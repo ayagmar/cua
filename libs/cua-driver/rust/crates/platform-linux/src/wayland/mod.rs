@@ -1269,7 +1269,7 @@ fn screenshot_dispatch_for_pid(xid: u64, pid: Option<u32>) -> anyhow::Result<Vec
         });
     }
     if is_wayland() && niri::is_session() {
-        return niri_window_capture(xid, pid).map(|(png, _)| png);
+        return niri_window_capture(xid, pid);
     }
     if is_wayland() {
         // A GNOME helper with API 9+ snapshots the window's own actor, so a
@@ -1329,29 +1329,13 @@ fn niri_display_capture() -> anyhow::Result<niri::DisplayCapture> {
     })
 }
 
-/// The window capture `get_window_state` returns, which becomes the window's
-/// pixel frame. On niri a tiled window's capture is its whole output, with
-/// the [`niri::OutputFrame`] its coordinates use once adopted.
-pub fn screenshot_for_window_state(
-    xid: u64,
-    pid: u32,
-) -> anyhow::Result<(Vec<u8>, Option<niri::OutputFrame>)> {
-    if is_wayland() && niri::is_session() {
-        return niri_window_capture(xid, Some(pid));
-    }
-    screenshot_dispatch_with_pid(xid, pid).map(|png| (png, None))
-}
-
 /// niri has no per-toplevel capture protocol: crop a settled display capture
-/// to a placed, unoverlapped floating window, or keep the whole output for a
-/// tiled one, and scale it to logical size, the coordinate frame input uses.
-fn niri_window_capture(
-    xid: u64,
-    pid: Option<u32>,
-) -> anyhow::Result<(Vec<u8>, Option<niri::OutputFrame>)> {
-    let niri::WindowCapture { png, plan, frame } =
-        niri::capture_window(xid, pid, niri_display_capture)
-            .map_err(|reason| surface_identity_unproven(xid, format!("niri: {reason}")))?;
+/// to a placed, unoverlapped floating window and scale it to the window's
+/// logical size, the window-local coordinate frame input uses. A tiled
+/// window refuses: niri does not report where it is.
+fn niri_window_capture(xid: u64, pid: Option<u32>) -> anyhow::Result<Vec<u8>> {
+    let (png, plan) = niri::capture_window(xid, pid, niri_display_capture)
+        .map_err(|reason| surface_identity_unproven(xid, format!("niri: {reason}")))?;
     let pixels = plan.pixels;
     let crop = crop_png_to_rect(
         &png,
@@ -1363,7 +1347,7 @@ fn niri_window_capture(
     )?;
     let image = image::load_from_memory_with_format(&crop, image::ImageFormat::Png)?;
     if (image.width(), image.height()) == (plan.width, plan.height) {
-        return Ok((crop, frame));
+        return Ok(crop);
     }
     let image = image.resize_exact(
         plan.width,
@@ -1372,7 +1356,7 @@ fn niri_window_capture(
     );
     let mut out = std::io::Cursor::new(Vec::new());
     image.write_to(&mut out, image::ImageFormat::Png)?;
-    Ok((out.into_inner(), frame))
+    Ok(out.into_inner())
 }
 
 fn crop_png_to_rect(
@@ -1727,6 +1711,8 @@ fn pointer_reaches(origin_x: i32, origin_y: i32, w: u32, h: u32, x: i32, y: i32)
 #[derive(Clone, Debug, Default)]
 pub struct DesktopInputSpace {
     snapshot: Option<hyprland::DesktopSnapshot>,
+    /// The `get_desktop_state` capture the points come from, when named.
+    capture: Option<String>,
 }
 
 impl DesktopInputSpace {
@@ -1738,7 +1724,16 @@ impl DesktopInputSpace {
         } else {
             None
         };
-        Ok(Self { snapshot })
+        Ok(Self {
+            snapshot,
+            capture: None,
+        })
+    }
+
+    /// Name the `get_desktop_state` capture the action's points come from.
+    pub fn with_capture(mut self, capture_id: Option<String>) -> Self {
+        self.capture = capture_id;
+        self
     }
 
     /// Layout coordinates of a desktop-frame point.
@@ -2202,7 +2197,7 @@ pub fn click_desktop(
     }
     let (x, y) = space.input_layout(x, y)?;
     with_libei_fallback(
-        || click_vptr(None, x, y, count, button, space.snapshot.as_ref()),
+        || click_vptr(None, x, y, count, button, Some(space)),
         || libei_click(x, y, count, button),
     )
 }
@@ -2286,10 +2281,12 @@ fn centres_origin_click(x: i32, y: i32, layout_addressed: bool) -> bool {
 /// On niri, window-addressed pointer input waits for the layout to settle,
 /// proves each layout point lands on the target window and then activates it
 /// (see [`niri::gate_pointer`]). Desktop-scope input names no window: its
-/// points are desktop-frame pixels and need no window geometry. Confirm the
-/// returned gate right before sending the first event.
+/// points are pixels of the latest `get_desktop_state` screenshot, admitted
+/// while that screenshot's frame holds (see [`niri::desktop_gate`]). Confirm
+/// the returned gate right before sending the first event.
 fn niri_pointer_gate(
     window_id: Option<u64>,
+    desktop: Option<&DesktopInputSpace>,
     sess: &VptrSession,
     points: &[(i32, i32)],
 ) -> anyhow::Result<Option<niri::PointerGate>> {
@@ -2313,9 +2310,10 @@ fn niri_pointer_gate(
             );
         }
     }
-    let gate = match window_id {
-        Some(id) => niri::gate_pointer(id, points, true)?,
-        None => match current_foreground_target() {
+    let gate = match (window_id, desktop) {
+        (Some(id), _) => niri::gate_pointer(id, points, true)?,
+        (None, Some(desktop)) => niri::desktop_gate(points, desktop.capture.as_deref())?,
+        (None, None) => match current_foreground_target() {
             Some((_, id)) => niri::gate_pointer(id, points, false)?,
             None => return Ok(None),
         },
@@ -2331,9 +2329,9 @@ fn click_vptr(
     y: i32,
     count: u32,
     button: u8,
-    snapshot: Option<&hyprland::DesktopSnapshot>,
+    desktop: Option<&DesktopInputSpace>,
 ) -> anyhow::Result<()> {
-    let mut sess = open_vptr_session_in(window_id, snapshot)?;
+    let mut sess = open_vptr_session_in(window_id, desktop.and_then(|d| d.snapshot.as_ref()))?;
     std::thread::sleep(std::time::Duration::from_millis(40));
     let (w, h) = (sess.output_w, sess.output_h);
     let centre = centres_origin_click(x, y, hyprland::is_session() || niri::is_session());
@@ -2347,7 +2345,7 @@ fn click_vptr(
     } else {
         (x, y)
     };
-    let mut gate = niri_pointer_gate(window_id, &sess, &[aimed])?;
+    let mut gate = niri_pointer_gate(window_id, desktop, &sess, &[aimed])?;
     let btn = evdev_pointer_button(button);
     niri_gate_holds(&mut gate, &sess)?;
     sess.point_at(px, py)?;
@@ -2514,15 +2512,7 @@ pub fn scroll_desktop(
     let (x, y) = space.input_layout(x, y)?;
     let direction = direction.to_string();
     with_libei_fallback(
-        || {
-            scroll_vptr(
-                None,
-                Some((x, y)),
-                &direction,
-                amount,
-                space.snapshot.as_ref(),
-            )
-        },
+        || scroll_vptr(None, Some((x, y)), &direction, amount, Some(space)),
         || {
             libei_wait_scroll_ready()?;
             libei_move_absolute(x, y)?;
@@ -2537,7 +2527,7 @@ fn scroll_vptr(
     point: Option<(i32, i32)>,
     direction: &str,
     amount: u32,
-    snapshot: Option<&hyprland::DesktopSnapshot>,
+    desktop: Option<&DesktopInputSpace>,
 ) -> anyhow::Result<()> {
     // A niri window scroll without a point aims at the window's centre, so
     // the wheel provably reaches the window rather than whatever is under the
@@ -2546,11 +2536,11 @@ fn scroll_vptr(
         (None, Some(id)) if is_wayland() && niri::is_session() => Some(niri_window_centre(id)?),
         (point, _) => point,
     };
-    let mut sess = open_vptr_session_in(window_id, snapshot)?;
+    let mut sess = open_vptr_session_in(window_id, desktop.and_then(|d| d.snapshot.as_ref()))?;
     let mut gate = None;
     if let Some((x, y)) = point {
         let (px, py) = sess.abs(x, y);
-        gate = niri_pointer_gate(window_id, &sess, &[(x, y)])?;
+        gate = niri_pointer_gate(window_id, desktop, &sess, &[(x, y)])?;
         niri_gate_holds(&mut gate, &sess)?;
         sess.point_at(px, py)?;
         record_synth_cursor(sess.origin_x + px as i32, sess.origin_y + py as i32);
@@ -2586,7 +2576,7 @@ fn niri_window_centre(window_id: u64) -> anyhow::Result<(i32, i32)> {
     let (_, _, width, height) = window_geometry(window_id).ok_or_else(|| {
         anyhow::anyhow!(
             "foreground_unavailable: niri reports no on-screen place for window {window_id}; \
-             pass a point from the window's screenshot"
+             pass a point inside a floating window"
         )
     })?;
     niri::aim(window_id, (width / 2) as i32, (height / 2) as i32)
@@ -2637,7 +2627,7 @@ pub fn move_cursor_absolute(window_id: Option<u64>, x: i32, y: i32) -> anyhow::R
 pub fn move_cursor_desktop(space: &DesktopInputSpace, x: i32, y: i32) -> anyhow::Result<()> {
     let (x, y) = space.input_layout(x, y)?;
     with_libei_fallback(
-        || move_cursor_absolute_vptr(None, x, y, space.snapshot.as_ref()),
+        || move_cursor_absolute_vptr(None, x, y, Some(space)),
         || libei_move_absolute(x, y),
     )
 }
@@ -2647,11 +2637,11 @@ fn move_cursor_absolute_vptr(
     window_id: Option<u64>,
     x: i32,
     y: i32,
-    snapshot: Option<&hyprland::DesktopSnapshot>,
+    desktop: Option<&DesktopInputSpace>,
 ) -> anyhow::Result<()> {
-    let mut sess = open_vptr_session_in(window_id, snapshot)?;
+    let mut sess = open_vptr_session_in(window_id, desktop.and_then(|d| d.snapshot.as_ref()))?;
     let (px, py) = sess.abs(x, y);
-    let mut gate = niri_pointer_gate(window_id, &sess, &[(x, y)])?;
+    let mut gate = niri_pointer_gate(window_id, desktop, &sess, &[(x, y)])?;
     niri_gate_holds(&mut gate, &sess)?;
     sess.motion(px, py)?;
     record_synth_cursor(sess.origin_x + px as i32, sess.origin_y + py as i32);
@@ -2707,18 +2697,7 @@ pub fn drag_desktop(
     let (from_x, from_y) = space.input_layout(from_x, from_y)?;
     let (to_x, to_y) = space.input_layout(to_x, to_y)?;
     with_libei_fallback(
-        || {
-            drag_vptr(
-                None,
-                from_x,
-                from_y,
-                to_x,
-                to_y,
-                steps,
-                button,
-                space.snapshot.as_ref(),
-            )
-        },
+        || drag_vptr(None, from_x, from_y, to_x, to_y, steps, button, Some(space)),
         || {
             libei_wait_pointer_ready()?;
             libei_drag(from_x, from_y, to_x, to_y, steps, duration_ms, button)
@@ -2736,9 +2715,9 @@ fn drag_vptr(
     to_y: i32,
     steps: u32,
     button: u8,
-    snapshot: Option<&hyprland::DesktopSnapshot>,
+    desktop: Option<&DesktopInputSpace>,
 ) -> anyhow::Result<()> {
-    let mut sess = open_vptr_session_in(window_id, snapshot)?;
+    let mut sess = open_vptr_session_in(window_id, desktop.and_then(|d| d.snapshot.as_ref()))?;
     std::thread::sleep(std::time::Duration::from_millis(40));
     let (w, h) = (sess.output_w, sess.output_h);
     let btn = evdev_pointer_button(button);
@@ -2746,7 +2725,7 @@ fn drag_vptr(
     let clamp_xy = |x: i32, y: i32| pointer_abs(origin_x, origin_y, w, h, x, y);
     let (fx, fy) = clamp_xy(from_x, from_y);
     let (tx, ty) = clamp_xy(to_x, to_y);
-    let mut gate = niri_pointer_gate(window_id, &sess, &[(from_x, from_y), (to_x, to_y)])?;
+    let mut gate = niri_pointer_gate(window_id, desktop, &sess, &[(from_x, from_y), (to_x, to_y)])?;
     niri_gate_holds(&mut gate, &sess)?;
     sess.motion(fx, fy)?;
     std::thread::sleep(std::time::Duration::from_millis(15));

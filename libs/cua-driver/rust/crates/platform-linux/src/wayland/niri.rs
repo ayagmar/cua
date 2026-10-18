@@ -8,12 +8,13 @@
 //!
 //! niri 26.04 reports a position only for floating windows
 //! (`tile_pos_in_workspace_view`): a tiled window's place depends on the
-//! view's scroll position, which IPC does not report. A tiled window's
-//! screenshot is therefore its whole output, and its window coordinates are
-//! pixels of that screenshot while niri reports no layout change, for at
-//! most [`FRAME_MAX_AGE`] (see [`OutputFrame`]). IPC positions also omit niri's animation offset, so
-//! pointer and crop routes wait until the layout has been quiet for a while
-//! (see [`History`]).
+//! view's scroll position, which IPC does not report. Window capture and
+//! window-coordinate pointer input therefore refuse a tiled window; the
+//! desktop scope reaches it, with pixels of a `get_desktop_state` screenshot
+//! that are admitted while niri reports no layout change, for at most
+//! [`FRAME_MAX_AGE`] (see [`DesktopFrame`]). IPC positions also omit niri's
+//! animation offset, so pointer and crop routes wait until the layout has
+//! been quiet for a while (see [`History`]).
 
 use anyhow::{anyhow, bail, Context, Result};
 use serde::de::DeserializeOwned;
@@ -50,10 +51,10 @@ const SETTLE_QUIET: Duration = Duration::from_secs(1);
 const SETTLE_LIMIT: Duration = Duration::from_secs(4);
 /// Recent window-local to layout translations kept for the pointer gate.
 const MAX_AIMS: usize = 64;
-/// How long a tiled window's output screenshot stays usable for pointer
-/// input. niri scrolls a view without reporting it (see [`Shown`]), so an
-/// unchanged layout proves less the older the screenshot is.
-pub const FRAME_MAX_AGE: Duration = Duration::from_secs(60);
+/// How long a `get_desktop_state` screenshot stays usable for desktop-scope
+/// pointer input. niri scrolls a view without reporting it (see [`Shown`]),
+/// so an unchanged layout proves less the older the screenshot is.
+const FRAME_MAX_AGE: Duration = Duration::from_secs(60);
 
 // ── Session ──────────────────────────────────────────────────────────────────
 
@@ -799,6 +800,10 @@ impl Rect {
     }
 }
 
+/// What a tiled window's window capture and window-coordinate pointer input
+/// refuse with: no pixel can be proven to be the window's.
+const TILED_REFUSAL: &str = "niri does not report where a tiled window is; use get_desktop_state and a desktop-scope action (needs the display grant), or float the window";
+
 /// Why niri reports no on-screen place for a window.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Unplaced {
@@ -816,7 +821,7 @@ pub enum Unplaced {
 impl Unplaced {
     pub fn reason(self) -> &'static str {
         match self {
-            Self::Tiled => "niri does not report where a tiled window is on screen",
+            Self::Tiled => TILED_REFUSAL,
             Self::NotShowing => {
                 "the window is not showing: its workspace is not active on an output, or the niri overview is open"
             }
@@ -2155,22 +2160,24 @@ fn aims() -> &'static Mutex<Vec<Aim>> {
 }
 
 fn placed_or_refuse(window: &Window) -> Result<&Placed> {
-    window.placement.as_ref().map_err(|unplaced| {
-        foreground_unavailable(format!("niri window {}: {}", window.id, unplaced.reason()))
+    window.placement.as_ref().map_err(|unplaced| match unplaced {
+        Unplaced::Tiled => foreground_unavailable(format!(
+            "niri does not report where tiled window {} is; use get_desktop_state and a desktop-scope action (needs the display grant), or float the window",
+            window.id
+        )),
+        unplaced => {
+            foreground_unavailable(format!("niri window {}: {}", window.id, unplaced.reason()))
+        }
     })
 }
 
 /// Translate window coordinates into the global layout. A floating window's
 /// coordinates are window-local; the geometry used is remembered so the
-/// pointer gate can prove it still holds. A tiled window's are pixels of its
-/// output frame (see [`OutputFrame`]); without one it refuses instead of
-/// passing `(x, y)` through as output coordinates.
+/// pointer gate can prove it still holds. A window without a place (a tiled
+/// one) refuses instead of passing `(x, y)` through as output coordinates.
 pub fn aim(window_id: u64, x: i32, y: i32) -> Result<(i32, i32)> {
     let scene = ipc().scene().map_err(input_unavailable)?;
     let window = scene.window(window_id).map_err(input_unavailable)?;
-    if matches!(window.placement, Err(Unplaced::Tiled)) {
-        return adopted_frame(window_id)?.aim_window(&scene, &window, &HISTORY, x, y);
-    }
     let (point, rect) = aim_at(&window, x, y)?;
     if let Ok(mut aims) = aims().lock() {
         aims.retain(|aim| (aim.window, aim.point) != (window_id, point));
@@ -2234,34 +2241,16 @@ impl PointerGate {
     }
 }
 
-/// Gate window-addressed pointer input. A floating window: wait until the
+/// Gate window-addressed pointer input on a floating window: wait until the
 /// layout is quiet, then require the target to be placed where its
 /// coordinates were computed and every point to land on it rather than on
-/// another floating window. A tiled window: require its output frame to
-/// still hold (see [`OutputFrame`]). With `activate`, focus the window only
-/// once all of that holds, so a refused action leaves focus alone.
+/// another floating window. A window without a place (a tiled one) refuses.
+/// With `activate`, focus the window only once all of that holds, so a
+/// refused action leaves focus alone.
 pub fn gate_pointer(window_id: u64, points: &[(i32, i32)], activate: bool) -> Result<PointerGate> {
-    // One read: the frame admitted below is the one the bound capture is
-    // checked against.
-    let adopted = adopted(window_id);
-    if let Some(capture_id) = bound_capture() {
-        admits_capture(adopted.as_ref(), window_id, &capture_id)?;
-    }
     let mut ipc = ipc();
     let scene = ipc.scene().map_err(input_unavailable)?;
     let window = scene.window(window_id).map_err(input_unavailable)?;
-    if matches!(window.placement, Err(Unplaced::Tiled)) {
-        let frame = adopted
-            .and_then(|record| record.frame)
-            .ok_or_else(|| no_frame(window_id))?;
-        frame.admit(&scene, &window, points, activate, &HISTORY)?;
-        return Ok(PointerGate {
-            history: &HISTORY,
-            mark: frame.mark,
-            expected: Expected::default(),
-            ipc,
-        });
-    }
     let before = placed_or_refuse(&window)?.rect;
     let mark = settled().map_err(input_unavailable)?;
     let window = ipc
@@ -2327,7 +2316,7 @@ fn pointer_admission(
     Ok(())
 }
 
-// ── Tiled windows ────────────────────────────────────────────────────────────
+// ── Desktop frames ───────────────────────────────────────────────────────────
 
 /// What one output shows, as far as niri reports it: the output, its active
 /// workspace with that workspace's active window and every window's layout,
@@ -2374,20 +2363,17 @@ impl Scene {
     }
 }
 
-/// A tiled window's pixel frame. niri does not report where a tiled window
-/// is, so its `get_window_state` screenshot is its whole output and its
-/// window coordinates are that output's logical pixels. They are admitted
+/// The pixel frame of a niri `get_desktop_state` screenshot. Desktop-scope
+/// pointer points are its pixels, the single output's logical pixels. niri
+/// does not report where tiled windows are, so a point is admitted only
 /// while niri's event stream reports no layout change after `mark`, taken
 /// once the layout had settled before the capture, the output still shows
 /// what `shown` recorded, and the screenshot is at most [`FRAME_MAX_AGE`]
 /// old. That proves only that niri reported no change: a view scroll niri
 /// does not report (see [`Shown`]) or an animation longer than
-/// [`SETTLE_QUIET`] still moves the pixels, and a point can be on another
-/// tiled window or a layer-shell surface, which IPC does not place. A point
-/// inside a floating window, drawn above every tiled one, refuses.
+/// [`SETTLE_QUIET`] still moves the pixels.
 #[derive(Clone, Debug, PartialEq)]
-pub struct OutputFrame {
-    window: u64,
+pub struct DesktopFrame {
     area: Rect,
     shown: Shown,
     mark: Mark,
@@ -2395,23 +2381,21 @@ pub struct OutputFrame {
     taken: Instant,
 }
 
-impl OutputFrame {
-    pub fn output(&self) -> &str {
+impl DesktopFrame {
+    fn output(&self) -> &str {
         &self.shown.output.name
     }
 
     fn changed(&self, why: &str) -> anyhow::Error {
         foreground_unavailable(format!(
-            "{why} after the screenshot of tiled niri window {}, so its pixels may be elsewhere now; take a new screenshot",
-            self.window
+            "{why} after the get_desktop_state screenshot, so its pixels may be elsewhere now; take a new screenshot"
         ))
     }
 
     fn holds(&self, scene: &Scene, history: &History) -> Result<()> {
         if self.taken.elapsed() > FRAME_MAX_AGE {
             return Err(foreground_unavailable(format!(
-                "the screenshot of tiled niri window {} is over {} s old, and niri does not report every scroll of its view; take a new screenshot",
-                self.window,
+                "the get_desktop_state screenshot is over {} s old, and niri does not report every scroll of its view; take a new screenshot",
                 FRAME_MAX_AGE.as_secs()
             )));
         }
@@ -2427,223 +2411,171 @@ impl OutputFrame {
         Ok(())
     }
 
-    /// Focusing a tiled window can scroll niri's view, which niri does not
-    /// report, so the screenshot could no longer show the point.
-    fn not_focused(&self) -> anyhow::Error {
-        foreground_unavailable(format!(
-            "tiled niri window {} is not focused, and niri may scroll its view to focus it; focus it, then take a new screenshot",
-            self.window
-        ))
-    }
-
-    /// The layout point of pixel `(x, y)` for window-addressed input on
-    /// `window`, the frame's window as `scene` reports it now. It must
-    /// already be focused: this runs before any route focuses the window,
-    /// so an unfocused one refuses before focus or the view move.
-    fn aim_window(
-        &self,
-        scene: &Scene,
-        window: &Window,
-        history: &History,
-        x: i32,
-        y: i32,
-    ) -> Result<(i32, i32)> {
-        if !window.focused {
-            return Err(self.not_focused());
-        }
-        self.holds(scene, history)?;
-        self.aim(x, y)
-    }
-
-    /// The layout point of pixel `(x, y)` of the screenshot.
-    fn aim(&self, x: i32, y: i32) -> Result<(i32, i32)> {
-        let point = (self.area.x.saturating_add(x), self.area.y.saturating_add(y));
-        if x < 0 || y < 0 || !self.area.contains(point.0, point.1) {
-            return Err(foreground_unavailable(format!(
-                "point ({x}, {y}) is outside the screenshot of tiled niri window {}, which is its whole output, {}x{}",
-                self.window, self.area.width, self.area.height
-            )));
-        }
-        Ok(point)
-    }
-
-    /// Admit pointer input at layout `points` for `window`, the frame's
-    /// window as `scene` reports it now.
-    fn admit(
-        &self,
-        scene: &Scene,
-        window: &Window,
-        points: &[(i32, i32)],
-        activate: bool,
-        history: &History,
-    ) -> Result<()> {
+    /// Admit desktop-scope input at layout `points`, and say which focus
+    /// change the input may make itself. A press on a floating window
+    /// focuses and raises it without moving anything, so focus moving to
+    /// the one floating window under every point is expected; focus moving
+    /// to a tiled window can scroll the view, so it counts as a change.
+    fn admit(&self, scene: &Scene, points: &[(i32, i32)], history: &History) -> Result<Expected> {
         self.holds(scene, history)?;
         let logical = self.shown.output.logical.as_ref();
+        let mut under = HashSet::new();
         for &(x, y) in points {
             if !self.area.contains(x, y) {
                 return Err(foreground_unavailable(format!(
-                    "point ({x}, {y}) is past the edge of niri output {}, which tiled window {} was captured on",
-                    self.output(),
-                    self.window
+                    "point ({x}, {y}) is past the edge of niri output {}, which the get_desktop_state screenshot shows",
+                    self.output()
                 )));
             }
-            let floating = self
+            let floating: Vec<u64> = self
                 .shown
                 .windows
                 .iter()
-                .filter_map(|(id, layout)| Some((id, floating_tile(logical?, layout.as_ref()?)?)))
-                .find(|(_, tile)| tile.contains(f64::from(x), f64::from(y)));
-            if let Some((id, _)) = floating {
-                return Err(foreground_unavailable(format!(
-                    "point ({x}, {y}) lies on floating niri window {id}, which niri draws above tiled window {}",
-                    self.window
-                )));
-            }
+                .filter_map(|(id, layout)| Some((*id, floating_tile(logical?, layout.as_ref()?)?)))
+                .filter(|(_, tile)| tile.contains(f64::from(x), f64::from(y)))
+                .map(|(id, _)| id)
+                .collect();
+            under.insert(match floating.as_slice() {
+                [id] => Some(*id),
+                _ => None,
+            });
         }
-        if activate && !window.focused {
-            return Err(self.not_focused());
-        }
-        Ok(())
+        Ok(match under.into_iter().collect::<Vec<_>>().as_slice() {
+            [Some(id)] => Expected {
+                window: Some(*id),
+                workspace: Some(self.shown.workspace),
+            },
+            _ => Expected::default(),
+        })
     }
 }
 
-/// The capture registry keeps at most 32 captures in all by default, so an
-/// output capture id older than this many of its window's is no longer live.
-const MAX_OUTPUT_CAPTURES: usize = 32;
-
-/// The `get_window_state` screenshots of a window that has been tiled.
-#[derive(Clone)]
-struct Adopted {
-    window: u64,
-    /// The latest screenshot's frame; `None` once it shows only the window.
-    frame: Option<OutputFrame>,
-    /// The capture id the latest screenshot was published as.
-    capture: Option<String>,
-    /// The capture ids of its output screenshots, newest last.
-    outputs: VecDeque<String>,
+/// The latest `get_desktop_state` screenshot's frame and capture id.
+struct LatestDesktop {
+    frame: DesktopFrame,
+    capture: String,
 }
 
-/// Records of windows that have been tiled, least recently adopted first. A
-/// record is evicted only after [`MAX_AIMS`] - 1 later screenshots of other
-/// windows, more than the capture registry keeps, so its ids are gone too.
-fn frames() -> &'static Mutex<Vec<Adopted>> {
-    static FRAMES: OnceLock<Mutex<Vec<Adopted>>> = OnceLock::new();
-    FRAMES.get_or_init(|| Mutex::new(Vec::new()))
-}
-
-/// Record a window's latest `get_window_state` screenshot: a tiled window's
-/// output `frame`, published as `capture_id`, or `None` for a window whose
-/// screenshot shows only itself, which drops any earlier frame but keeps
-/// refusing the ids of its output screenshots.
-pub fn adopt_frame(window: u64, frame: Option<OutputFrame>, capture_id: Option<&str>) {
-    let Ok(mut frames) = frames().lock() else {
-        return;
-    };
-    let mut record = match frames.iter().position(|record| record.window == window) {
-        Some(index) => frames.remove(index),
-        None if frame.is_some() => Adopted {
-            window,
-            frame: None,
-            capture: None,
-            outputs: VecDeque::new(),
-        },
-        None => return,
-    };
-    if let (Some(_), Some(capture_id)) = (&frame, capture_id) {
-        record.outputs.push_back(capture_id.to_owned());
-        if record.outputs.len() > MAX_OUTPUT_CAPTURES {
-            record.outputs.pop_front();
-        }
-    }
-    record.frame = frame;
-    record.capture = capture_id.map(str::to_owned);
-    if frames.len() >= MAX_AIMS {
-        frames.remove(0);
-    }
-    frames.push(record);
-}
-
-/// Held while `get_window_state` publishes a screenshot to the snapshot
-/// store and adopts its frame, so concurrent calls on one window leave the
-/// store's latest screenshot and the adopted frame from the same call.
-pub fn publication() -> std::sync::MutexGuard<'static, ()> {
-    static PUBLICATION: Mutex<()> = Mutex::new(());
-    PUBLICATION
+fn latest_desktop() -> std::sync::MutexGuard<'static, Option<LatestDesktop>> {
+    static LATEST: Mutex<Option<LatestDesktop>> = Mutex::new(None);
+    LATEST
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
-fn adopted(window: u64) -> Option<Adopted> {
-    frames()
-        .lock()
-        .ok()?
-        .iter()
-        .find(|record| record.window == window)
-        .cloned()
+/// Take a desktop screenshot through `capture` on a settled layout, with
+/// the frame its pixels use. The layout must stay unchanged through the
+/// capture.
+pub fn capture_desktop<T>(capture: impl FnOnce() -> Result<T>) -> Result<(T, DesktopFrame)> {
+    let mut ipc = ipc();
+    capture_desktop_in(
+        || ipc.scene(),
+        settled,
+        |mark| HISTORY.changed_since(mark, Expected::default()),
+        capture,
+    )
 }
 
-fn adopted_frame(window: u64) -> Result<OutputFrame> {
-    adopted(window)
-        .and_then(|record| record.frame)
-        .ok_or_else(|| no_frame(window))
-}
-
-fn no_frame(window: u64) -> anyhow::Error {
-    foreground_unavailable(format!(
-        "niri does not report where tiled window {window} is, so its coordinates are pixels of its get_window_state screenshot, which shows its whole output; take one first"
+fn capture_desktop_in<T>(
+    mut scene: impl FnMut() -> Result<Scene>,
+    settle: impl FnOnce() -> Result<Mark>,
+    changed_since: impl FnOnce(Mark) -> Result<bool>,
+    capture: impl FnOnce() -> Result<T>,
+) -> Result<(T, DesktopFrame)> {
+    let taken = Instant::now();
+    let mut frame_now = || -> Result<(Rect, Shown)> {
+        let scene = scene()?;
+        let (output, logical) = scene.single_output()?;
+        let area = Rect {
+            x: logical.x,
+            y: logical.y,
+            width: logical.width,
+            height: logical.height,
+        };
+        let shown = scene
+            .shown(&output.name)
+            .context("niri shows no workspace on its output")?;
+        Ok((area, shown))
+    };
+    let before = frame_now()?;
+    let mark = settle()?;
+    let (area, shown) = frame_now()?;
+    if (area, &shown) != (before.0, &before.1) {
+        bail!("the niri layout changed while settling; call get_desktop_state again");
+    }
+    let captured = capture()?;
+    if changed_since(mark)? {
+        bail!("the niri layout changed during get_desktop_state; call it again");
+    }
+    // niri has no output-change event: compare the output itself.
+    if frame_now()? != (area, shown.clone()) {
+        bail!("the niri output changed during get_desktop_state; call it again");
+    }
+    Ok((
+        captured,
+        DesktopFrame {
+            area,
+            shown,
+            mark,
+            taken,
+        },
     ))
 }
 
-thread_local! {
-    /// The `capture_id` the pointer action on this thread is bound to.
-    static BOUND_CAPTURE: std::cell::RefCell<Option<String>> =
-        const { std::cell::RefCell::new(None) };
+/// Publish a `get_desktop_state` screenshot through `publish`, which
+/// returns its capture id, and make `frame` the latest one in the same
+/// step, so concurrent calls leave the latest published screenshot and the
+/// latest frame from one call.
+pub fn adopt_desktop(
+    frame: DesktopFrame,
+    publish: impl FnOnce() -> anyhow::Result<String>,
+) -> anyhow::Result<String> {
+    let mut latest = latest_desktop();
+    let capture = publish()?;
+    *latest = Some(LatestDesktop {
+        frame,
+        capture: capture.clone(),
+    });
+    Ok(capture)
 }
 
-/// Restores the previous capture binding when dropped.
-pub struct CaptureBinding(Option<String>);
-
-impl Drop for CaptureBinding {
-    fn drop(&mut self) {
-        let previous = self.0.take();
-        BOUND_CAPTURE.with(|bound| *bound.borrow_mut() = previous);
-    }
+/// Gate desktop-scope pointer input at layout `points`: they are pixels of
+/// the latest `get_desktop_state` screenshot, which `capture_id`, when
+/// given, must name, and its frame must still hold (see [`DesktopFrame`]).
+pub fn desktop_gate(points: &[(i32, i32)], capture_id: Option<&str>) -> Result<PointerGate> {
+    let latest = latest_desktop()
+        .as_ref()
+        .map(|latest| (latest.frame.clone(), latest.capture.clone()));
+    let mut ipc = ipc();
+    let scene = ipc.scene().map_err(input_unavailable)?;
+    let (frame, expected) = desktop_admission(latest, capture_id, &scene, points, &HISTORY)?;
+    Ok(PointerGate {
+        history: &HISTORY,
+        mark: frame.mark,
+        expected,
+        ipc,
+    })
 }
 
-/// Bind the pointer action run on this thread to `capture_id`, so the
-/// pointer gate checks it against the same frame it admits the action on.
-pub fn bind_capture(capture_id: Option<String>) -> CaptureBinding {
-    CaptureBinding(BOUND_CAPTURE.with(|bound| bound.replace(capture_id)))
-}
-
-fn bound_capture() -> Option<String> {
-    BOUND_CAPTURE.with(|bound| bound.borrow().clone())
-}
-
-/// A click bound to `capture_id` on a tiled window needs that capture to be
-/// the window's latest screenshot: only that one's frame is checked against
-/// the layout, and an earlier one may show another.
-pub fn frame_admits_capture(window: u64, capture_id: &str) -> Result<()> {
-    admits_capture(adopted(window).as_ref(), window, capture_id)
-}
-
-fn admits_capture(adopted: Option<&Adopted>, window: u64, capture_id: &str) -> Result<()> {
-    let Some(record) = adopted else {
-        return Ok(());
+fn desktop_admission(
+    latest: Option<(DesktopFrame, String)>,
+    capture_id: Option<&str>,
+    scene: &Scene,
+    points: &[(i32, i32)],
+    history: &History,
+) -> Result<(DesktopFrame, Expected)> {
+    let Some((frame, latest_capture)) = latest else {
+        return Err(foreground_unavailable(
+            "niri does not report where tiled windows are, so desktop-scope points are pixels of a get_desktop_state screenshot; take one first",
+        ));
     };
-    if record.capture.as_deref() == Some(capture_id) {
-        Ok(())
-    } else if record.frame.is_some() {
-        Err(foreground_unavailable(format!(
-            "capture {capture_id} is not the latest screenshot of tiled niri window {window}, and only that one's pixels are checked against niri's layout; use the latest get_window_state screenshot"
-        )))
-    } else if record.outputs.iter().any(|output| output == capture_id) {
-        Err(foreground_unavailable(format!(
-            "capture {capture_id} is not the latest screenshot of niri window {window}, and it shows the whole output rather than the window; use the latest get_window_state screenshot"
-        )))
-    } else {
-        Ok(())
+    if let Some(capture_id) = capture_id.filter(|id| *id != latest_capture) {
+        return Err(foreground_unavailable(format!(
+            "capture {capture_id} is not the latest get_desktop_state screenshot, and only that one's pixels are checked against niri's layout; use the latest screenshot"
+        )));
     }
+    let expected = frame.admit(scene, points, history)?;
+    Ok((frame, expected))
 }
 
 // ── Window capture ───────────────────────────────────────────────────────────
@@ -2664,9 +2596,6 @@ pub struct CapturePlan {
     pub scale: f64,
     pub transform: u32,
     pub image: (u32, u32),
-    /// For a tiled window, captured as its whole output, what that output
-    /// shows.
-    pub shown: Option<Shown>,
 }
 
 /// An oriented display capture, the output it copied and the transform the
@@ -2678,16 +2607,6 @@ pub struct DisplayCapture {
     pub size: (u32, u32),
 }
 
-/// A window capture: the oriented display capture, where the window is in
-/// it, and for a tiled window the frame its coordinates use once a
-/// `get_window_state` screenshot adopts it.
-#[derive(Debug)]
-pub struct WindowCapture {
-    pub png: Vec<u8>,
-    pub plan: CapturePlan,
-    pub frame: Option<OutputFrame>,
-}
-
 fn capture_plan_in(scene: &Scene, id: u64, pid: Option<u32>) -> Result<CapturePlan, &'static str> {
     let window = scene
         .window(id)
@@ -2695,24 +2614,13 @@ fn capture_plan_in(scene: &Scene, id: u64, pid: Option<u32>) -> Result<CapturePl
     if pid.is_some_and(|pid| window.pid != Some(pid)) {
         return Err("niri reports the window belongs to a different process");
     }
+    let placed = window
+        .placement
+        .as_ref()
+        .map_err(|unplaced| unplaced.reason())?;
     let (output, logical) = scene
         .single_output()
         .map_err(|_| "niri window capture supports a single output, and this layout has several")?;
-    let mode = output
-        .current_mode
-        .and_then(|index| output.modes.get(index))
-        .ok_or("niri reports no current mode for the output")?;
-    let transform =
-        transform_code(&logical.transform).map_err(|_| "unknown niri output transform")?;
-    let image = super::logical_output_size((mode.width, mode.height), transform);
-    let scale = logical.scale;
-    let placed = match &window.placement {
-        Ok(placed) => placed,
-        Err(Unplaced::Tiled) => {
-            return tiled_plan(scene, &window, &output.name, logical, transform, image)
-        }
-        Err(unplaced) => return Err(unplaced.reason()),
-    };
     if placed.output != output.name {
         return Err("the window is not on the captured output");
     }
@@ -2722,6 +2630,13 @@ fn capture_plan_in(scene: &Scene, id: u64, pid: Option<u32>) -> Result<CapturePl
     if placed.overlapped() {
         return Err("another floating window overlaps it, and niri reports no stacking order");
     }
+    let mode = output
+        .current_mode
+        .and_then(|index| output.modes.get(index))
+        .ok_or("niri reports no current mode for the output")?;
+    let transform =
+        transform_code(&logical.transform).map_err(|_| "unknown niri output transform")?;
+    let scale = logical.scale;
     // Round only in pixel space: the fractional origin is what niri drew.
     let pixels = Rect::from_f64(
         (placed.origin.0 - f64::from(logical.x)) * scale,
@@ -2738,67 +2653,19 @@ fn capture_plan_in(scene: &Scene, id: u64, pid: Option<u32>) -> Result<CapturePl
         area: placed.area,
         scale,
         transform,
-        image,
-        shown: None,
+        image: super::logical_output_size((mode.width, mode.height), transform),
     })
 }
 
-/// A tiled window is captured as its whole output, and only when niri
-/// surely shows it: as the active window of the workspace shown on that
-/// output, with the overview closed. niri keeps the active column in view;
-/// any other tiled window may be scrolled out of it.
-fn tiled_plan(
-    scene: &Scene,
-    window: &Window,
-    output: &str,
-    logical: &IpcLogical,
-    transform: u32,
-    image: (u32, u32),
-) -> Result<CapturePlan, &'static str> {
-    if scene.overview_open {
-        return Err(Unplaced::NotShowing.reason());
-    }
-    let workspace = scene
-        .workspaces
-        .iter()
-        .find(|workspace| Some(workspace.id) == window.workspace)
-        .filter(|workspace| workspace.is_active && workspace.output.as_deref() == Some(output))
-        .ok_or(Unplaced::NotShowing.reason())?;
-    if workspace.active_window_id != Some(window.id) {
-        return Err("niri does not report where a tiled window is, and shows for certain only its workspace's active window; focus the window first");
-    }
-    Ok(CapturePlan {
-        pixels: Rect {
-            x: 0,
-            y: 0,
-            width: image.0,
-            height: image.1,
-        },
-        width: logical.width,
-        height: logical.height,
-        output: output.to_owned(),
-        area: Rect {
-            x: logical.x,
-            y: logical.y,
-            width: logical.width,
-            height: logical.height,
-        },
-        scale: logical.scale,
-        transform,
-        image,
-        shown: scene.shown(output),
-    })
-}
-
-/// Capture one window from a settled display capture: a floating window
-/// cropped to its place, a tiled one as its whole output. The layout must
-/// stay unchanged through the capture, and the window and its output too.
-/// Errors are refusal reasons for `surface_identity_unproven`.
+/// Capture one floating window by cropping a settled display capture. The
+/// layout must stay quiet through the capture, and the window and its
+/// output unchanged. Errors are refusal reasons for
+/// `surface_identity_unproven`.
 pub fn capture_window(
     id: u64,
     pid: Option<u32>,
     capture_display: impl FnOnce() -> Result<DisplayCapture>,
-) -> Result<WindowCapture, String> {
+) -> Result<(Vec<u8>, CapturePlan), String> {
     let mut ipc = ipc();
     capture_window_in(
         || ipc.scene(),
@@ -2817,8 +2684,7 @@ fn capture_window_in(
     id: u64,
     pid: Option<u32>,
     capture_display: impl FnOnce() -> Result<DisplayCapture>,
-) -> Result<WindowCapture, String> {
-    let taken = Instant::now();
+) -> Result<(Vec<u8>, CapturePlan), String> {
     let mut plan_now = || -> Result<CapturePlan, String> {
         Ok(capture_plan_in(
             &scene().map_err(|e| format!("{e:#}"))?,
@@ -2858,18 +2724,7 @@ fn capture_window_in(
             capture.size.0, capture.size.1, plan.image.0, plan.image.1, plan.output
         ));
     }
-    let frame = plan.shown.clone().map(|shown| OutputFrame {
-        window: id,
-        area: plan.area,
-        shown,
-        mark,
-        taken,
-    });
-    Ok(WindowCapture {
-        png: capture.png,
-        plan,
-        frame,
-    })
+    Ok((capture.png, plan))
 }
 
 #[cfg(test)]
@@ -3792,7 +3647,6 @@ mod tests {
                 scale: 1.5,
                 transform: 0,
                 image: (1920, 1080),
-                shown: None,
             })
         );
     }
@@ -4717,14 +4571,11 @@ mod tests {
             pointer_admission(&tiled, rect, &[(150, 100)], |_| None)
                 .unwrap_err()
                 .to_string(),
-            format!(
-                "foreground_unavailable: niri window 5: {}",
-                Unplaced::Tiled.reason()
-            )
+            "foreground_unavailable: niri does not report where tiled window 5 is; use get_desktop_state and a desktop-scope action (needs the display grant), or float the window"
         );
     }
 
-    // ── Tiled windows ───────────────────────────────────────────────────────
+    // ── Tiled windows and desktop frames ────────────────────────────────────
 
     /// Tiled window 5 (active) and 6 beside it, and floating window 7, on
     /// workspace 1 of output winit placed at x=1920; workspace 2 hidden.
@@ -4750,78 +4601,24 @@ mod tests {
     }
 
     #[test]
-    fn a_tiled_window_is_captured_as_its_output_while_niri_surely_shows_it() {
+    fn a_tiled_window_refuses_window_capture_and_window_coordinates() {
+        // Even the focused active tiled window: its neighbour shares the
+        // output, and niri cannot say which pixels are whose.
         let scene = tiled_scene(Some(5));
-        let plan = capture_plan_in(&scene, 5, Some(105)).unwrap();
         assert_eq!(
-            plan.pixels,
-            Rect {
-                x: 0,
-                y: 0,
-                width: 1280,
-                height: 720
-            }
+            capture_plan_in(&scene, 5, Some(105)),
+            Err("niri does not report where a tiled window is; use get_desktop_state and a desktop-scope action (needs the display grant), or float the window")
         );
-        assert_eq!((plan.width, plan.height), (853, 480));
+        let window = scene.window(5).unwrap();
         assert_eq!(
-            plan.area,
-            Rect {
-                x: 1920,
-                y: 0,
-                width: 853,
-                height: 480
-            }
-        );
-        assert_eq!(plan.shown, scene.shown("winit"));
-        assert_eq!(
-            capture_plan_in(&scene, 6, None),
-            Err("niri does not report where a tiled window is, and shows for certain only its workspace's active window; focus the window first")
-        );
-        assert_eq!(
-            capture_plan_in(&scene, 8, None),
-            Err(Unplaced::NotShowing.reason())
-        );
-        let mut overview = tiled_scene(Some(5));
-        overview.overview_open = true;
-        assert_eq!(
-            capture_plan_in(&overview, 5, None),
-            Err(Unplaced::NotShowing.reason())
+            aim_at(&window, 10, 20).unwrap_err().to_string(),
+            "foreground_unavailable: niri does not report where tiled window 5 is; use get_desktop_state and a desktop-scope action (needs the display grant), or float the window"
         );
     }
 
-    #[test]
-    fn a_tiled_capture_yields_the_frame_of_its_settled_layout() {
-        let mark = Mark {
-            generation: 3,
-            at: 9,
-        };
-        let capture = capture_window_in(
-            || Ok(tiled_scene(Some(5))),
-            || Ok(mark),
-            unchanged,
-            5,
-            None,
-            || display("winit", (1280, 720)),
-        )
-        .unwrap();
-        let frame = capture.frame.unwrap();
-        assert_eq!((frame.window, frame.mark), (5, mark));
-        assert_eq!(frame.area, capture.plan.area);
-        assert!(capture_window_in(
-            || Ok(one_output(vec![floating(7, 1, (100.0, 60.0), (300, 200))])),
-            settled_now,
-            unchanged,
-            7,
-            None,
-            || display("winit", (1280, 720)),
-        )
-        .unwrap()
-        .frame
-        .is_none());
-    }
-
-    /// The frame window 5's capture gives, checked against `history`.
-    fn tiled_frame(history: &'static History) -> OutputFrame {
+    /// The frame a desktop capture of [`tiled_scene`] gives, checked against
+    /// `history`.
+    fn desktop_frame(history: &'static History) -> DesktopFrame {
         let mark = history
             .settle(
                 || Ok(event_stream(vec![])),
@@ -4829,54 +4626,80 @@ mod tests {
                 Duration::from_secs(1),
             )
             .unwrap();
-        capture_window_in(
+        capture_desktop_in(
             || Ok(tiled_scene(Some(5))),
             || Ok(mark),
             |mark| history.changed_since(mark, Expected::default()),
-            5,
-            None,
-            || display("winit", (1280, 720)),
+            || Ok(()),
         )
         .unwrap()
-        .frame
-        .unwrap()
+        .1
     }
 
     #[test]
-    fn tiled_window_pixels_aim_at_the_output_while_its_layout_holds() {
-        let history = history();
-        let frame = tiled_frame(history);
-        let scene = tiled_scene(Some(5));
-        let window = scene.window(5).unwrap();
-        frame.holds(&scene, history).unwrap();
-        assert_eq!(frame.aim(10, 20).unwrap(), (1930, 20));
-        assert_eq!(frame.aim(852, 479).unwrap(), (2772, 479));
+    fn a_desktop_capture_yields_the_frame_of_its_settled_layout() {
+        let mark = Mark {
+            generation: 3,
+            at: 9,
+        };
+        let ((), frame) = capture_desktop_in(
+            || Ok(tiled_scene(Some(5))),
+            || Ok(mark),
+            unchanged,
+            || Ok(()),
+        )
+        .unwrap();
+        assert_eq!(frame.mark, mark);
         assert_eq!(
-            frame.aim(853, 20).unwrap_err().to_string(),
-            "foreground_unavailable: point (853, 20) is outside the screenshot of tiled niri window 5, which is its whole output, 853x480"
+            frame.area,
+            Rect {
+                x: 1920,
+                y: 0,
+                width: 853,
+                height: 480
+            }
         );
-        assert!(frame.aim(-1, 20).is_err());
-        frame
-            .admit(&scene, &window, &[(2500, 400)], true, history)
-            .unwrap();
-        // Floating window 7 covers layout x 2020..2320, y 60..260.
+        assert_eq!(Some(frame.shown), tiled_scene(Some(5)).shown("winit"));
+        // A layout change niri reported during the capture refuses it.
+        assert_eq!(
+            capture_desktop_in(
+                || Ok(tiled_scene(Some(5))),
+                || Ok(mark),
+                |_| Ok(true),
+                || Ok(())
+            )
+            .unwrap_err()
+            .to_string(),
+            "the niri layout changed during get_desktop_state; call it again"
+        );
+    }
+
+    #[test]
+    fn desktop_pixels_are_admitted_on_the_output_while_its_frame_holds() {
+        let history = history();
+        let frame = desktop_frame(history);
+        let scene = tiled_scene(Some(5));
+        // A tiled area: focus moving there may scroll the view.
+        let expected = frame.admit(&scene, &[(2500, 400)], history).unwrap();
+        assert_eq!(expected.window, None);
+        // Floating window 7 covers layout x 2020..2320, y 60..260: a press
+        // there may focus and raise it, which moves nothing.
+        let expected = frame.admit(&scene, &[(2100, 100)], history).unwrap();
+        assert_eq!((expected.window, expected.workspace), (Some(7), Some(1)));
         assert_eq!(
             frame
-                .admit(&scene, &window, &[(2100, 100)], true, history)
+                .admit(&scene, &[(10, 100)], history)
                 .unwrap_err()
                 .to_string(),
-            "foreground_unavailable: point (2100, 100) lies on floating niri window 7, which niri draws above tiled window 5"
+            "foreground_unavailable: point (10, 100) is past the edge of niri output winit, which the get_desktop_state screenshot shows"
         );
-        assert!(frame
-            .admit(&scene, &window, &[(10, 100)], true, history)
-            .is_err());
     }
 
     #[test]
-    fn tiled_window_pixels_refuse_once_the_layout_changed() {
+    fn desktop_pixels_refuse_once_the_layout_changed() {
         let history = history();
-        let frame = tiled_frame(history);
-        let changed = "foreground_unavailable: niri output winit changed after the screenshot of tiled niri window 5, so its pixels may be elsewhere now; take a new screenshot";
+        let frame = desktop_frame(history);
+        let changed = "foreground_unavailable: niri output winit changed after the get_desktop_state screenshot, so its pixels may be elsewhere now; take a new screenshot";
         // Focus moved to the tiled window beside it: niri may have scrolled.
         let mut focus = tiled_scene(Some(6));
         focus.workspaces[0].active_window_id = Some(6);
@@ -4901,8 +4724,8 @@ mod tests {
     }
 
     #[test]
-    fn a_change_niri_reported_after_the_capture_refuses_tiled_pixels() {
-        let captured = tiled_frame(history());
+    fn a_change_niri_reported_after_the_capture_refuses_desktop_pixels() {
+        let captured = desktop_frame(history());
         let history = history();
         let mark = history
             .settle(
@@ -4916,7 +4739,7 @@ mod tests {
                 Duration::from_secs(1),
             )
             .unwrap();
-        let frame = OutputFrame { mark, ..captured };
+        let frame = DesktopFrame { mark, ..captured };
         let scene = tiled_scene(Some(5));
         frame.holds(&scene, history).unwrap();
         // Focus went elsewhere and back: the scene matches again, but niri
@@ -4924,39 +4747,16 @@ mod tests {
         std::thread::sleep(Duration::from_millis(100));
         assert_eq!(
             frame.holds(&scene, history).unwrap_err().to_string(),
-            "foreground_unavailable: the niri layout changed after the screenshot of tiled niri window 5, so its pixels may be elsewhere now; take a new screenshot"
+            "foreground_unavailable: the niri layout changed after the get_desktop_state screenshot, so its pixels may be elsewhere now; take a new screenshot"
         );
     }
 
     #[test]
-    fn an_unfocused_tiled_window_is_not_focused_for_a_pointer_action() {
-        let history = history();
-        // Focus is on a layer-shell surface: no window has it.
-        let unfocused = tiled_scene(None);
-        let frame = OutputFrame {
-            shown: unfocused.shown("winit").unwrap(),
-            ..tiled_frame(history)
-        };
-        let window = unfocused.window(5).unwrap();
-        assert_eq!(
-            frame
-                .admit(&unfocused, &window, &[(2500, 400)], true, history)
-                .unwrap_err()
-                .to_string(),
-            "foreground_unavailable: tiled niri window 5 is not focused, and niri may scroll its view to focus it; focus it, then take a new screenshot"
-        );
-        // Desktop-scope input focuses nothing.
-        frame
-            .admit(&unfocused, &window, &[(2500, 400)], false, history)
-            .unwrap();
-    }
-
-    #[test]
-    fn a_tiled_frame_expires_because_niri_does_not_report_every_view_scroll() {
+    fn a_desktop_frame_expires_because_niri_does_not_report_every_view_scroll() {
         let history = history();
         let scene = tiled_scene(Some(5));
-        let frame = tiled_frame(history);
-        let aged = |age: Duration| OutputFrame {
+        let frame = desktop_frame(history);
+        let aged = |age: Duration| DesktopFrame {
             taken: Instant::now().checked_sub(age).unwrap(),
             ..frame.clone()
         };
@@ -4968,140 +4768,75 @@ mod tests {
                 .holds(&scene, history)
                 .unwrap_err()
                 .to_string(),
-            "foreground_unavailable: the screenshot of tiled niri window 5 is over 60 s old, and niri does not report every scroll of its view; take a new screenshot"
+            "foreground_unavailable: the get_desktop_state screenshot is over 60 s old, and niri does not report every scroll of its view; take a new screenshot"
         );
     }
 
     #[test]
-    fn an_unfocused_tiled_window_refuses_before_any_route_focuses_it() {
+    fn desktop_input_needs_the_latest_get_desktop_state_screenshot() {
         let history = history();
-        // Captured and still shown while a layer-shell surface has focus.
-        let unfocused = tiled_scene(None);
-        let frame = OutputFrame {
-            shown: unfocused.shown("winit").unwrap(),
-            ..tiled_frame(history)
-        };
-        let window = unfocused.window(5).unwrap();
+        let scene = tiled_scene(Some(5));
+        let point = [(2500, 400)];
         assert_eq!(
-            frame
-                .aim_window(&unfocused, &window, history, 10, 20)
+            desktop_admission(None, None, &scene, &point, history)
                 .unwrap_err()
                 .to_string(),
-            "foreground_unavailable: tiled niri window 5 is not focused, and niri may scroll its view to focus it; focus it, then take a new screenshot"
+            "foreground_unavailable: niri does not report where tiled windows are, so desktop-scope points are pixels of a get_desktop_state screenshot; take one first"
         );
-        let focused = tiled_scene(Some(5));
-        let frame = tiled_frame(history);
+        let latest = || Some((desktop_frame(history), "c2".to_owned()));
         assert_eq!(
-            frame
-                .aim_window(&focused, &focused.window(5).unwrap(), history, 10, 20)
-                .unwrap(),
-            (1930, 20)
+            desktop_admission(latest(), Some("c1"), &scene, &point, history)
+                .unwrap_err()
+                .to_string(),
+            "foreground_unavailable: capture c1 is not the latest get_desktop_state screenshot, and only that one's pixels are checked against niri's layout; use the latest screenshot"
         );
+        desktop_admission(latest(), Some("c2"), &scene, &point, history).unwrap();
+        desktop_admission(latest(), None, &scene, &point, history).unwrap();
     }
 
     #[test]
-    fn a_click_bound_to_a_capture_refuses_once_a_newer_screenshot_is_adopted() {
-        // A window id no other test adopts: the frames are process-wide.
-        let frame = OutputFrame {
-            window: 9002,
-            ..tiled_frame(history())
-        };
-        adopt_frame(9002, Some(frame.clone()), Some("c1"));
-        let _bound = bind_capture(Some("c1".to_owned()));
-        // Another call adopts a newer screenshot while the click is checked.
-        adopt_frame(9002, Some(frame), Some("c2"));
-        let refusal = gate_pointer(9002, &[(2500, 400)], false)
-            .err()
-            .expect("a click bound to an older capture is refused");
-        assert_eq!(
-            refusal.to_string(),
-            "foreground_unavailable: capture c1 is not the latest screenshot of tiled niri window 9002, and only that one's pixels are checked against niri's layout; use the latest get_window_state screenshot"
-        );
-    }
-
-    #[test]
-    fn only_the_latest_screenshot_of_a_tiled_window_aims() {
-        // Window ids no other test adopts: the frames are process-wide.
-        let frame = OutputFrame {
-            window: 9001,
-            ..tiled_frame(history())
-        };
-        assert!(adopted_frame(9001)
-            .unwrap_err()
-            .to_string()
-            .ends_with("which shows its whole output; take one first"));
-        adopt_frame(9001, Some(frame.clone()), Some("c1"));
-        adopt_frame(9001, Some(frame.clone()), Some("c2"));
-        assert_eq!(adopted_frame(9001).unwrap(), frame);
-        frame_admits_capture(9001, "c2").unwrap();
-        assert!(frame_admits_capture(9001, "c1")
-            .unwrap_err()
-            .to_string()
-            .starts_with("foreground_unavailable: capture c1 is not the latest screenshot"));
-        // Its latest screenshot shows only the window (it was floated).
-        adopt_frame(9001, None, Some("c3"));
-        assert!(adopted_frame(9001).is_err());
-    }
-
-    #[test]
-    fn the_screenshot_published_last_is_the_one_whose_frame_is_adopted() {
+    fn the_desktop_screenshot_published_last_is_the_one_whose_frame_is_adopted() {
         use std::sync::{mpsc, Arc};
-        let frame = OutputFrame {
-            window: 9004,
-            ..tiled_frame(history())
-        };
-        // The snapshot store's latest screenshot of the window.
+        let frame = desktop_frame(history());
+        // The capture registry's latest desktop screenshot.
         let store = Arc::new(Mutex::new(Vec::new()));
         let (published, wait_published) = mpsc::channel();
         let (release, wait_release) = mpsc::channel::<()>();
         let first = std::thread::spawn({
             let (frame, store) = (frame.clone(), store.clone());
             move || {
-                let _publication = publication();
-                store.lock().unwrap().push("a");
-                published.send(()).unwrap();
-                wait_release.recv().unwrap();
-                adopt_frame(9004, Some(frame), Some("a"));
+                adopt_desktop(frame, || {
+                    store.lock().unwrap().push("a");
+                    published.send(()).unwrap();
+                    wait_release.recv().unwrap();
+                    Ok("a".to_owned())
+                })
+                .unwrap();
             }
         });
         wait_published.recv().unwrap();
         let second = std::thread::spawn({
             let store = store.clone();
             move || {
-                let _publication = publication();
-                store.lock().unwrap().push("b");
-                adopt_frame(9004, Some(frame), Some("b"));
+                adopt_desktop(frame, || {
+                    store.lock().unwrap().push("b");
+                    Ok("b".to_owned())
+                })
+                .unwrap();
             }
         });
         // The second call would publish and adopt now, between the first
-        // call's publish and adopt, unless the publication holds it off.
+        // call's publish and adopt, unless adoption holds it off.
         std::thread::sleep(Duration::from_millis(100));
         release.send(()).unwrap();
         first.join().unwrap();
         second.join().unwrap();
         assert_eq!(
-            adopted(9004).unwrap().capture.as_deref(),
-            store.lock().unwrap().last().copied()
+            latest_desktop()
+                .as_ref()
+                .map(|latest| latest.capture.clone()),
+            store.lock().unwrap().last().map(|id: &&str| id.to_string())
         );
-    }
-
-    #[test]
-    fn an_output_capture_stays_refused_after_its_window_floats() {
-        let frame = OutputFrame {
-            window: 9003,
-            ..tiled_frame(history())
-        };
-        adopt_frame(9003, Some(frame), Some("c1"));
-        // Floated: its latest screenshot shows only the window.
-        adopt_frame(9003, None, Some("c2"));
-        assert_eq!(
-            frame_admits_capture(9003, "c1").unwrap_err().to_string(),
-            "foreground_unavailable: capture c1 is not the latest screenshot of niri window 9003, and it shows the whole output rather than the window; use the latest get_window_state screenshot"
-        );
-        frame_admits_capture(9003, "c2").unwrap();
-        // A window-only capture other than the latest is the floating
-        // window's own business: its pixels are window-local.
-        frame_admits_capture(9003, "c0").unwrap();
     }
 
     #[test]

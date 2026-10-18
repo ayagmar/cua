@@ -171,6 +171,21 @@ fn desktop_input_route() -> DriverRoute {
     }
 }
 
+/// niri does not report where tiled windows are, so it takes desktop-scope
+/// points only as pixels of the latest `get_desktop_state` screenshot.
+fn desktop_screenshot_on_niri(driver: &mut McpDriver, session: &str) {
+    if !(platform_linux::wayland::wayland_input_enabled()
+        && platform_linux::wayland::niri::is_session())
+    {
+        return;
+    }
+    let r = driver.call(
+        "get_desktop_state",
+        serde_json::json!({ "session": session }),
+    );
+    assert!(!r.is_error(), "get_desktop_state failed: {}", r.text());
+}
+
 fn start_scope(driver: &mut McpDriver, session: &str, scope: &str) {
     let r = driver.call(
         "start_session",
@@ -235,6 +250,7 @@ fn desktop_scope_windowless_click_lands_on_control() {
             posture.text()
         );
         std::thread::sleep(Duration::from_millis(300));
+        desktop_screenshot_on_niri(&mut driver, &desktop_session);
         driver.start_behavior_recording();
 
         // Retry the window-less desktop click until the counter advances. A
@@ -335,6 +351,7 @@ fn desktop_scope_windowless_scroll_lands_on_control() {
         // window. At niri's 1.5 scale smoke the window is 520 logical px tall
         // and the target lies below it, so scroll the outer scroller first.
         let mut target = (x, y);
+        desktop_screenshot_on_niri(&mut driver, &desktop_session);
         for _ in 0..6 {
             let Some(bounds) = snap.get("window_bounds").filter(|b| b.is_object()) else {
                 break;

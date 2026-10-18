@@ -1420,23 +1420,56 @@ fn session_id(environ: &[u8]) -> Result<Option<String>> {
     Ok(Some(id.to_owned()))
 }
 
-/// Run `call` on a detached thread and wait at most `timeout` for it. A call
-/// still blocked then is left to finish on its own; its result is dropped.
-fn within<T: Send + 'static>(
-    timeout: Duration,
-    what: &str,
-    call: impl FnOnce() -> T + Send + 'static,
-) -> Result<T> {
-    let (sender, receiver) = std::sync::mpsc::channel();
-    std::thread::Builder::new()
-        .name("cua-niri-logind".into())
-        .spawn(move || {
-            let _ = sender.send(call());
-        })
-        .with_context(|| format!("start a thread to {what}"))?;
-    receiver
-        .recv_timeout(timeout)
-        .map_err(|_| anyhow!("could not {what} within {timeout:?}"))
+/// A call that runs on a thread of its own, at most one at a time: one that
+/// outlives its wait is left to finish, and until it does, later calls
+/// refuse instead of starting another thread that a hung bus would hold.
+struct Flight<T> {
+    pending: Mutex<Option<std::sync::mpsc::Receiver<T>>>,
+}
+
+impl<T: Send + 'static> Flight<T> {
+    const fn new() -> Self {
+        Self {
+            pending: Mutex::new(None),
+        }
+    }
+
+    /// Run `call` and wait at most `timeout` for it. The answer of an
+    /// earlier call that has since finished is stale and dropped.
+    fn run(
+        &self,
+        timeout: Duration,
+        what: &str,
+        call: impl FnOnce() -> T + Send + 'static,
+    ) -> Result<T> {
+        let mut pending = self
+            .pending
+            .lock()
+            .map_err(|_| anyhow!("could not {what}: its lock is poisoned"))?;
+        if let Some(earlier) = pending.as_ref() {
+            if let Err(std::sync::mpsc::TryRecvError::Empty) = earlier.try_recv() {
+                bail!("could not {what}: an earlier attempt has not finished");
+            }
+            *pending = None;
+        }
+        let (sender, receiver) = std::sync::mpsc::channel();
+        std::thread::Builder::new()
+            .name("cua-niri-logind".into())
+            .spawn(move || {
+                let _ = sender.send(call());
+            })
+            .with_context(|| format!("start a thread to {what}"))?;
+        match receiver.recv_timeout(timeout) {
+            Ok(answer) => Ok(answer),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                *pending = Some(receiver);
+                bail!("could not {what} within {timeout:?}")
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                bail!("could not {what}: the attempt ended without an answer")
+            }
+        }
+    }
 }
 
 /// How long one whole logind query (connection, `GetSession`, `LockedHint`)
@@ -1453,7 +1486,8 @@ fn locked_hint(session: &str) -> Result<bool> {
 }
 
 fn locked_hint_with(query: impl FnOnce() -> Result<bool> + Send + 'static) -> Result<bool> {
-    within(LOCK_QUERY_TIMEOUT, "read logind's LockedHint", query)?
+    static QUERY: Flight<Result<bool>> = Flight::new();
+    QUERY.run(LOCK_QUERY_TIMEOUT, "read logind's LockedHint", query)?
 }
 
 fn logind_locked_hint(session: &str) -> Result<bool> {
@@ -2117,20 +2151,70 @@ mod tests {
     }
 
     #[test]
-    fn a_system_bus_that_never_answers_times_out() {
+    fn a_logind_query_that_never_answers_times_out_and_runs_once() {
+        let flight = Flight::new();
+        let spawned = Arc::new(Mutex::new(0));
+        let (release, released) = std::sync::mpsc::channel::<()>();
+        let hung = {
+            let spawned = Arc::clone(&spawned);
+            move || {
+                *spawned.lock().unwrap() += 1;
+                let _ = released.recv();
+                7
+            }
+        };
         let started = Instant::now();
-        let error = within(
-            Duration::from_millis(50),
-            "connect to the system bus",
-            || std::thread::sleep(Duration::from_secs(5)),
-        )
-        .unwrap_err();
+        let error = flight
+            .run(Duration::from_millis(50), "read logind's LockedHint", hung)
+            .unwrap_err();
         assert!(started.elapsed() < Duration::from_secs(2));
         assert_eq!(
             error.to_string(),
-            "could not connect to the system bus within 50ms"
+            "could not read logind's LockedHint within 50ms"
         );
-        assert_eq!(within(Duration::from_secs(1), "answer", || 7).unwrap(), 7);
+
+        // While it hangs, a later check refuses at once, without a thread.
+        let count = Arc::clone(&spawned);
+        let error = flight
+            .run(
+                Duration::from_secs(1),
+                "read logind's LockedHint",
+                move || {
+                    *count.lock().unwrap() += 1;
+                    8
+                },
+            )
+            .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "could not read logind's LockedHint: an earlier attempt has not finished"
+        );
+        assert_eq!(*spawned.lock().unwrap(), 1);
+
+        // Once it ends, its stale answer is dropped and a fresh query runs.
+        release.send(()).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let answer = loop {
+            let count = Arc::clone(&spawned);
+            let answer = flight.run(
+                Duration::from_secs(1),
+                "read logind's LockedHint",
+                move || {
+                    *count.lock().unwrap() += 1;
+                    8
+                },
+            );
+            match answer {
+                Err(error)
+                    if Instant::now() < deadline && error.to_string().ends_with("not finished") =>
+                {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                answer => break answer,
+            }
+        };
+        assert_eq!(answer.unwrap(), 8);
+        assert_eq!(*spawned.lock().unwrap(), 2);
     }
 
     #[test]

@@ -1333,19 +1333,27 @@ fn restore_focus<C: FnMut(Instant) -> Result<UnixStream>>(
             .with_context(|| format!("niri could not restore prior workspace {}", workspace.id))?,
         (None, None) => {}
     }
-    let now: Vec<IpcWorkspace> = ipc.query(Request::Workspaces)?;
-    if let Some(was) = before
-        .iter()
-        .filter(|was| was.is_active)
-        .find(|was| now.iter().any(|w| w.id == was.id && !w.is_active))
-    {
-        bail!(
-            "niri did not restore workspace {} on output {}",
-            was.id,
-            was.output.as_deref().unwrap_or("unknown")
-        );
+    // niri applies workspace switches asynchronously: poll like the
+    // single-workspace restore does.
+    let deadline = Instant::now() + confirm;
+    loop {
+        let now: Vec<IpcWorkspace> = ipc.query(Request::Workspaces)?;
+        let Some(was) = before
+            .iter()
+            .filter(|was| was.is_active)
+            .find(|was| now.iter().any(|w| w.id == was.id && !w.is_active))
+        else {
+            return Ok(());
+        };
+        if Instant::now() >= deadline {
+            bail!(
+                "niri did not restore workspace {} on output {}",
+                was.id,
+                was.output.as_deref().unwrap_or("unknown")
+            );
+        }
+        std::thread::sleep(Duration::from_millis(10));
     }
-    Ok(())
 }
 
 fn focus_workspace_action(id: u64) -> serde_json::Value {
@@ -1877,6 +1885,10 @@ mod tests {
         /// FocusWindow on these ids switches their workspace, but keyboard
         /// focus stays elsewhere (a layer-shell surface took it).
         focus_taken_on: Vec<u64>,
+        /// After a FocusWorkspace, this many Workspaces replies still show
+        /// the layout from before it (niri applies it asynchronously).
+        workspace_lag: usize,
+        stale: Option<(usize, Vec<Value>)>,
         requests: Vec<String>,
     }
 
@@ -1886,7 +1898,13 @@ mod tests {
             let request: Value = serde_json::from_str(request).unwrap();
             match request.as_str() {
                 Some("Windows") => json!({"Ok": {"Windows": self.windows}}),
-                Some("Workspaces") => json!({"Ok": {"Workspaces": self.workspaces}}),
+                Some("Workspaces") => match &mut self.stale {
+                    Some((reads, stale)) if *reads > 0 => {
+                        *reads -= 1;
+                        json!({"Ok": {"Workspaces": stale}})
+                    }
+                    _ => json!({"Ok": {"Workspaces": self.workspaces}}),
+                },
                 Some("OverviewState") => {
                     json!({"Ok": {"OverviewState": {"is_open": self.overview}}})
                 }
@@ -1916,6 +1934,9 @@ mod tests {
                             .iter()
                             .find(|w| w["id"] == id)
                             .and_then(|w| w["active_window_id"].as_u64());
+                        if self.workspace_lag > 0 {
+                            self.stale = Some((self.workspace_lag, self.workspaces.clone()));
+                        }
                         self.show_workspace(id, active);
                     } else {
                         return json!({"Err": "error parsing request"});
@@ -2870,7 +2891,11 @@ mod tests {
             ],
             ..Fake::default()
         }));
-        fake.lock().unwrap().workspaces[1]["is_focused"] = json!(false);
+        {
+            let mut fake = fake.lock().unwrap();
+            fake.workspaces[1]["is_focused"] = json!(false);
+            fake.workspace_lag = 2;
+        }
         let seen = with_focused_window_in(
             &mut fake_ipc(&fake),
             107,

@@ -1830,9 +1830,7 @@ pub fn aim(window_id: u64, x: i32, y: i32) -> Result<(i32, i32)> {
     let scene = ipc().scene().map_err(input_unavailable)?;
     let window = scene.window(window_id).map_err(input_unavailable)?;
     if matches!(window.placement, Err(Unplaced::Tiled)) {
-        let frame = adopted_frame(window_id)?;
-        frame.holds(&scene, &HISTORY)?;
-        return frame.aim(x, y);
+        return adopted_frame(window_id)?.aim_window(&scene, &window, &HISTORY, x, y);
     }
     let (point, rect) = aim_at(&window, x, y)?;
     if let Ok(mut aims) = aims().lock() {
@@ -2069,6 +2067,34 @@ impl OutputFrame {
         Ok(())
     }
 
+    /// Focusing a tiled window can scroll niri's view, which niri does not
+    /// report, so the screenshot could no longer show the point.
+    fn not_focused(&self) -> anyhow::Error {
+        foreground_unavailable(format!(
+            "tiled niri window {} is not focused, and niri may scroll its view to focus it; focus it, then take a new screenshot",
+            self.window
+        ))
+    }
+
+    /// The layout point of pixel `(x, y)` for window-addressed input on
+    /// `window`, the frame's window as `scene` reports it now. It must
+    /// already be focused: this runs before any route focuses the window,
+    /// so an unfocused one refuses before focus or the view move.
+    fn aim_window(
+        &self,
+        scene: &Scene,
+        window: &Window,
+        history: &History,
+        x: i32,
+        y: i32,
+    ) -> Result<(i32, i32)> {
+        if !window.focused {
+            return Err(self.not_focused());
+        }
+        self.holds(scene, history)?;
+        self.aim(x, y)
+    }
+
     /// The layout point of pixel `(x, y)` of the screenshot.
     fn aim(&self, x: i32, y: i32) -> Result<(i32, i32)> {
         let point = (self.area.x.saturating_add(x), self.area.y.saturating_add(y));
@@ -2114,13 +2140,8 @@ impl OutputFrame {
                 )));
             }
         }
-        // Focusing a tiled window can scroll niri's view, which niri does
-        // not report, so the screenshot could no longer show the point.
         if activate && !window.focused {
-            return Err(foreground_unavailable(format!(
-                "tiled niri window {} is not focused, and niri may scroll its view to focus it; focus it, then take a new screenshot",
-                self.window
-            )));
+            return Err(self.not_focused());
         }
         Ok(())
     }
@@ -4299,6 +4320,33 @@ mod tests {
         frame
             .admit(&unfocused, &window, &[(2500, 400)], false, history)
             .unwrap();
+    }
+
+    #[test]
+    fn an_unfocused_tiled_window_refuses_before_any_route_focuses_it() {
+        let history = history();
+        // Captured and still shown while a layer-shell surface has focus.
+        let unfocused = tiled_scene(None);
+        let frame = OutputFrame {
+            shown: unfocused.shown("winit").unwrap(),
+            ..tiled_frame(history)
+        };
+        let window = unfocused.window(5).unwrap();
+        assert_eq!(
+            frame
+                .aim_window(&unfocused, &window, history, 10, 20)
+                .unwrap_err()
+                .to_string(),
+            "foreground_unavailable: tiled niri window 5 is not focused, and niri may scroll its view to focus it; focus it, then take a new screenshot"
+        );
+        let focused = tiled_scene(Some(5));
+        let frame = tiled_frame(history);
+        assert_eq!(
+            frame
+                .aim_window(&focused, &focused.window(5).unwrap(), history, 10, 20)
+                .unwrap(),
+            (1930, 20)
+        );
     }
 
     #[test]

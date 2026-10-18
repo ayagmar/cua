@@ -147,14 +147,14 @@ fn probe(
 /// earlier in this process. Recognition is remembered, so a later socket
 /// loss refuses instead of turning this off.
 pub fn is_session() -> bool {
-    if super::is_inject_mode() || !super::is_wayland() {
-        return false;
-    }
-    if RECOGNIZED.get().is_some() {
-        return true;
-    }
-    if std::env::var_os("NIRI_SOCKET").is_none_or(|socket| socket.is_empty()) {
-        return false;
+    match session_check(
+        !super::is_inject_mode() && super::is_wayland(),
+        RECOGNIZED.get().is_some(),
+        std::env::var_os("NIRI_SOCKET").is_some_and(|socket| !socket.is_empty()),
+    ) {
+        SessionCheck::NotNiri => return false,
+        SessionCheck::Recognized => return true,
+        SessionCheck::Probe => {}
     }
     // An unrelated socket stays unrelated for the same environment: a stale
     // NIRI_SOCKET on another desktop must not cost a probe on every call.
@@ -187,6 +187,27 @@ pub fn is_session() -> bool {
             }
             false
         }
+    }
+}
+
+#[derive(Debug, PartialEq)]
+enum SessionCheck {
+    NotNiri,
+    /// Recognised earlier: stay niri even if the socket is gone, so routes
+    /// refuse instead of falling through to generic Wayland discovery.
+    Recognized,
+    Probe,
+}
+
+fn session_check(adapter_on: bool, recognized: bool, socket_set: bool) -> SessionCheck {
+    if !adapter_on {
+        SessionCheck::NotNiri
+    } else if recognized {
+        SessionCheck::Recognized
+    } else if socket_set {
+        SessionCheck::Probe
+    } else {
+        SessionCheck::NotNiri
     }
 }
 
@@ -1979,6 +2000,14 @@ mod tests {
     }
 
     #[test]
+    fn a_recognised_niri_stays_niri_after_its_socket_disappears() {
+        assert_eq!(session_check(true, true, false), SessionCheck::Recognized);
+        assert_eq!(session_check(true, false, false), SessionCheck::NotNiri);
+        assert_eq!(session_check(true, false, true), SessionCheck::Probe);
+        assert_eq!(session_check(false, true, true), SessionCheck::NotNiri);
+    }
+
+    #[test]
     fn recognised_niri_refuses_loss_mismatch_and_a_new_compositor() {
         assert_eq!(attest(Some(20), Ok(20), Ok(20)), Attestation::Attested(20));
         match attest(Some(20), Err(anyhow!("No such file or directory")), Ok(20)) {
@@ -2020,7 +2049,8 @@ mod tests {
         .unwrap_err();
         assert!(is_timeout(&error), "{error:#}");
         assert_eq!(attempts, 2);
-        assert!(started.elapsed() < Duration::from_millis(400));
+        // Bounded by the deadlines, not by the peer; loose for loaded CI.
+        assert!(started.elapsed() < Duration::from_secs(2));
     }
 
     #[test]

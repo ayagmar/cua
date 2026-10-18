@@ -426,26 +426,74 @@ pub(super) fn focus_identity() -> Result<Option<u64>, ObserverError> {
     Ok(focused(&query::<Vec<Window>>("Windows")?)?.map(|window| window.id))
 }
 
-/// The focus a niri event reports: `Some(focus)` for `WindowFocusChanged`
-/// and for the full `WindowsChanged` list, `None` for every other event.
-fn focus_from_event(line: &[u8]) -> Result<Option<Option<u64>>, ObserverError> {
-    let mut event: serde_json::Value = serde_json::from_slice(line)
-        .map_err(|error| ObserverError::new(format!("invalid niri event: {error}")))?;
-    if let Some(change) = event.get_mut("WindowFocusChanged") {
-        let id = change.get("id").cloned().unwrap_or(serde_json::Value::Null);
-        return serde_json::from_value(id)
-            .map(Some)
-            .map_err(|error| ObserverError::new(format!("invalid niri focus event: {error}")));
+#[derive(Deserialize)]
+struct WindowFocus {
+    id: u64,
+    is_focused: bool,
+}
+
+/// Which windows niri reports focused, updated from its event stream the way
+/// niri-ipc's `EventStreamState` applies window events.
+#[derive(Default)]
+struct FocusState {
+    windows: Option<HashMap<u64, bool>>,
+}
+
+impl FocusState {
+    /// Applies one event line. Events before the first `WindowsChanged` and
+    /// events about other state are ignored.
+    fn apply(&mut self, line: &[u8]) -> Result<(), ObserverError> {
+        let event: serde_json::Value = serde_json::from_slice(line)
+            .map_err(|error| ObserverError::new(format!("invalid niri event: {error}")))?;
+        let invalid =
+            |error: serde_json::Error| ObserverError::new(format!("invalid niri event: {error}"));
+        if let Some(change) = event.get("WindowsChanged") {
+            let windows: Vec<WindowFocus> =
+                serde_json::from_value(change["windows"].clone()).map_err(invalid)?;
+            self.windows = Some(
+                windows
+                    .into_iter()
+                    .map(|window| (window.id, window.is_focused))
+                    .collect(),
+            );
+            return Ok(());
+        }
+        let Some(windows) = self.windows.as_mut() else {
+            return Ok(());
+        };
+        if let Some(change) = event.get("WindowOpenedOrChanged") {
+            let window: WindowFocus =
+                serde_json::from_value(change["window"].clone()).map_err(invalid)?;
+            if window.is_focused {
+                windows.values_mut().for_each(|focused| *focused = false);
+            }
+            windows.insert(window.id, window.is_focused);
+        } else if let Some(change) = event.get("WindowClosed") {
+            let id: u64 = serde_json::from_value(change["id"].clone()).map_err(invalid)?;
+            windows.remove(&id);
+        } else if let Some(change) = event.get("WindowFocusChanged") {
+            let id: Option<u64> = serde_json::from_value(change["id"].clone()).map_err(invalid)?;
+            for (window, focused) in windows.iter_mut() {
+                *focused = Some(*window) == id;
+            }
+        }
+        Ok(())
     }
-    if let Some(windows) = event
-        .get_mut("WindowsChanged")
-        .and_then(|change| change.get_mut("windows"))
-    {
-        let windows: Vec<Window> = serde_json::from_value(windows.take())
-            .map_err(|error| ObserverError::new(format!("invalid niri windows event: {error}")))?;
-        return Ok(Some(focused(&windows)?.map(|window| window.id)));
+
+    /// The focused window, once the window list is known.
+    fn focus(&self) -> Result<Option<Option<u64>>, ObserverError> {
+        let Some(windows) = &self.windows else {
+            return Ok(None);
+        };
+        let mut focused = windows.iter().filter(|(_, focused)| **focused);
+        let first = focused.next().map(|(id, _)| *id);
+        if focused.next().is_some() {
+            return Err(ObserverError::new(
+                "niri reports more than one focused window",
+            ));
+        }
+        Ok(Some(first))
     }
-    Ok(None)
 }
 
 const JOURNAL_EVENT_LIMIT: usize = 10_000;
@@ -486,12 +534,14 @@ impl Journal {
                 "niri answered EventStream with {reply}"
             )));
         }
+        let mut state = FocusState::default();
         let mut focus = loop {
             if Instant::now() >= deadline {
                 return Err(ObserverError::new("niri event stream sent no window list"));
             }
             read_line(&mut reader, &mut line)?;
-            if let Some(focus) = focus_from_event(&line)? {
+            state.apply(&line)?;
+            if let Some(focus) = state.focus()? {
                 break focus;
             }
         };
@@ -509,7 +559,8 @@ impl Journal {
                 match reader.read_until(b'\n', &mut line) {
                     Ok(0) => return Err(ObserverError::new("niri event stream closed")),
                     Ok(_) if line.ends_with(b"\n") => {
-                        if let Some(current) = focus_from_event(&line)? {
+                        state.apply(&line)?;
+                        if let Some(current) = state.focus()? {
                             if current != focus {
                                 if journal.focus_events.len() >= JOURNAL_EVENT_LIMIT {
                                     return Err(ObserverError::new(
@@ -849,6 +900,52 @@ mod tests {
                     from: Some(20),
                     to: Some(10)
                 },
+            ]
+        );
+    }
+
+    #[test]
+    fn journal_records_focus_taken_by_an_opened_or_changed_window() {
+        // niri reports focus on a window it opens, or whose title or
+        // workspace changes in the same refresh, only inside
+        // WindowOpenedOrChanged; no WindowFocusChanged follows.
+        let (stream, mut niri) = UnixStream::pair().unwrap();
+        writeln!(niri, r#"{{"Ok":"Handled"}}"#).unwrap();
+        writeln!(niri, "{}", windows_changed(10)).unwrap();
+        let journal = Journal::with_stream(stream).unwrap();
+        let mut dialog = window(30, 200, true, true);
+        dialog["title"] = json!("dialog");
+        writeln!(
+            niri,
+            "{}",
+            json!({"WindowOpenedOrChanged": {"window": dialog}})
+        )
+        .unwrap();
+        writeln!(niri, r#"{{"WindowClosed":{{"id":30}}}}"#).unwrap();
+        writeln!(niri, r#"{{"WindowFocusChanged":{{"id":10}}}}"#).unwrap();
+        let mut renamed = window(20, 200, true, true);
+        renamed["title"] = json!("renamed");
+        writeln!(
+            niri,
+            "{}",
+            json!({"WindowOpenedOrChanged": {"window": renamed}})
+        )
+        .unwrap();
+        writeln!(niri, r#"{{"WindowFocusChanged":{{"id":10}}}}"#).unwrap();
+        std::thread::sleep(Duration::from_millis(100));
+        let events = journal.drain().unwrap().focus_events;
+        let transitions = events
+            .iter()
+            .map(|event| (event.from, event.to))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            transitions,
+            vec![
+                (Some(10), Some(30)),
+                (Some(30), None),
+                (None, Some(10)),
+                (Some(10), Some(20)),
+                (Some(20), Some(10)),
             ]
         );
     }

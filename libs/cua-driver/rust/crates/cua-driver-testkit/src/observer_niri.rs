@@ -305,26 +305,28 @@ struct Desktop {
     outputs: HashMap<String, Output>,
     overview_open: bool,
     sentinel: Option<Sentinel>,
-}
-
-/// The registered foreground sentinel and, while it is focused, the
-/// fullscreen state it reported after the window list was read.
-#[derive(Clone, Copy, Debug)]
-struct Sentinel {
-    window: TargetWindow,
-    fullscreen: Option<bool>,
+    /// When the window list was first read; the sentinel's fullscreen report
+    /// must be at least this recent.
+    started: Duration,
 }
 
 /// The foreground sentinel's window and its fullscreen state file, which the
 /// sentinel replaces on every tick and setup never resets.
-static SENTINEL: Mutex<Option<(TargetWindow, PathBuf)>> = Mutex::new(None);
+#[derive(Clone, Debug)]
+struct Sentinel {
+    window: TargetWindow,
+    state: PathBuf,
+}
+
+static SENTINEL: Mutex<Option<Sentinel>> = Mutex::new(None);
 
 /// Registers the foreground sentinel whose fullscreen reports may certify
 /// occlusion, or clears it with `None`.
 pub(super) fn register_sentinel(sentinel: Option<(TargetWindow, PathBuf)>) {
     *SENTINEL
         .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner()) = sentinel;
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+        sentinel.map(|(window, state)| Sentinel { window, state });
 }
 
 /// Milliseconds since the epoch, the sentinel's report clock.
@@ -335,23 +337,11 @@ fn report_clock() -> Duration {
     Duration::from_millis(now.as_millis() as u64)
 }
 
-/// The registered sentinel, given the window list read since `since`. Only a
-/// focused sentinel can certify occlusion, so only then does this wait for
-/// its report.
-fn sentinel(windows: &[Window], since: Duration) -> Option<Sentinel> {
-    let (window, state) = SENTINEL
+fn registered_sentinel() -> Option<Sentinel> {
+    SENTINEL
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .clone()?;
-    let focused = windows
-        .iter()
-        .any(|candidate| candidate.id == window.native_id && candidate.is_focused);
-    let fullscreen = if focused {
-        fullscreen_since(&state, since, SENTINEL_REPORT_TIMEOUT)
-    } else {
-        None
-    };
-    Some(Sentinel { window, fullscreen })
+        .clone()
 }
 
 /// The fullscreen state the sentinel wrote to `state` at or after `since`,
@@ -395,11 +385,12 @@ fn desktop() -> Result<Desktop, ObserverError> {
         let overview_open = query::<Overview>("OverviewState")?.is_open;
         if query::<Vec<Window>>("Windows")? == windows {
             return Ok(Desktop {
-                sentinel: sentinel(&windows, started),
                 windows,
                 workspaces,
                 outputs,
                 overview_open,
+                sentinel: registered_sentinel(),
+                started,
             });
         }
     }
@@ -456,9 +447,10 @@ fn floating_overlap(a: &Window, b: &Window) -> Option<bool> {
 }
 
 /// Whether the focused output-sized `tile` hides floating windows: only when
-/// it is the sentinel and the sentinel reports fullscreen.
-fn sentinel_occludes(sentinel: Option<&Sentinel>, tile: &Window) -> Result<TargetZ, ObserverError> {
-    let Some(sentinel) = sentinel.filter(|sentinel| {
+/// it is the sentinel and the sentinel reports fullscreen after the window
+/// list was read. Only this case waits for the report.
+fn sentinel_occludes(desktop: &Desktop, tile: &Window) -> Result<TargetZ, ObserverError> {
+    let Some(sentinel) = desktop.sentinel.as_ref().filter(|sentinel| {
         sentinel.window.native_id == tile.id && tile.pid == Some(i64::from(sentinel.window.pid))
     }) else {
         return Err(ObserverError::new(
@@ -466,7 +458,7 @@ fn sentinel_occludes(sentinel: Option<&Sentinel>, tile: &Window) -> Result<Targe
              fullscreen and occlusion are unproven",
         ));
     };
-    match sentinel.fullscreen {
+    match fullscreen_since(&sentinel.state, desktop.started, SENTINEL_REPORT_TIMEOUT) {
         Some(true) => Ok(TargetZ::BackgroundOccluded),
         Some(false) => Err(ObserverError::new(
             "niri sentinel reports it is not fullscreen; a maximized tile does not hide \
@@ -518,7 +510,7 @@ fn classify(desktop: &Desktop, target: TargetWindow) -> Result<TargetZ, Observer
             && focused.workspace_id == Some(workspace.id)
             && covers_output(focused, output)
     }) {
-        return sentinel_occludes(desktop.sentinel.as_ref(), tile);
+        return sentinel_occludes(desktop, tile);
     }
     for other in &desktop.windows {
         if other.id == target.id || !other.is_floating || other.workspace_id != target.workspace_id
@@ -873,9 +865,19 @@ mod tests {
             overview_open: false,
             sentinel: Some(Sentinel {
                 window: target(10, 100),
-                fullscreen: Some(true),
+                state: PathBuf::from("/nonexistent/sentinel-state.json"),
             }),
+            started: Duration::ZERO,
         }
+    }
+
+    /// Points the desktop's sentinel at a state file holding `report`.
+    fn report(desktop: &mut Desktop, report: &str) -> tempfile::TempDir {
+        let directory = tempfile::tempdir().unwrap();
+        let state = directory.path().join("sentinel-state.json");
+        std::fs::write(&state, report).unwrap();
+        desktop.sentinel.as_mut().unwrap().state = state;
+        directory
     }
 
     fn target(native_id: u64, pid: u32) -> TargetWindow {
@@ -884,10 +886,11 @@ mod tests {
 
     #[test]
     fn floating_target_behind_focused_fullscreen_sentinel_is_occluded() {
-        let desktop = desktop(vec![
+        let mut desktop = desktop(vec![
             fullscreen(window(10, 100, false, true)),
             window(20, 200, true, false),
         ]);
+        let _state = report(&mut desktop, r#"{"at_ms":1,"fullscreen":true}"#);
         assert_eq!(
             classify(&desktop, target(20, 200)).unwrap(),
             TargetZ::BackgroundOccluded
@@ -906,12 +909,12 @@ mod tests {
             fullscreen(window(10, 100, false, true)),
             window(20, 200, true, false),
         ]);
-        desktop.sentinel.as_mut().unwrap().fullscreen = Some(false);
+        let _state = report(&mut desktop, r#"{"at_ms":1,"fullscreen":false}"#);
         assert!(classify(&desktop, target(20, 200))
             .unwrap_err()
             .to_string()
             .contains("not fullscreen"));
-        desktop.sentinel.as_mut().unwrap().fullscreen = None;
+        let _state = report(&mut desktop, r#"{"at_ms":1}"#);
         assert!(classify(&desktop, target(20, 200))
             .unwrap_err()
             .to_string()
@@ -927,7 +930,7 @@ mod tests {
         for sentinel in [None, Some(target(11, 100)), Some(target(10, 101))] {
             desktop.sentinel = sentinel.map(|window| Sentinel {
                 window,
-                fullscreen: Some(true),
+                state: PathBuf::from("/nonexistent/sentinel-state.json"),
             });
             assert!(classify(&desktop, target(20, 200))
                 .unwrap_err()
@@ -957,12 +960,29 @@ mod tests {
             fullscreen(window(10, 100, false, true)),
             window(20, 200, true, false),
         ]);
-        posture.sentinel = sentinel(&posture.windows, since);
+        posture.sentinel = registered_sentinel();
+        posture.started = since;
         register_sentinel(None);
         assert_eq!(
             classify(&posture, target(20, 200)).unwrap(),
             TargetZ::BackgroundOccluded
         );
+    }
+
+    #[test]
+    fn focused_sentinel_snapshot_does_not_wait_for_its_fullscreen_report() {
+        // Most snapshots never consult the report, for example while waiting
+        // for the sentinel itself to hold focus. Here no report ever arrives.
+        let desktop = desktop(vec![
+            fullscreen(window(10, 100, false, true)),
+            window(20, 200, true, false),
+        ]);
+        let started = Instant::now();
+        assert_eq!(
+            classify(&desktop, target(10, 100)).unwrap(),
+            TargetZ::Foreground
+        );
+        assert!(started.elapsed() < SENTINEL_REPORT_TIMEOUT);
     }
 
     #[test]

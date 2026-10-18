@@ -1345,8 +1345,9 @@ const LOGIND_TIMEOUT: Duration = Duration::from_secs(1);
 /// its lock in logind's `LockedHint` of the session it started in
 /// (`XDG_SESSION_ID`), and only when it runs as the session instance
 /// (`niri --session`; `update_locked_hint` in niri v26.04 `src/niri.rs`).
-/// A niri started any other way, such as a nested one, sets no hint, so this
-/// check cannot see its lock and passes. Keyboard input does not rely on it:
+/// A niri started any other way, such as a nested one, or with `--session`
+/// but no `XDG_SESSION_ID`, sets no hint, so this check cannot see its lock
+/// and passes. Keyboard input does not rely on it:
 /// a locked niri reports no focused window (see [`keyboard_focus`]).
 pub fn refuse_if_locked() -> Result<()> {
     let pid = *RECOGNIZED
@@ -1369,7 +1370,8 @@ fn lock_refusal(checked: Result<bool>) -> Result<()> {
 }
 
 /// The logind session niri sets its locked hint on, or `None` when niri runs
-/// without `--session` and sets none. Fixed for the recognised process.
+/// without `--session` or without `XDG_SESSION_ID` and sets none. Fixed for
+/// the recognised process.
 fn logind_session(pid: libc::pid_t) -> Result<Option<String>> {
     static SESSION: OnceLock<Option<String>> = OnceLock::new();
     if let Some(session) = SESSION.get() {
@@ -1380,27 +1382,32 @@ fn logind_session(pid: libc::pid_t) -> Result<Option<String>> {
     let session = if session_instance(&cmdline) {
         let environ = std::fs::read(format!("/proc/{pid}/environ"))
             .with_context(|| format!("read niri's environment (pid {pid})"))?;
-        Some(session_id(&environ)?)
+        session_id(&environ)?
     } else {
         None
     };
     Ok(SESSION.get_or_init(|| session).clone())
 }
 
-/// Whether a `/proc/<pid>/cmdline` image has the `--session` argument.
+/// Whether a `/proc/<pid>/cmdline` image has niri's `--session` argument.
+/// Arguments after `--` are niri's startup command, not niri's own.
 fn session_instance(cmdline: &[u8]) -> bool {
     cmdline
         .split(|&byte| byte == 0)
+        .take_while(|&arg| arg != b"--")
         .any(|arg| arg == b"--session")
 }
 
 /// `XDG_SESSION_ID` from a `/proc/<pid>/environ` image. niri started with
-/// `--session` but without it sets no hint while locked, so that refuses.
-fn session_id(environ: &[u8]) -> Result<String> {
-    let id = environ
+/// `--session` but without it sets no hint, like a niri started without
+/// `--session`, so its lock cannot be seen and this is `None`.
+fn session_id(environ: &[u8]) -> Result<Option<String>> {
+    let Some(id) = environ
         .split(|&byte| byte == 0)
         .find_map(|entry| entry.strip_prefix(b"XDG_SESSION_ID="))
-        .context("niri runs with --session but has no XDG_SESSION_ID")?;
+    else {
+        return Ok(None);
+    };
     let id = std::str::from_utf8(id).context("XDG_SESSION_ID is not UTF-8")?;
     // `self` and `auto` would name the caller's own session, not niri's.
     if id.is_empty()
@@ -1410,7 +1417,7 @@ fn session_id(environ: &[u8]) -> Result<String> {
     {
         bail!("XDG_SESSION_ID {id:?} is not a logind session id");
     }
-    Ok(id.to_owned())
+    Ok(Some(id.to_owned()))
 }
 
 /// Run `call` on a detached thread and wait at most `timeout` for it. A call
@@ -2081,11 +2088,16 @@ mod tests {
     fn only_a_session_niri_with_a_logind_session_id_has_a_lock_hint() {
         assert!(session_instance(b"niri\0--session\0"));
         assert!(!session_instance(b"niri\0-c\0/tmp/niri--session.kdl\0"));
+        // After `--`, `--session` belongs to the startup command.
+        assert!(!session_instance(b"niri\0--\0sh\0--session\0"));
         let environ = b"HOME=/home/u\0XDG_SESSION_ID=c2\0";
-        assert_eq!(session_id(environ).unwrap(), "c2");
+        assert_eq!(session_id(environ).unwrap().as_deref(), Some("c2"));
+        // niri sets no hint without the id, so there is none to read.
+        assert_eq!(session_id(b"HOME=/home/u\0").unwrap(), None);
         for environ in [
-            &b"HOME=/home/u\0"[..],
+            &b"XDG_SESSION_ID=\0"[..],
             b"XDG_SESSION_ID=self\0",
+            b"XDG_SESSION_ID=auto\0",
             b"XDG_SESSION_ID=-p\0",
         ] {
             assert!(

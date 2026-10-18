@@ -2000,6 +2000,17 @@ fn niri_gate_holds(gate: &mut Option<niri::PointerGate>, sess: &VptrSession) -> 
     pointer_space_holds(space, current)
 }
 
+/// The niri pointer space now, read on an attested connection, or `None`
+/// off niri.
+fn niri_pointer_space_now() -> anyhow::Result<Option<(i32, i32, u32, u32)>> {
+    if !(is_wayland() && niri::is_session()) {
+        return Ok(None);
+    }
+    niri::pointer_space()
+        .map(Some)
+        .map_err(niri::input_unavailable)
+}
+
 /// Refuse when the compositor's pointer space no longer matches the extent
 /// the session scales `motion_absolute` by: every motion would land elsewhere.
 fn pointer_space_holds(

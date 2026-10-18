@@ -12050,6 +12050,7 @@ impl Tool for MouseDragTool {
             duration_ms
         };
         let mut result: anyhow::Result<()> = Ok(());
+        let mut moved = 0;
         let mut prev_x = from_x;
         let mut prev_y = from_y;
         let is_wl = crate::wayland::is_wayland();
@@ -12108,6 +12109,7 @@ impl Tool for MouseDragTool {
                     }
                     prev_x = ix;
                     prev_y = iy;
+                    moved = i;
                     if step_delay_ms > 0 {
                         tokio::time::sleep(std::time::Duration::from_millis(step_delay_ms)).await;
                     }
@@ -12155,6 +12157,21 @@ impl Tool for MouseDragTool {
                     mouse_button_name(hold.button),
                 ))
                 .with_structured(mouse_hold_json(&cursor_id, Some(&hold)))
+            }
+            Err(e) if e.is::<crate::wayland::persistent_vptr::HeldPointerReleased>() => {
+                // The persistent pointer released the button: the cursor
+                // holds nothing any more.
+                self.state.mouse_hold.lock().unwrap().remove(&cursor_id);
+                crate::overlay::send_command_for(
+                    cursor_id.clone(),
+                    cursor_overlay::OverlayCommand::SetPressed(false),
+                );
+                let mut structured = mouse_hold_json(&cursor_id, None);
+                structured["effect"] = json!("partial");
+                ToolResult::error(format!(
+                    "mouse_drag stopped after {moved} of {steps} steps: {e}"
+                ))
+                .with_structured(structured)
             }
             Err(e) => ToolResult::error(e.to_string())
                 .with_structured(mouse_hold_json(&cursor_id, Some(&hold))),

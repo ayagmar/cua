@@ -66,9 +66,47 @@ enum Cmd {
     },
 }
 
+/// The device a held cursor drives: the virtual pointer, or a recording
+/// fake in tests. Each call sends one event and its frame.
+trait HeldDevice {
+    fn motion(&self, x: u32, y: u32, extent: (u32, u32));
+    fn button(&self, button: u32, state: ButtonState);
+    fn destroy(&self);
+}
+
+impl HeldDevice for ZwlrVirtualPointerV1 {
+    fn motion(&self, x: u32, y: u32, (w, h): (u32, u32)) {
+        self.motion_absolute(0, x, y, w, h);
+        self.frame();
+    }
+
+    fn button(&self, button: u32, state: ButtonState) {
+        ZwlrVirtualPointerV1::button(self, 0, button, state);
+        self.frame();
+    }
+
+    fn destroy(&self) {
+        ZwlrVirtualPointerV1::destroy(self);
+    }
+}
+
+/// A held cursor's motion refused because the pointer space it scales by
+/// changed. Its buttons were released where the pointer was, so the app may
+/// have seen a drop: the cursor holds nothing any more.
+#[derive(Debug)]
+pub struct HeldPointerReleased(String);
+
+impl std::fmt::Display for HeldPointerReleased {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for HeldPointerReleased {}
+
 /// State held inside the owner thread for one cursor_id.
-struct ActivePointer {
-    vptr: ZwlrVirtualPointerV1,
+struct ActivePointer<D = ZwlrVirtualPointerV1> {
+    vptr: D,
     /// evdev codes of buttons currently held down. When this set becomes
     /// empty the vptr is destroyed and the entry dropped from the map.
     held: HashSet<u32>,
@@ -195,11 +233,57 @@ fn handle_move(
     x: i32,
     y: i32,
 ) -> anyhow::Result<()> {
+    move_held(
+        active,
+        cursor_id,
+        (x, y),
+        super::niri_pointer_space_now,
+        roundtrip_on_persistent,
+    )
+}
+
+/// Move a held cursor. On niri the pointer space is read again first: the
+/// motion is scaled by the extent saved at the press, and niri sends no
+/// event when an output is added or rescaled. If it changed, no motion goes
+/// out; the held buttons are released and the cursor is dropped.
+fn move_held<D: HeldDevice>(
+    active: &mut HashMap<String, ActivePointer<D>>,
+    cursor_id: &str,
+    (x, y): (i32, i32),
+    space_now: impl FnOnce() -> anyhow::Result<Option<(i32, i32, u32, u32)>>,
+    mut roundtrip: impl FnMut(&str) -> anyhow::Result<()>,
+) -> anyhow::Result<()> {
     let entry = active.get_mut(cursor_id).ok_or_else(|| {
         anyhow::anyhow!(
             "no held mouse button for cursor '{cursor_id}'; call mouse_button_down first"
         )
     })?;
+    let saved = (entry.origin_x, entry.origin_y, entry.out_w, entry.out_h);
+    if let Some(refusal) = space_now()
+        .and_then(|now| now.map_or(Ok(()), |now| super::pointer_space_holds(saved, now)))
+        .err()
+    {
+        let entry = active.remove(cursor_id).expect("found above");
+        for button in &entry.held {
+            entry.vptr.button(*button, ButtonState::Released);
+        }
+        entry.vptr.destroy();
+        let released = roundtrip(cursor_id);
+        forget_conn(cursor_id);
+        let refusal = refusal
+            .to_string()
+            .trim_start_matches("foreground_unavailable: ")
+            .to_owned();
+        return Err(match released {
+            Ok(()) => HeldPointerReleased(format!(
+                "{refusal}; no motion was sent, and the held button was released where the pointer was, which the app may take as a drop"
+            ))
+            .into(),
+            Err(error) => anyhow::anyhow!(
+                "{refusal}; no motion was sent, and releasing the held button failed: {error:#}"
+            ),
+        });
+    }
     let (px, py) = super::pointer_abs(
         entry.origin_x,
         entry.origin_y,
@@ -208,12 +292,8 @@ fn handle_move(
         x,
         y,
     );
-    entry
-        .vptr
-        .motion_absolute(0, px, py, entry.out_w, entry.out_h);
-    entry.vptr.frame();
-    roundtrip_on_persistent(cursor_id)?;
-    Ok(())
+    entry.vptr.motion(px, py, (entry.out_w, entry.out_h));
+    roundtrip(cursor_id)
 }
 
 fn handle_release(
@@ -345,4 +425,86 @@ pub fn forget(cursor_id: &str) -> anyhow::Result<()> {
     .map_err(|e| anyhow::anyhow!("cua-persistent-vptr thread is dead: {e}"))?;
     rx_r.recv()
         .map_err(|e| anyhow::anyhow!("reply channel closed: {e}"))?
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::cell::RefCell;
+
+    #[derive(Debug, PartialEq)]
+    enum Event {
+        Motion(u32, u32, (u32, u32)),
+        Release(u32),
+        Destroy,
+    }
+
+    #[derive(Default)]
+    struct Recorder(RefCell<Vec<Event>>);
+
+    impl HeldDevice for &Recorder {
+        fn motion(&self, x: u32, y: u32, extent: (u32, u32)) {
+            self.0.borrow_mut().push(Event::Motion(x, y, extent));
+        }
+
+        fn button(&self, button: u32, state: ButtonState) {
+            assert_eq!(state, ButtonState::Released);
+            self.0.borrow_mut().push(Event::Release(button));
+        }
+
+        fn destroy(&self) {
+            self.0.borrow_mut().push(Event::Destroy);
+        }
+    }
+
+    fn held(device: &Recorder) -> HashMap<String, ActivePointer<&Recorder>> {
+        HashMap::from([(
+            "drag".to_owned(),
+            ActivePointer {
+                vptr: device,
+                held: HashSet::from([0x110]),
+                out_w: 1280,
+                out_h: 720,
+                origin_x: 0,
+                origin_y: 0,
+            },
+        )])
+    }
+
+    #[test]
+    fn a_held_motion_after_the_pointer_space_changed_releases_instead_of_moving() {
+        let device = Recorder::default();
+        let mut active = held(&device);
+        // Unchanged: the motion goes out in the saved extent.
+        move_held(
+            &mut active,
+            "drag",
+            (200, 200),
+            || Ok(Some((0, 0, 1280, 720))),
+            |_| Ok(()),
+        )
+        .unwrap();
+        assert_eq!(*device.0.borrow(), [Event::Motion(200, 200, (1280, 720))]);
+
+        // The output went from scale 1 to 1.5 between two motions: scaling
+        // by the old extent would land far from the aimed point.
+        let stopped = move_held(
+            &mut active,
+            "drag",
+            (267, 267),
+            || Ok(Some((0, 0, 854, 480))),
+            |_| Ok(()),
+        )
+        .unwrap_err();
+        assert!(stopped.downcast_ref::<HeldPointerReleased>().is_some());
+        assert_eq!(
+            stopped.to_string(),
+            "the niri pointer space changed from (0, 0, 1280, 720) to (0, 0, 854, 480); take a new screenshot; no motion was sent, and the held button was released where the pointer was, which the app may take as a drop"
+        );
+        assert_eq!(
+            device.0.borrow()[1..],
+            [Event::Release(0x110), Event::Destroy]
+        );
+        assert!(active.is_empty());
+    }
 }

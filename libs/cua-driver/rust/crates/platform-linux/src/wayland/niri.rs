@@ -1047,32 +1047,45 @@ pub fn health_note() -> Option<String> {
         return None;
     }
     if !is_session() {
-        let reason = match probe(RECOGNIZED.get().copied(), QUERY_TIMEOUT).0 {
-            Attestation::Unrelated(reason) | Attestation::Refused(reason) => reason,
-            Attestation::Attested(_) => "the native Wayland backend is not active".to_owned(),
+        let session = match probe(RECOGNIZED.get().copied(), QUERY_TIMEOUT).0 {
+            Attestation::Unrelated(reason) | Attestation::Refused(reason) => {
+                HealthSession::Foreign(reason)
+            }
+            Attestation::Attested(_) => HealthSession::Inactive,
         };
-        return Some(describe_health(Err(reason), Ok(1)));
+        return Some(describe_health(session, Ok(1)));
     }
     let scene = ipc().scene();
     Some(describe_health(
-        Ok(version()),
+        HealthSession::Attested(version()),
         scene.map(|scene| scene.laid_out().len()),
     ))
 }
 
-fn describe_health(
-    session: std::result::Result<Result<String>, String>,
-    outputs: Result<usize>,
-) -> String {
+enum HealthSession {
+    /// NIRI_SOCKET belongs to another compositor, with the reason.
+    Foreign(String),
+    /// This session's niri, but this process does not use the adapter.
+    Inactive,
+    /// This session's niri, with its version.
+    Attested(Result<String>),
+}
+
+fn describe_health(session: HealthSession, outputs: Result<usize>) -> String {
     let version = match session {
-        Err(reason) => {
+        HealthSession::Foreign(reason) => {
             return format!(
                 "niri: NIRI_SOCKET is not this session's compositor ({reason}); niri window \
                  ids, focus and geometry are off."
             )
         }
-        Ok(Ok(version)) => version,
-        Ok(Err(error)) => format!("version unavailable: {error:#}"),
+        HealthSession::Inactive => {
+            return "niri: NIRI_SOCKET is this session's niri, but this process does not use \
+                    the niri adapter (inject mode or the native Wayland backend is off)."
+                .to_owned()
+        }
+        HealthSession::Attested(Ok(version)) => version,
+        HealthSession::Attested(Err(error)) => format!("version unavailable: {error:#}"),
     };
     match outputs {
         Ok(1) => format!("niri {version}: IPC attested to WAYLAND_DISPLAY."),
@@ -3074,18 +3087,25 @@ mod tests {
     #[test]
     fn health_note_states_attestation_and_the_single_output_limit() {
         assert_eq!(
-            describe_health(Ok(Ok("26.04 (8ed0da4)".into())), Ok(1)),
+            describe_health(HealthSession::Attested(Ok("26.04 (8ed0da4)".into())), Ok(1)),
             "niri 26.04 (8ed0da4): IPC attested to WAYLAND_DISPLAY."
         );
-        assert!(describe_health(Ok(Ok("26.04".into())), Ok(2))
-            .contains("refuse because 2 outputs are enabled"));
+        assert!(
+            describe_health(HealthSession::Attested(Ok("26.04".into())), Ok(2))
+                .contains("refuse because 2 outputs are enabled")
+        );
         assert_eq!(
             describe_health(
-                Err("NIRI_SOCKET is served by pid 1 but WAYLAND_DISPLAY by pid 2".into()),
+                HealthSession::Foreign(
+                    "NIRI_SOCKET is served by pid 1 but WAYLAND_DISPLAY by pid 2".into()
+                ),
                 Ok(1)
             ),
             "niri: NIRI_SOCKET is not this session's compositor (NIRI_SOCKET is served by pid 1 \
              but WAYLAND_DISPLAY by pid 2); niri window ids, focus and geometry are off."
         );
+        assert!(describe_health(HealthSession::Inactive, Ok(1)).starts_with(
+            "niri: NIRI_SOCKET is this session's niri, but this process does not use"
+        ));
     }
 }

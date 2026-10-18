@@ -1413,6 +1413,25 @@ fn session_id(environ: &[u8]) -> Result<String> {
     Ok(id.to_owned())
 }
 
+/// Run `call` on a detached thread and wait at most `timeout` for it. A call
+/// still blocked then is left to finish on its own; its result is dropped.
+fn within<T: Send + 'static>(
+    timeout: Duration,
+    what: &str,
+    call: impl FnOnce() -> T + Send + 'static,
+) -> Result<T> {
+    let (sender, receiver) = std::sync::mpsc::channel();
+    std::thread::Builder::new()
+        .name("cua-niri-logind".into())
+        .spawn(move || {
+            let _ = sender.send(call());
+        })
+        .with_context(|| format!("start a thread to {what}"))?;
+    receiver
+        .recv_timeout(timeout)
+        .map_err(|_| anyhow!("could not {what} within {timeout:?}"))
+}
+
 fn locked_hint(session: &str) -> Result<bool> {
     static BUS: Mutex<Option<zbus::blocking::Connection>> = Mutex::new(None);
     let mut bus = BUS
@@ -1421,10 +1440,12 @@ fn locked_hint(session: &str) -> Result<bool> {
     let connection = match bus.as_ref() {
         Some(connection) => connection.clone(),
         None => {
-            let connection = zbus::blocking::connection::Builder::system()?
-                .method_timeout(LOGIND_TIMEOUT)
-                .build()
-                .context("connect to the system bus")?;
+            let connection = within(LOGIND_TIMEOUT, "connect to the system bus", || {
+                zbus::blocking::connection::Builder::system()?
+                    .method_timeout(LOGIND_TIMEOUT)
+                    .build()
+            })?
+            .context("connect to the system bus")?;
             bus.insert(connection).clone()
         }
     };
@@ -2058,6 +2079,23 @@ mod tests {
                 String::from_utf8_lossy(environ)
             );
         }
+    }
+
+    #[test]
+    fn a_system_bus_that_never_answers_times_out() {
+        let started = Instant::now();
+        let error = within(
+            Duration::from_millis(50),
+            "connect to the system bus",
+            || std::thread::sleep(Duration::from_secs(5)),
+        )
+        .unwrap_err();
+        assert!(started.elapsed() < Duration::from_secs(2));
+        assert_eq!(
+            error.to_string(),
+            "could not connect to the system bus within 50ms"
+        );
+        assert_eq!(within(Duration::from_secs(1), "answer", || 7).unwrap(), 7);
     }
 
     #[test]

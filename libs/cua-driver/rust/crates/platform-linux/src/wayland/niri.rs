@@ -253,12 +253,17 @@ pub(super) fn attested_wayland_socket() -> Result<UnixStream> {
     Ok(socket)
 }
 
-fn ipc() -> Ipc<impl FnMut(Instant) -> Result<UnixStream>> {
+/// IPC to the recognised niri process. One value serves one action: its
+/// requests share one attested connection.
+type AttestedIpc = Ipc<fn(Instant) -> Result<UnixStream>>;
+
+fn ipc() -> AttestedIpc {
     Ipc {
         connect: attested_connection,
         per_attempt: QUERY_TIMEOUT,
         total: QUERY_TOTAL_TIMEOUT,
         backoff: QUERY_RETRY_BACKOFF,
+        lines: None,
     }
 }
 
@@ -407,9 +412,21 @@ struct Ipc<C> {
     per_attempt: Duration,
     total: Duration,
     backoff: Duration,
+    /// The connection earlier requests used. A connected socket keeps its
+    /// peer, so it stays attested; niri answers one connection's requests
+    /// in order. A failed exchange drops it, so a late reply is never read
+    /// as the answer to a later request.
+    lines: Option<Lines>,
 }
 
 impl<C: FnMut(Instant) -> Result<UnixStream>> Ipc<C> {
+    fn connection(&mut self, deadline: Instant) -> Result<Lines> {
+        match self.lines.take() {
+            Some(lines) => Ok(lines),
+            None => Ok(Lines::new((self.connect)(deadline)?)),
+        }
+    }
+
     /// A read-only request. Only a timed-out request/reply is retried, on a
     /// newly attested connection; connection and attestation errors are final.
     fn query<T: DeserializeOwned>(&mut self, request: Request) -> Result<T> {
@@ -418,9 +435,10 @@ impl<C: FnMut(Instant) -> Result<UnixStream>> Ipc<C> {
         for attempt in 1..=QUERY_MAX_ATTEMPTS {
             time_remaining(deadline)?;
             let attempt_deadline = deadline.min(Instant::now() + self.per_attempt);
-            let mut lines = Lines::new((self.connect)(attempt_deadline)?);
+            let mut lines = self.connection(attempt_deadline)?;
             match lines.exchange(&format!("\"{name}\""), attempt_deadline) {
                 Ok(reply) => {
+                    self.lines = Some(lines);
                     let mut payload = reply_ok(name, reply)?;
                     let value = payload
                         .get_mut(name)
@@ -452,10 +470,11 @@ impl<C: FnMut(Instant) -> Result<UnixStream>> Ipc<C> {
     fn action(&mut self, action: serde_json::Value) -> Result<()> {
         let deadline = Instant::now() + self.per_attempt;
         let request = serde_json::json!({ "Action": action }).to_string();
-        let mut lines = Lines::new((self.connect)(deadline)?);
+        let mut lines = self.connection(deadline)?;
         let reply = lines
             .exchange(&request, deadline)
             .context("niri action outcome is unknown")?;
+        self.lines = Some(lines);
         match reply_ok(&request, reply)? {
             serde_json::Value::String(handled) if handled == "Handled" => Ok(()),
             other => bail!("unexpected niri reply to {request}: {other}"),
@@ -1984,6 +2003,7 @@ mod tests {
         workspace_lag: usize,
         stale: Option<(usize, Vec<Value>)>,
         requests: Vec<String>,
+        connections: usize,
     }
 
     impl Fake {
@@ -2083,14 +2103,21 @@ mod tests {
             connect: move |_| {
                 let (client, server) = UnixStream::pair()?;
                 let fake = fake.clone();
+                fake.lock().unwrap().connections += 1;
                 std::thread::spawn(move || {
                     let mut lines = Lines::new(server);
-                    if let Ok(Some(line)) = lines.next(Instant::now() + Duration::from_secs(2)) {
+                    while let Ok(Some(line)) = lines.next(Instant::now() + Duration::from_secs(2)) {
                         let reply = fake
                             .lock()
                             .unwrap()
                             .reply(std::str::from_utf8(&line).unwrap());
-                        let _ = lines.stream.write_all(format!("{reply}\n").as_bytes());
+                        if lines
+                            .stream
+                            .write_all(format!("{reply}\n").as_bytes())
+                            .is_err()
+                        {
+                            return;
+                        }
                     }
                 });
                 Ok(client)
@@ -2098,6 +2125,7 @@ mod tests {
             per_attempt: Duration::from_secs(1),
             total: Duration::from_secs(2),
             backoff: Duration::from_millis(1),
+            lines: None,
         }
     }
 
@@ -2121,6 +2149,7 @@ mod tests {
             per_attempt,
             total,
             backoff: Duration::from_millis(1),
+            lines: None,
         }
     }
 
@@ -2194,6 +2223,17 @@ mod tests {
         assert_eq!(attempts, 2);
         // Bounded by the deadlines, not by the peer; loose for loaded CI.
         assert!(started.elapsed() < Duration::from_secs(2));
+    }
+
+    #[test]
+    fn one_action_attests_one_connection_for_all_its_requests() {
+        let fake = focus_fixture();
+        let mut ipc = fake_ipc(&fake);
+        ipc.focused_window().unwrap();
+        activate_in(&mut ipc, 7, Some(107), Duration::from_millis(200)).unwrap();
+        let fake = fake.lock().unwrap();
+        assert_eq!(fake.requests.len(), 5, "{:?}", fake.requests);
+        assert_eq!(fake.connections, 1);
     }
 
     #[test]

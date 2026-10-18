@@ -36,9 +36,12 @@ const MAX_LOGICAL_PIXELS: u64 = 64 * 1024 * 1024;
 /// How long niri may take to apply and report a focus change.
 const FOCUS_CONFIRM_TIMEOUT: Duration = Duration::from_millis(500);
 /// How long the layout must stay unchanged before IPC geometry is taken to
-/// be what niri renders. niri's default window, workspace and overview
-/// animations finish well inside this; a configuration that slows them past
-/// it is not detected.
+/// be what niri renders. This is an assumption, not proof: niri's IPC
+/// positions exclude animation offsets and niri reports no animation state,
+/// so an animation longer than this (a slow `animations` config) is not
+/// detected, and input or a window capture can then use the destination
+/// while the window is still drawn elsewhere. niri's default animations
+/// finish well inside it.
 const SETTLE_QUIET: Duration = Duration::from_secs(1);
 /// How long a geometry-bound route waits for the layout to go quiet.
 const SETTLE_LIMIT: Duration = Duration::from_secs(4);
@@ -1451,9 +1454,9 @@ impl LayoutWatch {
 
 /// An open event stream that has seen the layout stay unchanged for
 /// [`SETTLE_QUIET`]. niri reports a new place at once and animates to it, and
-/// the stream does not report the animation's end; a quiet period at least
-/// as long as niri's animations is the evidence that IPC geometry matches
-/// what niri renders and hit-tests.
+/// the stream does not report the animation's end. The quiet period only
+/// covers animations no longer than [`SETTLE_QUIET`]; a longer one passes
+/// this gate with stale geometry.
 struct Quiet {
     lines: Lines,
     watch: LayoutWatch,

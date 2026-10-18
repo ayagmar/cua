@@ -626,6 +626,9 @@ pub struct Placed {
     /// The window's geometry in the global logical layout.
     pub rect: Rect,
     pub output: String,
+    /// The output's logical rectangle: niri shows no part of the window
+    /// outside it.
+    pub area: Rect,
     /// The tiles of the workspace's other floating windows. IPC reports no
     /// stacking order, so any of them may be above this window.
     pub others: Vec<Rect>,
@@ -710,6 +713,12 @@ impl Scene {
         Ok(Placed {
             rect,
             output: workspace.output.clone().unwrap_or_default(),
+            area: Rect {
+                x: logical.x,
+                y: logical.y,
+                width: logical.width,
+                height: logical.height,
+            },
             others,
         })
     }
@@ -1400,6 +1409,12 @@ fn pointer_admission(
             return Err(foreground_unavailable(format!(
                 "point ({x}, {y}) is outside niri window {} at {:?}",
                 window.id, placed.rect
+            )));
+        }
+        if !placed.area.contains(x, y) {
+            return Err(foreground_unavailable(format!(
+                "point ({x}, {y}) is past the edge of niri output {}, where window {} is not shown",
+                placed.output, window.id
             )));
         }
         if !placed.hits(x, y) {
@@ -2616,6 +2631,14 @@ mod tests {
         assert_eq!(
             pointer_admission(&window, rect, &[(150, 100), (5, 5)], |_| None).unwrap_err().to_string(),
             "foreground_unavailable: point (5, 5) is outside niri window 7 at Rect { x: 100, y: 60, width: 300, height: 200 }"
+        );
+        // Taller than the 853x480 output: its bottom is not shown.
+        let scene = one_output(vec![floating(9, 1, (100.0, 60.0), (300, 500))]);
+        let tall = placed_window(&scene, 9);
+        let tall_rect = tall.placement.as_ref().unwrap().rect;
+        assert_eq!(
+            pointer_admission(&tall, tall_rect, &[(150, 500)], |_| None).unwrap_err().to_string(),
+            "foreground_unavailable: point (150, 500) is past the edge of niri output winit, where window 9 is not shown"
         );
         let tiled = one_output(vec![tiled(5, 1, (402.0, 448.0))])
             .window(5)

@@ -1440,6 +1440,13 @@ pub(crate) fn pointer_abs(
     )
 }
 
+/// Whether `motion_absolute` reaches layout point `(x, y)` itself rather
+/// than a point [`pointer_abs`] clamped it to.
+fn pointer_reaches(origin_x: i32, origin_y: i32, w: u32, h: u32, x: i32, y: i32) -> bool {
+    let (px, py) = pointer_abs(origin_x, origin_y, w, h, x, y);
+    (origin_x + px as i32, origin_y + py as i32) == (x, y)
+}
+
 /// How one desktop-scope action is addressed: desktop-frame points (from
 /// `get_desktop_state`) convert to layout coordinates, and the virtual pointer
 /// is sized, from a single compositor snapshot. Other compositors keep the
@@ -1910,9 +1917,29 @@ pub fn click_desktop(
 /// proves each layout point lands on the target window (see
 /// [`niri::settle_pointer`]). Desktop-scope input names no window: its points
 /// are desktop-frame pixels and need no window geometry.
-fn niri_pointer_gate(window_id: Option<u64>, points: &[(i32, i32)]) -> anyhow::Result<()> {
+fn niri_pointer_gate(
+    window_id: Option<u64>,
+    sess: &VptrSession,
+    points: &[(i32, i32)],
+) -> anyhow::Result<()> {
     if !(is_wayland() && niri::is_session()) {
         return Ok(());
+    }
+    // `motion_absolute` clamps into the pointer space: a point it would move
+    // lands somewhere other than where it was aimed.
+    for &(x, y) in points {
+        if !pointer_reaches(
+            sess.origin_x,
+            sess.origin_y,
+            sess.output_w,
+            sess.output_h,
+            x,
+            y,
+        ) {
+            anyhow::bail!(
+                "foreground_unavailable: point ({x}, {y}) is outside the niri pointer space"
+            );
+        }
     }
     match window_id.or_else(|| current_foreground_target().map(|(_, id)| id)) {
         Some(id) => niri::settle_pointer(id, points),
@@ -1933,15 +1960,18 @@ fn click_vptr(
     let mut sess = open_vptr_session_in(window_id, snapshot)?;
     std::thread::sleep(std::time::Duration::from_millis(40));
     let (w, h) = (sess.output_w, sess.output_h);
-    let (px, py) = if x == 0 && y == 0 && !hyprland::is_session() {
+    let centre = x == 0 && y == 0 && !hyprland::is_session();
+    let (px, py) = if centre {
         (w / 2, h / 2)
     } else {
         sess.abs(x, y)
     };
-    niri_pointer_gate(
-        window_id,
-        &[(sess.origin_x + px as i32, sess.origin_y + py as i32)],
-    )?;
+    let aimed = if centre {
+        (sess.origin_x + px as i32, sess.origin_y + py as i32)
+    } else {
+        (x, y)
+    };
+    niri_pointer_gate(window_id, &sess, &[aimed])?;
     let btn = evdev_pointer_button(button);
     for i in 0..count.max(1) {
         if i > 0 {
@@ -2147,10 +2177,7 @@ fn scroll_vptr(
     let mut sess = open_vptr_session_in(window_id, snapshot)?;
     if let Some((x, y)) = point {
         let (px, py) = sess.abs(x, y);
-        niri_pointer_gate(
-            window_id,
-            &[(sess.origin_x + px as i32, sess.origin_y + py as i32)],
-        )?;
+        niri_pointer_gate(window_id, &sess, &[(x, y)])?;
         sess.point_at(px, py)?;
         record_synth_cursor(sess.origin_x + px as i32, sess.origin_y + py as i32);
         std::thread::sleep(std::time::Duration::from_millis(15));
@@ -2249,10 +2276,7 @@ fn move_cursor_absolute_vptr(
     let mut sess = open_vptr_session_in(window_id, snapshot)?;
     let (w, h) = (sess.output_w, sess.output_h);
     let (px, py) = sess.abs(x, y);
-    niri_pointer_gate(
-        window_id,
-        &[(sess.origin_x + px as i32, sess.origin_y + py as i32)],
-    )?;
+    niri_pointer_gate(window_id, &sess, &[(x, y)])?;
     sess.vptr.motion_absolute(event_time_ms(), px, py, w, h);
     sess.vptr.frame();
     sess.queue.roundtrip(&mut sess.state)?;
@@ -2350,13 +2374,7 @@ fn drag_vptr(
     let clamp_xy = |x: i32, y: i32| pointer_abs(origin_x, origin_y, w, h, x, y);
     let (fx, fy) = clamp_xy(from_x, from_y);
     let (tx, ty) = clamp_xy(to_x, to_y);
-    niri_pointer_gate(
-        window_id,
-        &[
-            (origin_x + fx as i32, origin_y + fy as i32),
-            (origin_x + tx as i32, origin_y + ty as i32),
-        ],
-    )?;
+    niri_pointer_gate(window_id, &sess, &[(from_x, from_y), (to_x, to_y)])?;
     sess.vptr.motion_absolute(event_time_ms(), fx, fy, w, h);
     sess.vptr.frame();
     sess.queue.roundtrip(&mut sess.state)?;
@@ -4079,6 +4097,17 @@ mod output_transform_tests {
 
 #[cfg(test)]
 mod tests {
+    /// A point past the pointer space is clamped onto another pixel; the
+    /// niri gate must see that rather than admit the clamped point.
+    #[test]
+    fn clamped_points_are_not_reached() {
+        // The lane's 1280x720 logical output at scale 1.5.
+        assert!(super::pointer_reaches(0, 0, 1280, 720, 100, 719));
+        assert!(!super::pointer_reaches(0, 0, 1280, 720, 100, 750));
+        assert!(!super::pointer_reaches(0, 0, 1280, 720, -1, 10));
+        assert!(super::pointer_reaches(-100, 0, 2773, 1080, -100, 0));
+    }
+
     /// The pointer always moves before a desktop click or scroll, even when
     /// it already sits on the target pixel (corners and 1-pixel outputs too).
     #[test]

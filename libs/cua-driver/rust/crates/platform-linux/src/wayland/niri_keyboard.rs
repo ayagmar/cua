@@ -416,7 +416,7 @@ pub(super) fn type_text(expected: Option<u64>, text: &str) -> Result<()> {
     let mut session = Session::begin(expected, text.chars().count())?;
     let parts = plan_text(session.keyboard.base_text(), session.group, text)?;
     let total: usize = parts.iter().map(|part| part.keys.len()).sum();
-    let mut sent = 0;
+    let mut sent = Sent::default();
     let typed = session.send(&parts, &mut sent);
     outcome(sent, total, typed, session.finish())
 }
@@ -432,9 +432,11 @@ pub(super) fn press(expected: Option<u64>, modifiers: &[String], name: &str) -> 
         keys: vec![key],
         extended: None,
     }];
-    let typed = session.send(&parts, &mut 0);
+    let mut sent = Sent::default();
+    let typed = session.send(&parts, &mut sent);
     match (typed, session.finish()) {
         (Ok(()), Ok(())) => Ok(()),
+        (Err(error), _) if sent.underway => Err(anyhow!("the key may have gone out: {error:#}")),
         (Err(error), _) => Err(error),
         (Ok(()), Err(error)) => Err(error.context("pressed the key, but could not finish")),
     }
@@ -466,7 +468,7 @@ impl Session {
         })
     }
 
-    fn send(&mut self, parts: &[Part], sent: &mut usize) -> Result<()> {
+    fn send(&mut self, parts: &[Part], sent: &mut Sent) -> Result<()> {
         let target = self.target;
         type_parts(
             &mut self.keyboard,
@@ -530,15 +532,30 @@ fn focus_moved(target: u64, focused: Option<u64>, sent: usize) -> anyhow::Error 
     )
 }
 
-/// A stop before any key keeps its refusal; a stop after some keys went out
-/// says how many, without the `foreground_unavailable` code that would
-/// report no effect, as a partial scroll does.
-fn outcome(sent: usize, total: usize, typed: Result<()>, finished: Result<()>) -> Result<()> {
+/// How far a call got: the keys niri confirmed, and whether one more was
+/// sent but not confirmed, so may have gone out.
+#[derive(Clone, Copy, Debug, Default)]
+struct Sent {
+    done: usize,
+    underway: bool,
+}
+
+/// A stop before any key keeps its refusal; a stop after some keys went out,
+/// or with one that may have, says how many, without the
+/// `foreground_unavailable` code that would report no effect, as a partial
+/// scroll does.
+fn outcome(sent: Sent, total: usize, typed: Result<()>, finished: Result<()>) -> Result<()> {
+    let done = sent.done;
     match (typed, finished) {
         (Ok(()), Ok(())) => Ok(()),
-        (Err(error), _) if sent == 0 => Err(error),
+        (Err(error), _) if sent.underway => Err(anyhow!(
+            "type_text stopped after {done} of {total} characters, and character {} may have \
+             gone out: {error:#}",
+            done + 1
+        )),
+        (Err(error), _) if done == 0 => Err(error),
         (Err(error), _) => Err(anyhow!(
-            "type_text stopped after {sent} of {total} characters: {error:#}"
+            "type_text stopped after {done} of {total} characters: {error:#}"
         )),
         (Ok(()), Err(error)) => Err(error.context(format!(
             "typed all {total} characters, but could not put niri's keymap back"
@@ -561,7 +578,7 @@ fn type_parts(
     parts: &[Part],
     group: u32,
     deadline: Instant,
-    sent: &mut usize,
+    sent: &mut Sent,
     mut still_focused: impl FnMut(usize) -> Result<()>,
 ) -> Result<()> {
     for part in parts {
@@ -569,12 +586,14 @@ fn type_parts(
             if Instant::now() >= deadline {
                 bail!("foreground_unavailable: niri text input ran out of time");
             }
-            still_focused(*sent)?;
+            still_focused(sent.done)?;
             if let (0, Some(map)) = (index, &part.extended) {
                 keyboard.upload(map)?;
             }
+            sent.underway = true;
             keyboard.stroke(*key, group, deadline)?;
-            *sent += 1;
+            sent.underway = false;
+            sent.done += 1;
         }
     }
     Ok(())
@@ -1010,6 +1029,8 @@ mod tests {
     #[derive(Default)]
     struct Recorder {
         events: Vec<String>,
+        /// The stroke whose round trip fails, as when niri does not answer.
+        fails: Option<usize>,
     }
 
     impl Strokes for Recorder {
@@ -1018,7 +1039,12 @@ mod tests {
             Ok(())
         }
         fn stroke(&mut self, key: Key, _: u32, _: Instant) -> Result<()> {
+            let index = self.events.len();
             self.events.push(key.code.to_string());
+            anyhow::ensure!(
+                self.fails != Some(index),
+                "niri did not answer a Wayland round trip in time"
+            );
             Ok(())
         }
     }
@@ -1031,18 +1057,18 @@ mod tests {
     fn an_extended_keymap_goes_up_before_its_first_key() {
         let parts = plan_text(US_DE, 0, "a→").unwrap();
         let mut recorder = Recorder::default();
-        let mut sent = 0;
+        let mut sent = Sent::default();
         type_parts(&mut recorder, &parts, 0, later(), &mut sent, |_| Ok(())).unwrap();
         assert_eq!(recorder.events[0], "keymap");
         assert_eq!(recorder.events.len(), 3);
-        assert_eq!(sent, 2);
+        assert_eq!(sent.done, 2);
     }
 
     #[test]
     fn typing_stops_when_focus_leaves_and_reports_the_partial_effect() {
         let parts = plan_text(US_DE, 0, "hello").unwrap();
         let mut recorder = Recorder::default();
-        let mut sent = 0;
+        let mut sent = Sent::default();
         let mut checks = 0;
         let typed = type_parts(&mut recorder, &parts, 0, later(), &mut sent, |_| {
             checks += 1;
@@ -1062,7 +1088,7 @@ mod tests {
         assert_eq!(crate::input::foreground::error_code(&stopped), None);
 
         // Focus gone before the first key: nothing went out.
-        let mut sent = 0;
+        let mut sent = Sent::default();
         let typed = type_parts(&mut recorder, &parts, 0, later(), &mut sent, |_| {
             anyhow::bail!("foreground_unavailable: niri keyboard focus moved")
         });
@@ -1077,7 +1103,16 @@ mod tests {
     fn a_focus_move_after_some_keys_says_the_last_may_have_reached_the_new_window() {
         let before = focus_moved(3, Some(4), 0).to_string();
         assert!(!before.contains("may have reached"), "{before}");
-        let after = outcome(7, 400, Err(focus_moved(3, Some(4), 7)), Ok(())).unwrap_err();
+        let after = outcome(
+            Sent {
+                done: 7,
+                underway: false,
+            },
+            400,
+            Err(focus_moved(3, Some(4), 7)),
+            Ok(()),
+        )
+        .unwrap_err();
         assert!(
             after
                 .to_string()
@@ -1113,10 +1148,37 @@ mod tests {
     }
 
     #[test]
+    fn a_stroke_that_fails_after_sending_says_its_key_may_have_gone_out() {
+        let parts = plan_text(US_DE, 0, "hello").unwrap();
+        for (fails, message) in [
+            (
+                2,
+                "type_text stopped after 2 of 5 characters, and character 3 may have gone out: \
+                 niri did not answer a Wayland round trip in time",
+            ),
+            (
+                0,
+                "type_text stopped after 0 of 5 characters, and character 1 may have gone out: \
+                 niri did not answer a Wayland round trip in time",
+            ),
+        ] {
+            let mut recorder = Recorder {
+                fails: Some(fails),
+                ..Recorder::default()
+            };
+            let mut sent = Sent::default();
+            let typed = type_parts(&mut recorder, &parts, 0, later(), &mut sent, |_| Ok(()));
+            let stopped = outcome(sent, 5, typed, Ok(())).unwrap_err();
+            assert_eq!(stopped.to_string(), message);
+            assert_eq!(crate::input::foreground::error_code(&stopped), None);
+        }
+    }
+
+    #[test]
     fn typing_stops_at_the_deadline() {
         let parts = plan_text(US_DE, 0, "hello").unwrap();
         let mut recorder = Recorder::default();
-        let mut sent = 0;
+        let mut sent = Sent::default();
         let typed = type_parts(&mut recorder, &parts, 0, Instant::now(), &mut sent, |_| {
             Ok(())
         });

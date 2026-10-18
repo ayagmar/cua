@@ -6081,30 +6081,33 @@ fn capture_admission_error(error: anyhow::Error) -> ToolResult {
 }
 static CLICK_DEF: std::sync::OnceLock<ToolDef> = std::sync::OnceLock::new();
 
-/// Wheel detents for a compositor scroll: one per line, and a page as the
-/// same detent approximation the Hyprland route documents.
-fn wheel_ticks(amount: usize, by: cua_driver_contract::ScrollBy) -> u32 {
+/// Wheel detents for a compositor scroll: one per line. On niri a page is
+/// the detent approximation the Hyprland route documents; other compositors
+/// keep one detent per page, which no run has measured against.
+fn wheel_ticks(amount: usize, by: cua_driver_contract::ScrollBy, niri: bool) -> u32 {
     let detents = match by {
-        cua_driver_contract::ScrollBy::Line => amount,
-        cua_driver_contract::ScrollBy::Page => {
+        cua_driver_contract::ScrollBy::Page if niri => {
             amount * crate::wayland::hyprland_input::PAGE_WHEEL_DETENTS
         }
+        _ => amount,
     };
     detents as u32
 }
 
 #[cfg(test)]
 #[test]
-fn a_page_scroll_sends_more_than_one_detent_per_page() {
+fn a_niri_page_scroll_sends_more_than_one_detent_per_page() {
     // `by: "page"` used to send `amount` detents, the same as lines: two
     // pages moved a WebKitGTK scroller 80 px under niri, less than its
     // 128 px viewport.
     use cua_driver_contract::ScrollBy;
-    assert_eq!(wheel_ticks(2, ScrollBy::Line), 2);
+    assert_eq!(wheel_ticks(2, ScrollBy::Line, true), 2);
     assert_eq!(
-        wheel_ticks(2, ScrollBy::Page),
+        wheel_ticks(2, ScrollBy::Page, true),
         2 * crate::wayland::hyprland_input::PAGE_WHEEL_DETENTS as u32
     );
+    // Sway, KWin and GNOME keep their earlier page scroll.
+    assert_eq!(wheel_ticks(2, ScrollBy::Page, false), 2);
 }
 
 /// Presses in one click train: 1 to 3, as the contract states. A niri click
@@ -10238,7 +10241,7 @@ impl Tool for ScrollTool {
                 Ok(point) => point,
                 Err(error) => return input_error_result(error),
             };
-            let ticks = wheel_ticks(amount, by);
+            let ticks = wheel_ticks(amount, by, crate::wayland::niri::is_session());
             let result = tokio::task::spawn_blocking(move || {
                 crate::wayland::scroll_at(xid, output_point, &direction_for_wayland, ticks)
             })

@@ -919,7 +919,8 @@ pub mod macos {
 #[path = "observer_hyprland.rs"]
 mod hyprland;
 
-#[cfg(any(target_os = "linux", all(test, unix)))]
+// niri's transport uses Linux-only peer credentials.
+#[cfg(target_os = "linux")]
 #[path = "observer_niri.rs"]
 mod niri;
 

@@ -10,7 +10,6 @@
 //! canonical niri lane (`CUA_E2E_WAYLAND_SESSION=niri`) guarantees all three,
 //! so the rule is trusted only there. Every other overlap is reported as
 //! ambiguous instead of guessed.
-#![cfg_attr(not(target_os = "linux"), allow(dead_code))]
 
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Read, Write};

@@ -5,9 +5,11 @@
 //! occlusion is classified only where niri's own rendering rule decides it:
 //! floating windows are not drawn while a tiled window in a fullscreen column
 //! holds focus on the same workspace (`Workspace::is_floating_visible`). That
-//! rule needs a static view, so it holds only with animations off and focus
-//! not following the mouse, as the canonical niri lane configures. Every other
-//! overlap is reported as ambiguous instead of guessed.
+//! rule needs a static view, focus that does not follow the mouse, and a
+//! fullscreen (not maximized) column, which IPC cannot tell apart by size. The
+//! canonical niri lane (`CUA_E2E_WAYLAND_SESSION=niri`) guarantees all three,
+//! so the rule is trusted only there. Every other overlap is reported as
+//! ambiguous instead of guessed.
 #![cfg_attr(not(target_os = "linux"), allow(dead_code))]
 
 use std::collections::HashMap;
@@ -118,6 +120,9 @@ struct Desktop {
     workspaces: Vec<Workspace>,
     outputs: HashMap<String, Output>,
     overview_open: bool,
+    /// The canonical niri lane's config: animations and focus-follows-mouse
+    /// off, and only the sentinel's fullscreen column covers the output.
+    lane_config: bool,
 }
 
 fn desktop() -> Result<Desktop, ObserverError> {
@@ -126,6 +131,7 @@ fn desktop() -> Result<Desktop, ObserverError> {
         workspaces: query("Workspaces")?,
         outputs: query("Outputs")?,
         overview_open: query::<Overview>("OverviewState")?.is_open,
+        lane_config: std::env::var("CUA_E2E_WAYLAND_SESSION").as_deref() == Ok("niri"),
     })
 }
 
@@ -215,6 +221,11 @@ fn classify(desktop: &Desktop, target: TargetWindow) -> Result<TargetZ, Observer
             && focused.workspace_id == Some(workspace.id)
             && covers_output(focused, output)
     }) {
+        if !desktop.lane_config {
+            return Err(ObserverError::new(
+                "niri fullscreen occlusion is only certified under the niri lane config",
+            ));
+        }
         return Ok(TargetZ::BackgroundOccluded);
     }
     for other in &desktop.windows {
@@ -361,6 +372,7 @@ mod tests {
             }))
             .unwrap(),
             overview_open: false,
+            lane_config: true,
         }
     }
 
@@ -382,6 +394,21 @@ mod tests {
             classify(&desktop, target(10, 100)).unwrap(),
             TargetZ::Foreground
         );
+    }
+
+    #[test]
+    fn fullscreen_sized_tile_outside_the_lane_config_is_ambiguous() {
+        // A maximized column, focus-follows-mouse or a moving view leaves
+        // floating windows visible over a tile of the same size.
+        let mut desktop = desktop(vec![
+            fullscreen(window(10, 100, false, true)),
+            window(20, 200, true, false),
+        ]);
+        desktop.lane_config = false;
+        assert!(classify(&desktop, target(20, 200))
+            .unwrap_err()
+            .to_string()
+            .contains("only certified under the niri lane config"));
     }
 
     #[test]

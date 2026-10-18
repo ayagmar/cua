@@ -1396,6 +1396,52 @@ fn foreground_unavailable(detail: impl std::fmt::Display) -> anyhow::Error {
     anyhow!("foreground_unavailable: {detail}")
 }
 
+/// The next step for a niri input refusal, from the remedy its detail names.
+/// `None` for refusals this module does not word, which keep the generic
+/// suggestion.
+pub fn refusal_suggestion(detail: &str) -> Option<&'static str> {
+    let remedies: [(&[&str], &str); 7] = [
+        (
+            &["float the window"],
+            "niri does not report where tiled windows are: call get_desktop_state and act at desktop scope (needs the display grant), or float the window.",
+        ),
+        (
+            &[
+                "take a new screenshot",
+                "take one first",
+                "use the latest screenshot",
+                "call get_desktop_state again",
+                "during get_desktop_state; call it again",
+            ],
+            "Take a new screenshot (get_desktop_state for desktop-scope points, get_window_state for a floating window) and retry with its coordinates.",
+        ),
+        (
+            &["lies under another floating window"],
+            "Move the floating windows apart so the point is on one of them, or call get_desktop_state and act at desktop scope.",
+        ),
+        (
+            &["is outside niri window", "where window"],
+            "Pass a point inside the window, from its latest get_window_state screenshot.",
+        ),
+        (
+            &["which the get_desktop_state screenshot shows"],
+            "Pass a point on the niri output, from the latest get_desktop_state screenshot.",
+        ),
+        (
+            &["overview is open"],
+            "Close the niri overview, then retry.",
+        ),
+        (
+            &["did not stay unchanged"],
+            "Wait for niri's animations to finish, then retry.",
+        ),
+    ];
+    remedies
+        .iter()
+        .find(|(phrases, _)| phrases.iter().any(|phrase| detail.contains(phrase)))
+        .map(|(_, suggestion)| *suggestion)
+}
+
 /// An IPC failure on an input route, with its whole cause chain. A refusal
 /// that already carries the code is kept as it is.
 pub(crate) fn input_unavailable(error: anyhow::Error) -> anyhow::Error {
@@ -3150,6 +3196,40 @@ mod tests {
             Attestation::Unrelated(_)
         ));
         assert_eq!(attest(None, Ok(20), Ok(20)), Attestation::Attested(20));
+    }
+
+    #[test]
+    fn a_niri_refusal_suggests_the_remedy_its_detail_names() {
+        let screenshot = refusal_suggestion(
+            &desktop_frame(history())
+                .holds(
+                    &{
+                        let mut scene = tiled_scene(Some(5));
+                        scene.overview_open = true;
+                        scene
+                    },
+                    history(),
+                )
+                .unwrap_err()
+                .to_string(),
+        );
+        assert!(screenshot.unwrap().starts_with("Take a new screenshot"));
+        let tiled = aim_at(&tiled_scene(Some(5)).window(5).unwrap(), 10, 20).unwrap_err();
+        assert!(refusal_suggestion(&tiled.to_string())
+            .unwrap()
+            .contains("act at desktop scope"));
+        let history = history();
+        let edge = desktop_frame(history)
+            .admit(&tiled_scene(Some(5)), &[(10, 100)], history)
+            .unwrap_err();
+        assert!(refusal_suggestion(&edge.to_string())
+            .unwrap()
+            .starts_with("Pass a point on the niri output"));
+        // A refusal this module does not word keeps the generic suggestion.
+        assert_eq!(
+            refusal_suggestion("foreground_unavailable: no window"),
+            None
+        );
     }
 
     #[test]

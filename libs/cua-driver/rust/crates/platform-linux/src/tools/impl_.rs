@@ -2711,12 +2711,28 @@ fn input_error_result(e: anyhow::Error) -> ToolResult {
             "effect": "none",
             "suggestion": if code == crate::input::foreground::CODE_TIMEOUT {
                 "Take a screenshot (get_desktop_state) to confirm the desktop is responsive, then retry once."
+            } else if let Some(suggestion) = crate::wayland::niri::refusal_suggestion(&text) {
+                suggestion
             } else {
                 "Call bring_to_front on the window (or its modal dialog), confirm with get_window_state, then retry."
             },
         })),
         None => linux_input_error(e),
     }
+}
+
+#[cfg(test)]
+#[test]
+fn a_niri_refusal_suggests_its_own_remedy_instead_of_bring_to_front() {
+    let refused = input_error_result(anyhow::anyhow!(
+        "foreground_unavailable: the niri layout changed after the get_desktop_state screenshot, so its pixels may be elsewhere now; take a new screenshot"
+    ));
+    let structured = refused.structured_content.unwrap();
+    assert_eq!(structured["code"], "foreground_unavailable");
+    assert!(structured["suggestion"]
+        .as_str()
+        .unwrap()
+        .starts_with("Take a new screenshot"));
 }
 
 /// Structured payload for a completed foreground transaction.

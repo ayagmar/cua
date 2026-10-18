@@ -487,9 +487,6 @@ impl Session {
     }
 }
 
-/// Focus left `target` for `focused`. niri can move focus between its answer
-/// and the next key, so once keys went out the last one may have reached the
-/// window that has focus now; niri offers no check that is atomic with a key.
 /// The window a call types into: the one with keyboard focus, which must be
 /// `expected` when the caller activated a window, since another window may
 /// have taken focus after the activation was confirmed.
@@ -508,6 +505,9 @@ fn admitted_target(expected: Option<u64>, focused: Option<u64>) -> Result<u64> {
     }
 }
 
+/// Focus left `target` for `focused`. niri can move focus between its answer
+/// and the next key, so once keys went out the last one may have reached the
+/// window that has focus now; niri offers no check that is atomic with a key.
 fn focus_moved(target: u64, focused: Option<u64>, sent: usize) -> anyhow::Error {
     let now = focused.map_or_else(|| "no window".to_owned(), |id| format!("window {id}"));
     if sent == 0 {

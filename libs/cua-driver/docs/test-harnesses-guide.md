@@ -382,7 +382,7 @@ wlroots protocols. The niri lane (`CUA_E2E_WAYLAND_SESSION=niri` in
 headless cage; its observer reads niri IPC, which reports no stacking order and
 no tiled-window positions, and cannot tell a fullscreen tile from a maximized
 one. It reports a floating harness window as occluded only behind the focused
-sentinel while the sentinel's own heartbeat reports fullscreen, and one that
+sentinel while the sentinel itself reports being fullscreen, and one that
 overlaps no other floating window as visible. It refuses tiled targets,
 overlapping floating windows, an open overview, and any other output-sized
 tile, including a maximized sentinel.

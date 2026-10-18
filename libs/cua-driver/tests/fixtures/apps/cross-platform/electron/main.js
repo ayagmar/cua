@@ -13,6 +13,7 @@ const customCuaCompositor = process.env.CUA_E2E_WAYLAND_SESSION === 'cua-composi
 const fixtureJournalUrl = process.env.CUA_E2E_FIXTURE_JOURNAL_URL || '';
 const sentinelJournalPath = process.env.CUA_E2E_SENTINEL_JOURNAL || '';
 const sentinelControlPath = process.env.CUA_E2E_SENTINEL_CONTROL || '';
+const sentinelStatePath = process.env.CUA_E2E_SENTINEL_STATE || '';
 if (process.env.CUA_E2E_USER_DATA_DIR) {
   app.setPath('userData', process.env.CUA_E2E_USER_DATA_DIR);
 }
@@ -157,11 +158,19 @@ function createWindow() {
                     mainWindow.webContents.send('cua-e2e-sentinel-arm-setup-click', request.token);
                   }
                 }
-                // Fullscreen as the compositor's last configure set it; niri's
-                // IPC cannot tell a fullscreen tile from a maximized one.
-                mainWindow.webContents.send('cua-e2e-sentinel-heartbeat-probe', {
-                  fullscreen: mainWindow.isFullScreen(),
-                });
+                if (sentinelStatePath) {
+                  // Fullscreen as the compositor's last configure set it; niri's
+                  // IPC cannot tell a fullscreen tile from a maximized one. The
+                  // event journal is reset during setup, so this state is kept
+                  // in its own file, replaced whole on every tick.
+                  const state = JSON.stringify({
+                    at_ms: Date.now(),
+                    fullscreen: mainWindow.isFullScreen(),
+                  });
+                  fs.writeFileSync(`${sentinelStatePath}.tmp`, state, 'utf8');
+                  fs.renameSync(`${sentinelStatePath}.tmp`, sentinelStatePath);
+                }
+                mainWindow.webContents.send('cua-e2e-sentinel-heartbeat-probe');
               }
             }, 100);
             sentinelHeartbeatTimer.unref();

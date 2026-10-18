@@ -34,8 +34,8 @@ const QUERY_TIMEOUT: Duration = Duration::from_secs(1);
 const REPLY_LIMIT: u64 = 1024 * 1024;
 /// Logical pixels of slack when comparing a fullscreen tile with its output.
 const FULLSCREEN_TOLERANCE: f64 = 1.0;
-/// The oldest sentinel heartbeat whose fullscreen report is still trusted;
-/// the sentinel sends one every 100 ms.
+/// The oldest sentinel fullscreen report that is still trusted; the
+/// sentinel writes one every 100 ms.
 const SENTINEL_REPORT_MAX_AGE: Duration = Duration::from_secs(1);
 
 /// Connects without blocking past `timeout`: a wedged compositor stops
@@ -299,15 +299,16 @@ struct Desktop {
     sentinel: Option<Sentinel>,
 }
 
-/// The registered foreground sentinel and the fullscreen state its latest
-/// recent heartbeat reported, if any.
+/// The registered foreground sentinel and the fullscreen state of its latest
+/// recent report, if any.
 #[derive(Clone, Copy, Debug)]
 struct Sentinel {
     window: TargetWindow,
     fullscreen: Option<bool>,
 }
 
-/// The foreground sentinel's window and event journal.
+/// The foreground sentinel's window and its fullscreen state file, which the
+/// sentinel replaces on every tick and setup never resets.
 static SENTINEL: Mutex<Option<(TargetWindow, PathBuf)>> = Mutex::new(None);
 
 /// Registers the foreground sentinel whose fullscreen reports may certify
@@ -319,33 +320,29 @@ pub(super) fn register_sentinel(sentinel: Option<(TargetWindow, PathBuf)>) {
 }
 
 fn sentinel() -> Option<Sentinel> {
-    let (window, journal) = SENTINEL
+    let (window, state) = SENTINEL
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
         .clone()?;
     let now = SystemTime::now()
         .duration_since(SystemTime::UNIX_EPOCH)
         .unwrap_or_default();
-    let fullscreen = std::fs::read_to_string(journal)
+    let fullscreen = std::fs::read_to_string(state)
         .ok()
-        .and_then(|journal| reported_fullscreen(&journal, now));
+        .and_then(|state| reported_fullscreen(&state, now));
     Some(Sentinel { window, fullscreen })
 }
 
-/// The fullscreen state of the sentinel's latest complete heartbeat, unless
-/// it is older than [`SENTINEL_REPORT_MAX_AGE`] at `now` (since the epoch).
-fn reported_fullscreen(journal: &str, now: Duration) -> Option<bool> {
-    let heartbeat = journal
-        .split_inclusive('\n')
-        .filter(|line| line.ends_with('\n'))
-        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
-        .filter(|event| event["kind"] == "heartbeat")
-        .last()?;
-    let at = Duration::from_millis(heartbeat["at_ms"].as_u64()?);
+/// The fullscreen state the sentinel wrote, `{"at_ms":…,"fullscreen":…}`,
+/// unless it is older than [`SENTINEL_REPORT_MAX_AGE`] at `now` (since the
+/// epoch).
+fn reported_fullscreen(state: &str, now: Duration) -> Option<bool> {
+    let state: serde_json::Value = serde_json::from_str(state).ok()?;
+    let at = Duration::from_millis(state["at_ms"].as_u64()?);
     if now.saturating_sub(at) > SENTINEL_REPORT_MAX_AGE {
         return None;
     }
-    heartbeat["fullscreen"].as_bool()
+    state["fullscreen"].as_bool()
 }
 
 /// One desktop state from four requests. Each request is its own connection,
@@ -894,28 +891,46 @@ mod tests {
     }
 
     #[test]
-    fn sentinel_fullscreen_comes_from_its_latest_recent_heartbeat() {
+    fn sentinel_fullscreen_report_survives_a_journal_reset_before_the_posture_snapshot() {
+        // ForegroundSentinel waits for a heartbeat, resets its event journal
+        // and immediately checks the background posture.
+        let directory = tempfile::tempdir().unwrap();
+        let journal = directory.path().join("sentinel-events.jsonl");
+        let state = directory.path().join("sentinel-state.json");
+        let now = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_millis();
+        std::fs::write(
+            &journal,
+            format!("{{\"kind\":\"heartbeat\",\"at_ms\":{now}}}\n"),
+        )
+        .unwrap();
+        std::fs::write(&state, format!(r#"{{"at_ms":{now},"fullscreen":true}}"#)).unwrap();
+        register_sentinel(Some((target(10, 100), state)));
+        std::fs::write(&journal, "").unwrap();
+        let mut posture = desktop(vec![
+            fullscreen(window(10, 100, false, true)),
+            window(20, 200, true, false),
+        ]);
+        posture.sentinel = sentinel();
+        register_sentinel(None);
+        assert_eq!(
+            classify(&posture, target(20, 200)).unwrap(),
+            TargetZ::BackgroundOccluded
+        );
+    }
+
+    #[test]
+    fn sentinel_fullscreen_report_must_be_recent() {
         let now = Duration::from_millis(10_000);
-        let journal = concat!(
-            r#"{"kind":"heartbeat","at_ms":9800,"fullscreen":false}"#,
-            "\n",
-            r#"{"kind":"focus","at_ms":9850}"#,
-            "\n",
-            r#"{"kind":"heartbeat","at_ms":9900,"fullscreen":true}"#,
-            "\n",
-        );
-        assert_eq!(reported_fullscreen(journal, now), Some(true));
-        // A line still being written is not a report.
-        let partial = format!(r#"{journal}{{"kind":"heartbeat","at_ms":9950,"fullscr"#);
-        assert_eq!(reported_fullscreen(&partial, now), Some(true));
+        let state = r#"{"at_ms":9900,"fullscreen":true}"#;
+        assert_eq!(reported_fullscreen(state, now), Some(true));
         assert_eq!(
-            reported_fullscreen(journal, now + SENTINEL_REPORT_MAX_AGE),
+            reported_fullscreen(state, now + SENTINEL_REPORT_MAX_AGE),
             None
         );
-        assert_eq!(
-            reported_fullscreen("{\"kind\":\"heartbeat\",\"at_ms\":9900}\n", now),
-            None
-        );
+        assert_eq!(reported_fullscreen(r#"{"at_ms":9900}"#, now), None);
         assert_eq!(reported_fullscreen("", now), None);
     }
 

@@ -81,6 +81,10 @@ impl ForegroundSentinel {
                 "CUA_E2E_SENTINEL_CONTROL",
                 journal_path.with_extension("control.json"),
             )
+            .env(
+                "CUA_E2E_SENTINEL_STATE",
+                user_data.path().join("sentinel-state.json"),
+            )
             .env("CUA_E2E_USER_DATA_DIR", user_data.path())
             .env("CUA_ELECTRON_CDP_PORT", cdp_port.to_string())
             .stdout(Stdio::null())
@@ -164,7 +168,10 @@ impl ForegroundSentinel {
         fs::write(&journal_path, "")
             .map_err(|error| format!("reset focused sentinel journal: {error}"))?;
         #[cfg(target_os = "linux")]
-        crate::observer::linux::niri_register_sentinel(Some((target, journal_path.clone())));
+        crate::observer::linux::niri_register_sentinel(Some((
+            target,
+            user_data.path().join("sentinel-state.json"),
+        )));
 
         Ok(Self {
             cursor_calibrated,

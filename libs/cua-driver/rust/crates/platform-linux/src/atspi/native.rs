@@ -1079,6 +1079,13 @@ fn correlate_hyprland_frame(
     Some(frame.ordinal)
 }
 
+/// A niri window as a correlation client: its title and size. Tiled windows
+/// have a size but no placement; an unknown size (0x0) never matches.
+fn niri_client(window: &crate::wayland::niri::Window) -> (String, u32, u32) {
+    let (width, height) = window.size.unwrap_or((0, 0));
+    (window.title.clone(), width, height)
+}
+
 /// [`correlate_hyprland_frame`] for niri, which also keeps the single-root
 /// shortcut, but only while niri shows the process exactly one window: the
 /// requested one.
@@ -1185,6 +1192,38 @@ mod hyprland_frame_tests {
     }
 
     #[test]
+    fn niri_binds_a_tiled_chromium_root_by_size() {
+        // niri reports no position for tiled windows, but their size still
+        // identifies the BrowserRootView whose title carries the profile.
+        let tiled = |id, title: &str, size| crate::wayland::niri::Window {
+            id,
+            pid: Some(42),
+            title: title.into(),
+            app_id: "chromium".into(),
+            workspace: Some(1),
+            focused: false,
+            focus_rank: 0,
+            on_screen: true,
+            size: Some(size),
+            placement: Err(crate::wayland::niri::Unplaced::Tiled),
+        };
+        let owned = [
+            niri_client(&tiled(1, "Page - Google Chrome", (800, 600))),
+            niri_client(&tiled(2, "Other - Google Chrome", (640, 480))),
+        ];
+        let clients = owned
+            .iter()
+            .map(|(title, width, height)| (title.as_str(), *width, *height))
+            .collect::<Vec<_>>();
+        let mut other = frame("Other - Google Chrome - Cua Test");
+        other.ordinal = 8;
+        other.size = Some((640, 480));
+        let frames = [frame("Page - Google Chrome - Cua Test"), other];
+        assert_eq!(correlate_niri_frame(&frames, &clients, 0, 2), Some(7));
+        assert_eq!(correlate_niri_frame(&frames, &clients, 1, 2), Some(8));
+    }
+
+    #[test]
     fn preserves_exact_non_chromium_matching() {
         let mut candidate = frame("Editor");
         candidate.browser_root = false;
@@ -1233,16 +1272,7 @@ async fn resolve_window_frame(
                 .filter(|window| window.pid == Some(pid))
                 .collect();
             let target = owned.iter().position(|window| window.id == xid)?;
-            let owned = owned
-                .iter()
-                .map(|window| {
-                    let (width, height) = window
-                        .placement
-                        .as_ref()
-                        .map_or((0, 0), |placed| (placed.rect.width, placed.rect.height));
-                    (window.title.clone(), width, height)
-                })
-                .collect();
+            let owned = owned.iter().map(|window| niri_client(window)).collect();
             (owned, target)
         };
         let chromium = std::fs::read_link(format!("/proc/{pid}/exe"))

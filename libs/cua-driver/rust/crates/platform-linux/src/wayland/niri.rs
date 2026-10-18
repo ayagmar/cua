@@ -785,6 +785,10 @@ pub struct Window {
     /// niri shows it: a placed floating window, or the active tiled window of
     /// an active workspace while the overview is closed.
     pub on_screen: bool,
+    /// The window's logical size, which niri reports for tiled windows too.
+    /// Identity only: a tiled window has no position, so this is never input
+    /// or capture geometry.
+    pub size: Option<(u32, u32)>,
     pub placement: Result<Placed, Unplaced>,
 }
 
@@ -909,6 +913,10 @@ impl Scene {
                     })
                     .count(),
                 on_screen: self.on_screen(window, &placement),
+                size: window.layout.as_ref().and_then(|layout| {
+                    let (width, height) = layout.window_size;
+                    Some((u32::try_from(width).ok()?, u32::try_from(height).ok()?))
+                }),
                 placement,
             });
         }
@@ -2376,6 +2384,8 @@ mod tests {
         let window = scene.window(5).unwrap();
         assert!(window.on_screen);
         assert_eq!(window.placement, Err(Unplaced::Tiled));
+        // The size still identifies it, for AT-SPI root correlation.
+        assert_eq!(window.size, Some((402, 448)));
     }
 
     #[test]

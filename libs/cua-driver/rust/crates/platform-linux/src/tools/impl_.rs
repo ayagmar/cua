@@ -6036,6 +6036,30 @@ fn capture_admission_error(error: anyhow::Error) -> ToolResult {
 }
 static CLICK_DEF: std::sync::OnceLock<ToolDef> = std::sync::OnceLock::new();
 
+/// Presses in one click train: 1 to 3, as the contract states. A niri click
+/// train is one gated action, so a larger count would mean seconds of
+/// presses no recheck covers.
+fn click_train(requested: u64) -> usize {
+    requested.clamp(1, 3) as usize
+}
+
+#[cfg(test)]
+#[test]
+fn click_trains_stop_at_the_advertised_triple_click() {
+    // A niri click train is rechecked once, before its first press, so a
+    // `count: 20` must not become seconds of ungated presses.
+    let tool = ClickTool {
+        state: ToolState::new(),
+    };
+    let count = &tool.def().input_schema["properties"]["count"];
+    assert_eq!(
+        (count["minimum"].as_u64(), count["maximum"].as_u64()),
+        (Some(1), Some(3))
+    );
+    assert_eq!(click_train(20), 3);
+    assert_eq!(click_train(2), 2);
+}
+
 /// Where a foreground element click may put the real pointer.
 enum ForegroundElementPlacement {
     /// The element centre lies inside the target window (or a popup of the
@@ -6465,7 +6489,7 @@ impl Tool for ClickTool {
                     // [left,right,middle]); kept inline to carry the Linux/Wayland
                     // back-compat prose the click button-schema test asserts on.
                     "button":{"type":"string","enum":["left","right","middle"],"description":"Mouse button. Default: \"left\" (legacy back-compat). X11: routed via ButtonPress/Release with the matching evdev code. Native Wayland: only left-button is supported via the virtual-pointer protocol; right/middle return an error."},
-                    "count":{"type":"integer","minimum":1,"description":"Number of clicks in one press train: 1 (default), 2 = double-click, 3 = triple-click (line/paragraph selection). There is no separate triple_click tool — pass count: 3 here."},
+                    "count":{"type":"integer","minimum":1,"maximum":3,"description":"Number of clicks in one press train: 1 (default), 2 = double-click, 3 = triple-click (line/paragraph selection). There is no separate triple_click tool — pass count: 3 here."},
                     "modifier": cua_driver_core::tool_schema::modifier_schema(),
                     "from_zoom":{"type":"boolean","description":"Set true after a zoom call to auto-translate zoom-image pixel coordinates back to full-window space."},
                     "scope":{"type":"string","enum":["window","desktop"],"default":"window","description":"Coordinate frame (default \"window\"). Pass \"desktop\" with x,y and no pid/window_id for a screen-absolute click in get_desktop_state coordinates."},
@@ -6511,11 +6535,12 @@ impl Tool for ClickTool {
                 Err(result) => return result,
             };
             let button = parse_mouse_button(input.button.unwrap_or(ClickButton::Left).as_str());
-            let n = input.count.unwrap_or(1) as usize;
+            let n = input.count.unwrap_or(1);
             if n == 0 {
                 return ToolResult::error("click.count must be at least 1.")
                     .with_structured(json!({ "code": "invalid_arguments" }));
             }
+            let n = click_train(u64::from(n));
             let space = match desktop_input_space().await {
                 Ok(space) => space,
                 Err(error) => {
@@ -6592,7 +6617,7 @@ impl Tool for ClickTool {
             Err(e) => return e,
         };
         let delivery = crate::input::delivery::DeliveryMode::from_args(&args);
-        let count = args.u64_or("count", 1) as usize;
+        let count = click_train(args.u64_or("count", 1));
         let isolated_background = isolated_hyprland_background(delivery);
         // Surface 5: reject unknown buttons so a typo can't silently fall through
         // to a left-click. Empty string keeps back-compat with old clients.

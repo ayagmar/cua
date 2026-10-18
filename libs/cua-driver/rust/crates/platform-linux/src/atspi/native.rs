@@ -1235,6 +1235,12 @@ async fn resolve_window_frame(
         // that more certain.
         return Some(0);
     }
+    if crate::wayland::is_wayland() && crate::wayland::niri::is_session() {
+        // A niri id is no X11 window, and niri exposes nothing that ties one
+        // of several top-level accessibles to it: stay unscoped, which keeps
+        // the snapshot from publishing element tokens.
+        return None;
+    }
     // A popup menu / popover is an override-redirect window the WM's client
     // list never carries: describe it from the server directly, and let it
     // correlate with the toolkit's popup toplevels (role `window` for GTK

@@ -1530,9 +1530,12 @@ impl Tool for GetWindowStateTool {
                     structured["timeout_ms"] = json!(timeout_ms);
                     structured["tree_markdown"] = json!(tr.tree_markdown);
 
-                    let target_scoped = !(crate::wayland::is_wayland()
-                        && crate::wayland::hyprland::is_session())
-                        || tr.window_scoped;
+                    let target_scoped = snapshot_target_scoped(
+                        crate::wayland::is_wayland()
+                            && (crate::wayland::hyprland::is_session()
+                                || crate::wayland::niri::is_session()),
+                        tr.window_scoped,
+                    );
                     if !observation_only && !target_scoped {
                         invalidated.extend(state.snapshots.remove(pid as i32, xid));
                         crate::atspi::snapshot::forget_window(pid, xid);
@@ -2625,6 +2628,24 @@ async fn spawn_blocking_bounded<T: Send + 'static>(
 /// Map an input-path error to a tool error, attaching the structured
 /// foreground `code` (`foreground_unavailable` / `foreground_timeout`) when the
 /// message carries one so the caller can branch instead of parsing prose.
+/// Whether a snapshot's elements may become actionable tokens for the
+/// requested window. On compositors addressed by exact window ids (Hyprland,
+/// niri) an application-wide walk can include another window of the same
+/// process, so only a walk scoped to the requested window publishes.
+fn snapshot_target_scoped(exact_window_ids: bool, window_scoped: bool) -> bool {
+    !exact_window_ids || window_scoped
+}
+
+#[cfg(test)]
+mod snapshot_scope_tests {
+    #[test]
+    fn exact_id_compositors_publish_only_window_scoped_walks() {
+        assert!(!super::snapshot_target_scoped(true, false));
+        assert!(super::snapshot_target_scoped(true, true));
+        assert!(super::snapshot_target_scoped(false, false));
+    }
+}
+
 fn input_error_result(e: anyhow::Error) -> ToolResult {
     let text = e.to_string();
     if crate::input::is_uinput_unavailable(&e) {

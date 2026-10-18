@@ -18,6 +18,7 @@ mod hyprland_compatibility;
 pub mod hyprland_input;
 pub mod kwin_helper;
 pub mod niri;
+mod niri_keyboard;
 pub mod overlay;
 pub mod persistent_vptr;
 pub(crate) mod portal;
@@ -2566,12 +2567,16 @@ fn drag_vptr(
 /// backend's XSendEvent typing and the capture slice's shell-out to `grim`.
 /// foreign-toplevel exposes no pid and Wayland delivers keys to the *focused*
 /// surface, so this is window_id-free; pair it with `click`/`activate` to put
-/// the intended window in focus first.
+/// the intended window in focus first. Under niri, text goes out on niri's
+/// own keymap instead (see [`niri_keyboard`]).
 pub fn type_text(window_id: u64, text: &str) -> anyhow::Result<()> {
     if text.is_empty() {
         return Ok(());
     }
     activate_window_for_input(window_id)?;
+    if is_wayland() && niri::is_session() {
+        return niri_keyboard::type_text(text);
+    }
     // Lead with a no-op Shift_L tap: on a freshly-focused window under a headless
     // seat (notably sway), the compositor needs the first virtual-keyboard event
     // to wire up keyboard routing, and that first key is dropped. Sacrificing a
@@ -2597,10 +2602,14 @@ pub fn type_text(window_id: u64, text: &str) -> anyhow::Result<()> {
 
 /// Type into a surface whose exact Sway container is already held focused by
 /// the caller. This avoids re-resolving a title that can change mid-sequence
-/// (for example after opening a Chromium tab).
+/// (for example after opening a Chromium tab). Under niri, text goes out on
+/// niri's own keymap and stops if focus leaves the window that had it.
 pub fn type_text_focused(text: &str) -> anyhow::Result<()> {
     if text.is_empty() {
         return Ok(());
+    }
+    if is_wayland() && niri::is_session() {
+        return niri_keyboard::type_text(text);
     }
     let result = wtype_output(&["-k", "Shift_L", "--", text])?;
     match result {

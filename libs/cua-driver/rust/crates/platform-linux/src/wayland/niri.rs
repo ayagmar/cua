@@ -387,6 +387,7 @@ enum Request {
     Outputs,
     FocusedWindow,
     OverviewState,
+    KeyboardLayouts,
 }
 
 impl Request {
@@ -398,6 +399,7 @@ impl Request {
             Self::Outputs => "Outputs",
             Self::FocusedWindow => "FocusedWindow",
             Self::OverviewState => "OverviewState",
+            Self::KeyboardLayouts => "KeyboardLayouts",
         }
     }
 }
@@ -551,6 +553,12 @@ struct IpcLogical {
 #[derive(Deserialize)]
 struct Overview {
     is_open: bool,
+}
+
+#[derive(Deserialize)]
+struct KeyboardLayouts {
+    names: Vec<String>,
+    current_idx: u32,
 }
 
 /// wl_output transform number of a niri transform name.
@@ -1303,6 +1311,30 @@ fn confirm_focus<C: FnMut(Instant) -> Result<UnixStream>>(
 /// Focus an exact niri window for input, confirmed by read-back.
 pub fn activate(id: u64, pid: Option<u32>) -> Result<()> {
     activate_in(&mut ipc(), id, pid, FOCUS_CONFIRM_TIMEOUT).map_err(input_unavailable)
+}
+
+/// The window niri sends keyboard input to, or `None` when no window has it.
+/// niri marks a window focused only while its layout holds keyboard focus,
+/// so the lock screen, the overview, the exit dialog, the screenshot UI and
+/// a focused layer-shell surface all read as `None`.
+pub fn keyboard_focus() -> Result<Option<u64>> {
+    Ok(ipc().focused_window()?.map(|window| window.id))
+}
+
+/// The index of niri's active keyboard layout: the xkb group keys go out in.
+pub fn keyboard_layout() -> Result<u32> {
+    active_layout(&ipc().query(Request::KeyboardLayouts)?)
+}
+
+fn active_layout(layouts: &KeyboardLayouts) -> Result<u32> {
+    if usize::try_from(layouts.current_idx).map_or(true, |idx| idx >= layouts.names.len()) {
+        bail!(
+            "niri's active keyboard layout {} is not one of its {} layouts",
+            layouts.current_idx,
+            layouts.names.len()
+        );
+    }
+    Ok(layouts.current_idx)
 }
 
 /// Briefly focus one niri window for `pid`, run `body`, then restore the

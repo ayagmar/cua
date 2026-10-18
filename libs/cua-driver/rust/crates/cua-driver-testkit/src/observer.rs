@@ -960,6 +960,7 @@ pub mod linux {
         events: Arc<Mutex<Vec<FocusEvent>>>,
         sampler: Option<JoinHandle<()>>,
         hyprland_journal: Option<super::hyprland::Journal>,
+        niri_journal: Option<super::niri::Journal>,
         probe_error: Option<ObserverError>,
     }
 
@@ -1011,6 +1012,7 @@ pub mod linux {
                 events: Arc::new(Mutex::new(Vec::new())),
                 sampler: None,
                 hyprland_journal: None,
+                niri_journal: None,
                 probe_error,
             }
         }
@@ -1072,6 +1074,13 @@ pub mod linux {
                 self.hyprland_journal = Some(super::hyprland::Journal::start()?);
                 return Ok(());
             }
+            if self.session == SessionKind::Niri {
+                if self.niri_journal.is_some() {
+                    return Err(ObserverError::new("niri focus journal already active"));
+                }
+                self.niri_journal = Some(super::niri::Journal::start()?);
+                return Ok(());
+            }
             if self.sampler.is_some() {
                 return Err(ObserverError::new("Linux focus journal already active"));
             }
@@ -1112,6 +1121,9 @@ pub mod linux {
 
         fn drain_journal(&mut self) -> Result<DesktopJournal, ObserverError> {
             if let Some(journal) = self.hyprland_journal.take() {
+                return journal.drain();
+            }
+            if let Some(journal) = self.niri_journal.take() {
                 return journal.drain();
             }
             self.stop.store(true, Ordering::Release);

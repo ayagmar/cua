@@ -298,6 +298,11 @@ impl ForegroundSentinel {
         #[cfg(target_os = "linux")]
         set_sway_fullscreen(driver, self.target, true)?;
         wait_for_native_focus_stable(self.target);
+        #[cfg(target_os = "linux")]
+        if is_niri_session() {
+            assert_niri_transient_focus_detected(self.target, background_target)?;
+            wait_for_native_focus_stable(self.target);
+        }
         std::thread::sleep(Duration::from_millis(150));
         reset_journal(&self.journal_path)?;
         wait_for_event(&self.journal_path, "heartbeat", Duration::from_secs(2))?;
@@ -622,6 +627,40 @@ fn focus_sway_target(driver: &mut impl Driver, target: TargetWindow) -> Result<(
 
     let (_, con_id) = sway_tree_and_container_for_target(driver, target)?;
     run_sway_container_command(con_id, &["focus"], "focus canary")
+}
+
+/// niri's focus oracle must see a focus that leaves the sentinel and returns
+/// inside one observation, where both endpoint snapshots agree. Only the
+/// action-time journal can report it.
+#[cfg(target_os = "linux")]
+fn assert_niri_transient_focus_detected(
+    sentinel: TargetWindow,
+    background: TargetWindow,
+) -> Result<(), String> {
+    use crate::observer::linux::{niri_focus, niri_wait_for_focus_transfer};
+
+    let mut observer = DesktopObserver::new(NativeObserver::new(), background);
+    let (moved, delta) = observer
+        .observe(&[OracleKind::Focus], || {
+            niri_focus(background)?;
+            niri_wait_for_focus_transfer(sentinel, background)?;
+            niri_focus(sentinel)?;
+            niri_wait_for_focus_transfer(background, sentinel)
+        })
+        .map_err(|error| error.to_string())?;
+    moved.map_err(|error| format!("niri transient focus canary could not move focus: {error}"))?;
+    if delta.before.foreground != delta.after.foreground
+        || !delta
+            .violations()
+            .iter()
+            .any(|violation| violation.contains("changed transiently"))
+    {
+        return Err(format!(
+            "niri transient focus canary was not detected: {:?}",
+            delta.violations()
+        ));
+    }
+    Ok(())
 }
 
 #[cfg(target_os = "linux")]

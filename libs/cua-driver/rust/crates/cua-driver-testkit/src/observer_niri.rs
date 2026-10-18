@@ -17,13 +17,15 @@ use std::io::{BufRead, BufReader, Read, Write};
 use std::os::fd::{AsRawFd, FromRawFd};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
-use std::sync::OnceLock;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, OnceLock};
+use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use serde::de::DeserializeOwned;
 use serde::Deserialize;
 
-use super::{DesktopSnapshot, ObserverError, TargetWindow, TargetZ};
+use super::{DesktopJournal, DesktopSnapshot, FocusEvent, ObserverError, TargetWindow, TargetZ};
 
 const QUERY_TIMEOUT: Duration = Duration::from_secs(1);
 const REPLY_LIMIT: u64 = 1024 * 1024;
@@ -149,19 +151,19 @@ pub(super) fn attest() -> Result<bool, ObserverError> {
     Ok(true)
 }
 
-/// Sends one request on a fresh connection and returns the `Ok` payload.
-fn request(request: &serde_json::Value) -> Result<serde_json::Value, ObserverError> {
+/// A connection to the attested niri, with read and write deadlines.
+fn attested_connection(purpose: &str) -> Result<UnixStream, ObserverError> {
     let socket =
         niri_socket().ok_or_else(|| ObserverError::new("niri observer requires NIRI_SOCKET"))?;
     let error = |operation: &str, error: std::io::Error| {
-        ObserverError::new(format!("niri IPC {operation} {request}: {error}"))
+        ObserverError::new(format!("niri IPC {operation} {purpose}: {error}"))
     };
     if ATTESTED.get().is_none() && !attest()? {
         return Err(ObserverError::new(
             "NIRI_SOCKET is not served by the WAYLAND_DISPLAY compositor",
         ));
     }
-    let mut stream = connect(&socket, QUERY_TIMEOUT).map_err(|e| error("connect", e))?;
+    let stream = connect(&socket, QUERY_TIMEOUT).map_err(|e| error("connect", e))?;
     let peer = peer_pid(&stream).map_err(|e| error("read peer of", e))?;
     if Some(&peer) != ATTESTED.get() {
         return Err(ObserverError::new(format!(
@@ -173,6 +175,15 @@ fn request(request: &serde_json::Value) -> Result<serde_json::Value, ObserverErr
         .set_read_timeout(Some(QUERY_TIMEOUT))
         .and_then(|()| stream.set_write_timeout(Some(QUERY_TIMEOUT)))
         .map_err(|e| error("configure", e))?;
+    Ok(stream)
+}
+
+/// Sends one request on a fresh connection and returns the `Ok` payload.
+fn request(request: &serde_json::Value) -> Result<serde_json::Value, ObserverError> {
+    let error = |operation: &str, error: std::io::Error| {
+        ObserverError::new(format!("niri IPC {operation} {request}: {error}"))
+    };
+    let mut stream = attested_connection(&request.to_string())?;
     writeln!(stream, "{request}").map_err(|e| error("write", e))?;
     let mut line = String::new();
     BufReader::new(stream.take(REPLY_LIMIT))
@@ -413,6 +424,143 @@ pub(super) fn focus_identity() -> Result<Option<u64>, ObserverError> {
     Ok(focused(&query::<Vec<Window>>("Windows")?)?.map(|window| window.id))
 }
 
+/// The focus a niri event reports: `Some(focus)` for `WindowFocusChanged`
+/// and for the full `WindowsChanged` list, `None` for every other event.
+fn focus_from_event(line: &[u8]) -> Result<Option<Option<u64>>, ObserverError> {
+    let mut event: serde_json::Value = serde_json::from_slice(line)
+        .map_err(|error| ObserverError::new(format!("invalid niri event: {error}")))?;
+    if let Some(change) = event.get_mut("WindowFocusChanged") {
+        let id = change.get("id").cloned().unwrap_or(serde_json::Value::Null);
+        return serde_json::from_value(id)
+            .map(Some)
+            .map_err(|error| ObserverError::new(format!("invalid niri focus event: {error}")));
+    }
+    if let Some(windows) = event
+        .get_mut("WindowsChanged")
+        .and_then(|change| change.get_mut("windows"))
+    {
+        let windows: Vec<Window> = serde_json::from_value(windows.take())
+            .map_err(|error| ObserverError::new(format!("invalid niri windows event: {error}")))?;
+        return Ok(Some(focused(&windows)?.map(|window| window.id)));
+    }
+    Ok(None)
+}
+
+const JOURNAL_EVENT_LIMIT: usize = 10_000;
+
+/// Records every focus change niri reports through its event stream, so a
+/// focus that leaves and returns between two polls is still seen.
+pub(super) struct Journal {
+    stop: Arc<AtomicBool>,
+    sampler: Option<JoinHandle<Result<DesktopJournal, ObserverError>>>,
+}
+
+impl Journal {
+    pub(super) fn start() -> Result<Self, ObserverError> {
+        let mut stream = attested_connection("EventStream")?;
+        writeln!(stream, "\"EventStream\"")
+            .map_err(|error| ObserverError::new(format!("niri EventStream request: {error}")))?;
+        Self::with_stream(stream)
+    }
+
+    /// Ready barrier: the subscription is acknowledged and niri has sent its
+    /// current window list before the observed action may start.
+    fn with_stream(stream: UnixStream) -> Result<Self, ObserverError> {
+        let mut reader = BufReader::new(stream);
+        let mut line = Vec::new();
+        let deadline = Instant::now() + QUERY_TIMEOUT;
+        let read_line = |reader: &mut BufReader<UnixStream>, line: &mut Vec<u8>| {
+            line.clear();
+            match reader.read_until(b'\n', line) {
+                Ok(0) => Err(ObserverError::new("niri event stream closed")),
+                Ok(_) => Ok(()),
+                Err(error) => Err(ObserverError::new(format!("niri event stream: {error}"))),
+            }
+        };
+        read_line(&mut reader, &mut line)?;
+        let reply = parse_reply(&String::from_utf8_lossy(&line))?;
+        if reply != serde_json::json!("Handled") {
+            return Err(ObserverError::new(format!(
+                "niri answered EventStream with {reply}"
+            )));
+        }
+        let mut focus = loop {
+            if Instant::now() >= deadline {
+                return Err(ObserverError::new("niri event stream sent no window list"));
+            }
+            read_line(&mut reader, &mut line)?;
+            if let Some(focus) = focus_from_event(&line)? {
+                break focus;
+            }
+        };
+        reader
+            .get_ref()
+            .set_read_timeout(Some(Duration::from_millis(25)))
+            .map_err(|error| ObserverError::new(format!("niri event stream: {error}")))?;
+        let stop = Arc::new(AtomicBool::new(false));
+        let thread_stop = Arc::clone(&stop);
+        let sampler = std::thread::spawn(move || {
+            let mut journal = DesktopJournal::default();
+            let mut line = Vec::new();
+            while !thread_stop.load(Ordering::Acquire) {
+                // A timed-out read keeps its partial line for the next read.
+                match reader.read_until(b'\n', &mut line) {
+                    Ok(0) => return Err(ObserverError::new("niri event stream closed")),
+                    Ok(_) if line.ends_with(b"\n") => {
+                        if let Some(current) = focus_from_event(&line)? {
+                            if current != focus {
+                                if journal.focus_events.len() >= JOURNAL_EVENT_LIMIT {
+                                    return Err(ObserverError::new(
+                                        "niri focus journal exceeded event limit",
+                                    ));
+                                }
+                                journal.focus_events.push(FocusEvent {
+                                    from: focus,
+                                    to: current,
+                                });
+                                focus = current;
+                            }
+                        }
+                        line.clear();
+                    }
+                    Ok(_) => {}
+                    Err(error)
+                        if matches!(
+                            error.kind(),
+                            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                        ) => {}
+                    Err(error) => {
+                        return Err(ObserverError::new(format!("niri event stream: {error}")))
+                    }
+                }
+            }
+            Ok(journal)
+        });
+        Ok(Self {
+            stop,
+            sampler: Some(sampler),
+        })
+    }
+
+    pub(super) fn drain(mut self) -> Result<DesktopJournal, ObserverError> {
+        self.stop.store(true, Ordering::Release);
+        self.sampler
+            .take()
+            .expect("active journal")
+            .join()
+            .map_err(|_| ObserverError::new("niri focus journal panicked"))?
+    }
+}
+
+impl Drop for Journal {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Release);
+        if let Some(sampler) = self.sampler.take() {
+            let _ = sampler.join();
+        }
+    }
+}
+
 /// Whether focus left `from` for `to`, both resolved by exact identity. This
 /// does not use z-order: the tiled sentinel has no IPC position, so its own
 /// z-order is ambiguous once a floating window holds focus.
@@ -650,6 +798,64 @@ mod tests {
         // decide this canary.
         assert!(classify(&after, sentinel).is_err());
         assert!(focus_transferred(&after.windows, sentinel, sentinel).is_err());
+    }
+
+    fn windows_changed(focused_id: u64) -> String {
+        json!({"WindowsChanged": {"windows": [
+            fullscreen(window(10, 100, false, focused_id == 10)),
+            window(20, 200, true, focused_id == 20),
+        ]}})
+        .to_string()
+    }
+
+    #[test]
+    fn journal_records_a_focus_that_leaves_and_returns() {
+        let (stream, mut niri) = UnixStream::pair().unwrap();
+        writeln!(niri, r#"{{"Ok":"Handled"}}"#).unwrap();
+        writeln!(niri, r#"{{"WorkspacesChanged":{{"workspaces":[]}}}}"#).unwrap();
+        writeln!(niri, "{}", windows_changed(10)).unwrap();
+        let journal = Journal::with_stream(stream).unwrap();
+        // The second focus event arrives in two writes to exercise a read
+        // that times out mid-line.
+        writeln!(niri, r#"{{"WindowFocusChanged":{{"id":20}}}}"#).unwrap();
+        write!(niri, r#"{{"WindowFocusChanged":"#).unwrap();
+        std::thread::sleep(Duration::from_millis(60));
+        writeln!(niri, r#"{{"id":10}}}}"#).unwrap();
+        std::thread::sleep(Duration::from_millis(100));
+        let journal = journal.drain().unwrap();
+        assert_eq!(
+            journal.focus_events,
+            vec![
+                FocusEvent {
+                    from: Some(10),
+                    to: Some(20)
+                },
+                FocusEvent {
+                    from: Some(20),
+                    to: Some(10)
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn journal_waits_for_the_window_list_and_reports_a_closed_stream() {
+        let (stream, mut niri) = UnixStream::pair().unwrap();
+        writeln!(niri, r#"{{"Ok":"Handled"}}"#).unwrap();
+        drop(niri);
+        assert!(Journal::with_stream(stream)
+            .err()
+            .unwrap()
+            .to_string()
+            .contains("closed"));
+
+        let (stream, mut niri) = UnixStream::pair().unwrap();
+        writeln!(niri, r#"{{"Ok":"Handled"}}"#).unwrap();
+        writeln!(niri, "{}", windows_changed(10)).unwrap();
+        let journal = Journal::with_stream(stream).unwrap();
+        drop(niri);
+        std::thread::sleep(Duration::from_millis(60));
+        assert!(journal.drain().unwrap_err().to_string().contains("closed"));
     }
 
     #[test]

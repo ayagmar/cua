@@ -408,6 +408,128 @@ struct State {
     scrcopy_manager: Option<ZwlrScreencopyManagerV1>,
     shm: Option<WlShm>,
     capture: CaptureState,
+    /// Whether the pending [`bounded_roundtrip`] was answered.
+    synced: bool,
+}
+
+impl Syncs for State {
+    fn synced(&mut self) -> &mut bool {
+        &mut self.synced
+    }
+}
+
+impl Dispatch<wayland_client::protocol::wl_callback::WlCallback, ()> for State {
+    fn event(
+        state: &mut Self,
+        _: &wayland_client::protocol::wl_callback::WlCallback,
+        event: wayland_client::protocol::wl_callback::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        if let wayland_client::protocol::wl_callback::Event::Done { .. } = event {
+            state.synced = true;
+        }
+    }
+}
+
+// ── Bounded Wayland waits (niri) ─────────────────────────────────────────────
+
+/// How long one round trip with niri may take.
+const NIRI_ROUNDTRIP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1);
+/// A niri pointer action's deadline when its worker serves no tool call
+/// with one (see [`crate::input::action`]).
+const NIRI_POINTER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(12);
+/// How long releasing held buttons may take once an action is over, even
+/// past its deadline.
+const NIRI_CLEANUP_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(500);
+
+/// A dispatch state that records when its `wl_display.sync` is answered.
+trait Syncs {
+    fn synced(&mut self) -> &mut bool;
+}
+
+/// Send `wl_display.sync` and dispatch until niri answers or `deadline`
+/// (at most [`NIRI_ROUNDTRIP_TIMEOUT`] away) passes. `EventQueue::roundtrip`
+/// blocks until the compositor answers, so a stalled niri would hang the
+/// call and leave a pressed button held.
+fn bounded_roundtrip<D: Syncs + 'static>(
+    connection: &Connection,
+    queue: &mut wayland_client::EventQueue<D>,
+    state: &mut D,
+    deadline: std::time::Instant,
+) -> anyhow::Result<()>
+where
+    D: Dispatch<wayland_client::protocol::wl_callback::WlCallback, ()>,
+{
+    use anyhow::Context as _;
+    use std::os::fd::AsRawFd as _;
+    let deadline = deadline.min(std::time::Instant::now() + NIRI_ROUNDTRIP_TIMEOUT);
+    *state.synced() = false;
+    connection.display().sync(&queue.handle(), ());
+    loop {
+        queue
+            .dispatch_pending(state)
+            .context("niri Wayland dispatch failed")?;
+        if *state.synced() {
+            return Ok(());
+        }
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        if remaining.is_zero() {
+            anyhow::bail!("niri did not answer a Wayland round trip in time");
+        }
+        queue.flush().context("niri Wayland flush failed")?;
+        let Some(guard) = queue.prepare_read() else {
+            continue;
+        };
+        let mut pfd = libc::pollfd {
+            fd: guard.connection_fd().as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        let timeout = remaining.as_millis().clamp(1, i32::MAX as u128) as i32;
+        // SAFETY: one valid pollfd that outlives the call.
+        let ready = unsafe { libc::poll(&mut pfd, 1, timeout) };
+        if ready < 0 {
+            let error = std::io::Error::last_os_error();
+            if error.kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(error).context("poll on niri's Wayland socket failed");
+        }
+        if ready == 0 {
+            continue;
+        }
+        match guard.read() {
+            Ok(_) => {}
+            Err(wayland_client::backend::WaylandError::Io(error))
+                if error.kind() == std::io::ErrorKind::WouldBlock => {}
+            Err(error) => return Err(error).context("niri Wayland read failed"),
+        }
+    }
+}
+
+/// A round trip bounded by `deadline` on niri; elsewhere the blocking one
+/// other compositors have always used.
+fn sync_by(
+    connection: &Connection,
+    queue: &mut wayland_client::EventQueue<State>,
+    state: &mut State,
+    deadline: Option<std::time::Instant>,
+) -> anyhow::Result<()> {
+    match deadline {
+        Some(deadline) => bounded_roundtrip(connection, queue, state, deadline),
+        None => queue.roundtrip(state).map(drop).map_err(Into::into),
+    }
+}
+
+/// The Wayland connection for capture or pointer input: on niri, a socket
+/// connected within a deadline and proven to reach the recognised niri.
+fn wayland_connection(niri: bool) -> anyhow::Result<Connection> {
+    if niri {
+        return Ok(Connection::from_socket(niri::attested_wayland_socket()?)?);
+    }
+    Ok(Connection::connect_to_env()?)
 }
 
 impl Dispatch<wl_registry::WlRegistry, ()> for State {
@@ -785,17 +907,20 @@ fn capture_via_screencopy() -> anyhow::Result<Vec<u8>> {
 /// [`capture_via_screencopy`], plus the wl_output v4 name of the copied
 /// output when the compositor reports one.
 fn screencopy_first_output() -> anyhow::Result<(Vec<u8>, Option<String>)> {
-    let conn = Connection::connect_to_env()?;
-    if is_wayland() && niri::is_session() {
-        niri::verify_wayland_peer(&conn)?;
-    }
+    // The whole copy, connection included, waits at most this long.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    // On niri every round trip is bounded by it as well, so a stalled niri
+    // ends the capture at the deadline instead of hanging it.
+    let niri = is_wayland() && niri::is_session();
+    let bounded = niri.then_some(deadline);
+    let conn = wayland_connection(niri)?;
     let mut queue = conn.new_event_queue::<State>();
     let qh = queue.handle();
     conn.display().get_registry(&qh, ());
 
     let mut state = State::default();
-    queue.roundtrip(&mut state)?;
-    queue.roundtrip(&mut state)?; // outputs report their Mode
+    sync_by(&conn, &mut queue, &mut state, bounded)?;
+    sync_by(&conn, &mut queue, &mut state, bounded)?; // outputs report their Mode
 
     let manager = state
         .scrcopy_manager
@@ -812,7 +937,6 @@ fn screencopy_first_output() -> anyhow::Result<(Vec<u8>, Option<String>)> {
 
     let frame = manager.capture_output(0, &output, &qh, ());
     // Drain Buffer / Flags events; spin until Ready or Failed (or timeout).
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
     let mut buffer: Option<WlBuffer> = None;
     let mut pool: Option<WlShmPool> = None;
     let mut mmap_ptr: *mut libc::c_void = std::ptr::null_mut();
@@ -820,7 +944,10 @@ fn screencopy_first_output() -> anyhow::Result<(Vec<u8>, Option<String>)> {
     let mut fd: i32 = -1;
 
     loop {
-        queue.roundtrip(&mut state)?;
+        if let Err(error) = sync_by(&conn, &mut queue, &mut state, bounded) {
+            cleanup_mmap(mmap_ptr, mmap_len, fd);
+            return Err(error);
+        }
         if state.capture.failed {
             anyhow::bail!("compositor signalled screencopy failure");
         }
@@ -910,7 +1037,12 @@ fn screencopy_first_output() -> anyhow::Result<(Vec<u8>, Option<String>)> {
         p.destroy();
     }
     frame.destroy();
-    let _ = queue.roundtrip(&mut state);
+    let _ = sync_by(
+        &conn,
+        &mut queue,
+        &mut state,
+        niri.then(|| std::time::Instant::now() + NIRI_CLEANUP_TIMEOUT),
+    );
     cleanup_mmap(mmap_ptr, mmap_len, fd);
 
     result.map(|png| (png, state.output_name.take()))
@@ -1484,9 +1616,74 @@ pub struct VptrSession {
     /// coordinates; [`VptrSession::abs`] converts them for `motion_absolute`.
     pub origin_x: i32,
     pub origin_y: i32,
+    /// On niri, the deadline every round trip is bounded by.
+    deadline: Option<std::time::Instant>,
+    /// Buttons pressed and not released yet: dropping the session releases
+    /// them, whatever stopped the action.
+    held: Vec<u32>,
+    /// Destroyed by [`VptrSession::finish`], or handed on by
+    /// [`VptrSession::keep`].
+    done: bool,
 }
 
 impl VptrSession {
+    /// Wait until the compositor has handled every request sent so far.
+    fn sync(&mut self) -> anyhow::Result<()> {
+        sync_by(&self.conn, &mut self.queue, &mut self.state, self.deadline)
+    }
+
+    /// Send pointer events, unless the tool call this action serves is over
+    /// (see [`crate::input::action`]), then wait for the compositor.
+    fn send(&mut self, events: impl FnOnce(&ZwlrVirtualPointerV1)) -> anyhow::Result<()> {
+        let (conn, vptr) = (&self.conn, &self.vptr);
+        crate::input::action::admit(|| {
+            events(vptr);
+            vptr.frame();
+            conn.flush()
+        })??;
+        self.sync()
+    }
+
+    fn motion(&mut self, px: u32, py: u32) -> anyhow::Result<()> {
+        let (w, h) = (self.output_w, self.output_h);
+        self.send(|vptr| vptr.motion_absolute(event_time_ms(), px, py, w, h))
+    }
+
+    fn press(&mut self, button: u32) -> anyhow::Result<()> {
+        let (conn, vptr) = (&self.conn, &self.vptr);
+        crate::input::action::admit(|| {
+            vptr.button(event_time_ms(), button, ButtonState::Pressed);
+            vptr.frame();
+            conn.flush()
+        })??;
+        self.held.push(button);
+        self.sync()
+    }
+
+    /// Release `button`. Cleanup: it goes out even once the call is over.
+    fn release(&mut self, button: u32) -> anyhow::Result<()> {
+        self.held.retain(|held| *held != button);
+        self.vptr
+            .button(event_time_ms(), button, ButtonState::Released);
+        self.vptr.frame();
+        self.sync()
+    }
+
+    /// Destroy the virtual pointer once the action is complete.
+    fn finish(mut self) -> anyhow::Result<()> {
+        self.done = true;
+        self.vptr.destroy();
+        self.sync()
+    }
+
+    /// Hand the connection and the virtual pointer, with its pressed
+    /// buttons, to an owner that keeps them across calls.
+    fn keep(mut self) -> (Connection, ZwlrVirtualPointerV1) {
+        self.done = true;
+        self.held.clear();
+        (self.conn.clone(), self.vptr.clone())
+    }
+
     /// Layout point -> clamped `motion_absolute` coordinates.
     pub fn abs(&self, x: i32, y: i32) -> (u32, u32) {
         pointer_abs(
@@ -1577,15 +1774,33 @@ impl VptrSession {
     /// from the keyboard) never got the wheel or the button that followed.
     /// Approaching from the next pixel always moves the pointer.
     fn point_at(&mut self, px: u32, py: u32) -> anyhow::Result<()> {
-        let (w, h) = (self.output_w, self.output_h);
-        self.vptr
-            .motion_absolute(event_time_ms(), approach_pixel(px, w), py, w, h);
-        self.vptr.frame();
-        self.queue.roundtrip(&mut self.state)?;
-        self.vptr.motion_absolute(event_time_ms(), px, py, w, h);
-        self.vptr.frame();
-        self.queue.roundtrip(&mut self.state)?;
-        Ok(())
+        self.motion(approach_pixel(px, self.output_w), py)?;
+        self.motion(px, py)
+    }
+}
+
+impl Drop for VptrSession {
+    /// An action that stopped early still releases what it pressed, on a
+    /// short deadline of its own on niri.
+    fn drop(&mut self) {
+        if self.done {
+            return;
+        }
+        for button in std::mem::take(&mut self.held) {
+            self.vptr
+                .button(event_time_ms(), button, ButtonState::Released);
+            self.vptr.frame();
+        }
+        self.vptr.destroy();
+        let _ = match self.deadline {
+            Some(_) => bounded_roundtrip(
+                &self.conn,
+                &mut self.queue,
+                &mut self.state,
+                std::time::Instant::now() + NIRI_CLEANUP_TIMEOUT,
+            ),
+            None => self.conn.flush().map_err(Into::into),
+        };
     }
 }
 
@@ -1661,18 +1876,20 @@ fn open_vptr_session_in(
     // A niri window is activated by the pointer gate, once the action is
     // admitted; its id never reaches the foreign-toplevel match below.
     let niri = is_wayland() && niri::is_session();
-    let conn = Connection::connect_to_env()?;
-    if niri {
-        niri::verify_wayland_peer(&conn)?;
-    }
+    let deadline = niri.then(|| {
+        crate::input::action::current().map_or_else(
+            || std::time::Instant::now() + NIRI_POINTER_TIMEOUT,
+            |action| action.deadline(),
+        )
+    });
+    let conn = wayland_connection(niri)?;
     let mut queue = conn.new_event_queue::<State>();
     let qh = queue.handle();
     conn.display().get_registry(&qh, ());
 
     let mut state = State::default();
-    queue.roundtrip(&mut state)?;
-    for _ in 0..4 {
-        queue.roundtrip(&mut state)?;
+    for _ in 0..5 {
+        sync_by(&conn, &mut queue, &mut state, deadline)?;
     }
 
     // Evaluate the virtual-pointer / NO_VPTR_MARKER path FIRST: on compositors
@@ -1719,7 +1936,7 @@ fn open_vptr_session_in(
         let handle = matching_handle(&state, id)
             .ok_or_else(|| anyhow::anyhow!("no native Wayland toplevel for window_id {id}"))?;
         handle.activate(&seat);
-        queue.roundtrip(&mut state)?;
+        sync_by(&conn, &mut queue, &mut state, deadline)?;
     }
 
     let vptr = mgr.create_virtual_pointer(Some(&seat), &qh, ());
@@ -1739,6 +1956,9 @@ fn open_vptr_session_in(
         output_h,
         origin_x,
         origin_y,
+        deadline,
+        held: Vec::new(),
+        done: false,
     })
 }
 
@@ -2140,28 +2360,18 @@ fn click_vptr(
         |sess| niri_gate_holds(&mut gate, sess),
         |sess, i| {
             if i > 0 {
-                sess.vptr.motion_absolute(event_time_ms(), px, py, w, h);
-                sess.vptr.frame();
-                sess.queue.roundtrip(&mut sess.state)?;
+                sess.motion(px, py)?;
                 std::thread::sleep(std::time::Duration::from_millis(15));
             }
-            sess.vptr.button(event_time_ms(), btn, ButtonState::Pressed);
-            sess.vptr.frame();
-            sess.queue.roundtrip(&mut sess.state)?;
+            sess.press(btn)?;
             std::thread::sleep(std::time::Duration::from_millis(20));
-            sess.vptr
-                .button(event_time_ms(), btn, ButtonState::Released);
-            sess.vptr.frame();
-            sess.queue.roundtrip(&mut sess.state)?;
-            Ok(())
+            sess.release(btn)
         },
     )?;
     // Keep the synthetic-cursor registry in sync with the warp we just
     // performed so a subsequent `get_cursor_position` reflects reality.
     record_synth_cursor(sess.origin_x + px as i32, sess.origin_y + py as i32);
-    sess.vptr.destroy();
-    sess.queue.roundtrip(&mut sess.state)?;
-    Ok(())
+    sess.finish()
 }
 
 /// Synthesize a vertical or horizontal scroll on the activated toplevel. Each
@@ -2363,16 +2573,13 @@ fn scroll_vptr(
         ("scroll", "ticks"),
         |sess| niri_gate_holds(&mut gate, sess),
         |sess, _| {
-            sess.vptr.axis_source(AxisSource::Wheel);
-            sess.vptr.axis_discrete(event_time_ms(), axis, value, sign);
-            sess.vptr.frame();
-            sess.queue.roundtrip(&mut sess.state)?;
-            Ok(())
+            sess.send(|vptr| {
+                vptr.axis_source(AxisSource::Wheel);
+                vptr.axis_discrete(event_time_ms(), axis, value, sign);
+            })
         },
     )?;
-    sess.vptr.destroy();
-    sess.queue.roundtrip(&mut sess.state)?;
-    Ok(())
+    sess.finish()
 }
 
 fn niri_window_centre(window_id: u64) -> anyhow::Result<(i32, i32)> {
@@ -2443,17 +2650,12 @@ fn move_cursor_absolute_vptr(
     snapshot: Option<&hyprland::DesktopSnapshot>,
 ) -> anyhow::Result<()> {
     let mut sess = open_vptr_session_in(window_id, snapshot)?;
-    let (w, h) = (sess.output_w, sess.output_h);
     let (px, py) = sess.abs(x, y);
     let mut gate = niri_pointer_gate(window_id, &sess, &[(x, y)])?;
     niri_gate_holds(&mut gate, &sess)?;
-    sess.vptr.motion_absolute(event_time_ms(), px, py, w, h);
-    sess.vptr.frame();
-    sess.queue.roundtrip(&mut sess.state)?;
+    sess.motion(px, py)?;
     record_synth_cursor(sess.origin_x + px as i32, sess.origin_y + py as i32);
-    sess.vptr.destroy();
-    sess.queue.roundtrip(&mut sess.state)?;
-    Ok(())
+    sess.finish()
 }
 
 /// Press-drag-release on a native Wayland toplevel. Emits one button press at
@@ -2546,39 +2748,26 @@ fn drag_vptr(
     let (tx, ty) = clamp_xy(to_x, to_y);
     let mut gate = niri_pointer_gate(window_id, &sess, &[(from_x, from_y), (to_x, to_y)])?;
     niri_gate_holds(&mut gate, &sess)?;
-    sess.vptr.motion_absolute(event_time_ms(), fx, fy, w, h);
-    sess.vptr.frame();
-    sess.queue.roundtrip(&mut sess.state)?;
+    sess.motion(fx, fy)?;
     std::thread::sleep(std::time::Duration::from_millis(15));
     // The last check: refusing after the press would leave the button held.
     niri_gate_holds(&mut gate, &sess)?;
-    sess.vptr.button(event_time_ms(), btn, ButtonState::Pressed);
-    sess.vptr.frame();
-    sess.queue.roundtrip(&mut sess.state)?;
+    sess.press(btn)?;
     let n = steps.max(1);
     for s in 1..=n {
         let t = s as f64 / n as f64;
         let ix = (from_x as f64 + (to_x - from_x) as f64 * t).round() as i32;
         let iy = (from_y as f64 + (to_y - from_y) as f64 * t).round() as i32;
         let (cx, cy) = clamp_xy(ix, iy);
-        sess.vptr.motion_absolute(event_time_ms(), cx, cy, w, h);
-        sess.vptr.frame();
-        sess.queue.roundtrip(&mut sess.state)?;
+        sess.motion(cx, cy)?;
         std::thread::sleep(std::time::Duration::from_millis(8));
     }
-    sess.vptr.motion_absolute(event_time_ms(), tx, ty, w, h);
-    sess.vptr.frame();
-    sess.queue.roundtrip(&mut sess.state)?;
-    sess.vptr
-        .button(event_time_ms(), btn, ButtonState::Released);
-    sess.vptr.frame();
+    sess.motion(tx, ty)?;
     // Sync the synthetic-cursor registry with the drag endpoint so a
     // subsequent `get_cursor_position` reports where we left the pointer.
     record_synth_cursor(origin_x + tx as i32, origin_y + ty as i32);
-    sess.queue.roundtrip(&mut sess.state)?;
-    sess.vptr.destroy();
-    sess.queue.roundtrip(&mut sess.state)?;
-    Ok(())
+    sess.release(btn)?;
+    sess.finish()
 }
 
 /// Type Unicode text into the focused Wayland surface via `wtype` (the
@@ -4423,6 +4612,28 @@ mod tests {
         assert_eq!(super::chord_keysym("A"), "a");
         assert_eq!(super::chord_keysym("enter"), "Return");
         assert_eq!(super::chord_keysym("F5"), "F5");
+    }
+
+    #[test]
+    fn a_niri_that_stops_answering_ends_the_round_trip_at_its_deadline() {
+        // A compositor end that reads nothing and answers nothing.
+        let (client, _server) = std::os::unix::net::UnixStream::pair().unwrap();
+        let connection = super::Connection::from_socket(client).unwrap();
+        let mut queue = connection.new_event_queue::<super::State>();
+        let mut state = super::State::default();
+        let started = std::time::Instant::now();
+        let stalled = super::bounded_roundtrip(
+            &connection,
+            &mut queue,
+            &mut state,
+            started + std::time::Duration::from_millis(200),
+        )
+        .unwrap_err();
+        assert_eq!(
+            stalled.to_string(),
+            "niri did not answer a Wayland round trip in time"
+        );
+        assert!(started.elapsed() < std::time::Duration::from_secs(1));
     }
 
     #[test]

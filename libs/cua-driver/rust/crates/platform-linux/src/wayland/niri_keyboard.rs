@@ -27,7 +27,7 @@
 use std::fs::File;
 use std::io::{Seek, SeekFrom, Write};
 use std::ops::RangeInclusive;
-use std::os::fd::{AsFd, AsRawFd, OwnedFd};
+use std::os::fd::{AsFd, OwnedFd};
 use std::os::unix::fs::FileExt;
 use std::time::{Duration, Instant};
 
@@ -39,8 +39,6 @@ use xkbcommon::xkb;
 use super::virtual_keyboard::protocol::zwp_virtual_keyboard_manager_v1::ZwpVirtualKeyboardManagerV1;
 use super::virtual_keyboard::protocol::zwp_virtual_keyboard_v1::ZwpVirtualKeyboardV1;
 
-/// How long one Wayland round trip may take.
-const ROUNDTRIP_TIMEOUT: Duration = Duration::from_secs(1);
 /// The whole call's budget: setup, then this much per key.
 const CALL_BASE: Duration = Duration::from_secs(3);
 const PER_KEY: Duration = Duration::from_millis(100);
@@ -453,8 +451,11 @@ struct Session {
 
 impl Session {
     fn begin(expected: Option<u64>, keys: usize) -> Result<Self> {
-        let deadline =
+        let mut deadline =
             Instant::now() + CALL_BASE + PER_KEY * u32::try_from(keys).unwrap_or(u32::MAX);
+        if let Some(action) = crate::input::action::current() {
+            deadline = deadline.min(action.deadline());
+        }
         let focused = super::niri::keyboard_focus().map_err(super::niri::input_unavailable)?;
         let target = admitted_target(expected, focused)?;
         super::niri::refuse_if_locked().map_err(super::niri::input_unavailable)?;
@@ -637,16 +638,16 @@ impl Keyboard {
         let handle = queue.handle();
         connection.display().get_registry(&handle, ());
         let mut state = State::default();
-        roundtrip(&connection, &mut queue, &mut state, deadline)?;
+        super::bounded_roundtrip(&connection, &mut queue, &mut state, deadline)?;
         // The seats' names.
-        roundtrip(&connection, &mut queue, &mut state, deadline)?;
+        super::bounded_roundtrip(&connection, &mut queue, &mut state, deadline)?;
         let seat = state.seats.selected().context("niri exposes no wl_seat")?;
         let manager = state
             .manager
             .clone()
             .context("niri exposes no zwp_virtual_keyboard_manager_v1")?;
         let wl_keyboard = seat.get_keyboard(&handle, ());
-        roundtrip(&connection, &mut queue, &mut state, deadline)?;
+        super::bounded_roundtrip(&connection, &mut queue, &mut state, deadline)?;
         wl_keyboard.release();
         if let Some(error) = state.error.take() {
             bail!("{error}");
@@ -685,7 +686,8 @@ impl Keyboard {
                 .keymap(1, self.base.file.as_fd(), self.base.size);
         }
         self.device.modifiers(0, 0, 0, group);
-        let restored = roundtrip(&self.connection, &mut self.queue, &mut self.state, deadline);
+        let restored =
+            super::bounded_roundtrip(&self.connection, &mut self.queue, &mut self.state, deadline);
         self.device.destroy();
         let flushed = self.queue.flush().context("flush to niri");
         restored.and(flushed)
@@ -707,68 +709,21 @@ impl Strokes for Keyboard {
     }
 
     fn stroke(&mut self, key: Key, group: u32, deadline: Instant) -> Result<()> {
-        self.device.modifiers(key.modifiers, 0, 0, key.group);
+        // Nothing goes out once the tool call is over (see
+        // `crate::input::action`).
+        let (device, queue) = (&self.device, &self.queue);
+        crate::input::action::admit(|| {
+            device.modifiers(key.modifiers, 0, 0, key.group);
+            device.key(super::event_time_ms(), key.code, KEY_PRESSED);
+            device.key(super::event_time_ms(), key.code, KEY_RELEASED);
+            device.modifiers(0, 0, 0, group);
+            queue.flush()
+        })?
+        .context("flush to niri")?;
         self.pressed.push(key.code);
-        self.device
-            .key(super::event_time_ms(), key.code, KEY_PRESSED);
-        self.device
-            .key(super::event_time_ms(), key.code, KEY_RELEASED);
-        self.device.modifiers(0, 0, 0, group);
-        roundtrip(&self.connection, &mut self.queue, &mut self.state, deadline)?;
+        super::bounded_roundtrip(&self.connection, &mut self.queue, &mut self.state, deadline)?;
         self.pressed.clear();
         Ok(())
-    }
-}
-
-/// Send `wl_display.sync` and dispatch until niri answers or `deadline`
-/// (at most `ROUNDTRIP_TIMEOUT` away) passes.
-fn roundtrip(
-    connection: &Connection,
-    queue: &mut EventQueue<State>,
-    state: &mut State,
-    deadline: Instant,
-) -> Result<()> {
-    let deadline = deadline.min(Instant::now() + ROUNDTRIP_TIMEOUT);
-    state.synced = false;
-    connection.display().sync(&queue.handle(), ());
-    loop {
-        queue
-            .dispatch_pending(state)
-            .context("niri Wayland dispatch failed")?;
-        if state.synced {
-            return Ok(());
-        }
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        if remaining.is_zero() {
-            bail!("niri did not answer a Wayland round trip in time");
-        }
-        queue.flush().context("niri Wayland flush failed")?;
-        let Some(guard) = queue.prepare_read() else {
-            continue;
-        };
-        let mut pfd = libc::pollfd {
-            fd: guard.connection_fd().as_raw_fd(),
-            events: libc::POLLIN,
-            revents: 0,
-        };
-        let timeout = remaining.as_millis().clamp(1, i32::MAX as u128) as i32;
-        let ready = unsafe { libc::poll(&mut pfd, 1, timeout) };
-        if ready < 0 {
-            let error = std::io::Error::last_os_error();
-            if error.kind() == std::io::ErrorKind::Interrupted {
-                continue;
-            }
-            return Err(error).context("poll on niri's Wayland socket failed");
-        }
-        if ready == 0 {
-            continue;
-        }
-        match guard.read() {
-            Ok(_) => {}
-            Err(wayland_client::backend::WaylandError::Io(error))
-                if error.kind() == std::io::ErrorKind::WouldBlock => {}
-            Err(error) => return Err(error).context("niri Wayland read failed"),
-        }
     }
 }
 
@@ -864,6 +819,12 @@ impl Dispatch<wl_keyboard::WlKeyboard, ()> for State {
                 Err(error) => state.error = Some(error),
             }
         }
+    }
+}
+
+impl super::Syncs for State {
+    fn synced(&mut self) -> &mut bool {
+        &mut self.synced
     }
 }
 

@@ -2672,20 +2672,60 @@ fn foreground_budget(chars: usize) -> std::time::Duration {
 /// `spawn_blocking` with a hard deadline. A wedged X server (or a client
 /// holding a server grab) must surface as a structured `foreground_timeout`
 /// error instead of a tool call that never returns. The blocking task is not
-/// cancellable; it is left to finish (or leak) on the blocking pool.
+/// cancellable; it is left to finish (or leak) on the blocking pool, with its
+/// [`crate::input::action::Action`] abandoned so its input routes send
+/// nothing more.
 async fn spawn_blocking_bounded<T: Send + 'static>(
     label: &'static str,
     budget: std::time::Duration,
     f: impl FnOnce() -> anyhow::Result<T> + Send + 'static,
 ) -> Result<anyhow::Result<T>, tokio::task::JoinError> {
-    match tokio::time::timeout(budget, tokio::task::spawn_blocking(f)).await {
+    let action = crate::input::action::Action::new(budget);
+    let worker = {
+        let action = action.clone();
+        move || {
+            let _bound = crate::input::action::bind(action);
+            f()
+        }
+    };
+    match tokio::time::timeout(budget, tokio::task::spawn_blocking(worker)).await {
         Ok(joined) => joined,
-        Err(_elapsed) => Ok(Err(anyhow::anyhow!(
-            "{}: {label} did not complete within {budget:?}; the X server or the target \
+        Err(_elapsed) => Ok(Err({
+            action.abandon();
+            anyhow::anyhow!(
+                "{}: {label} did not complete within {budget:?}; the X server or the target \
              application may be wedged. Take a screenshot before retrying",
-            crate::input::foreground::CODE_TIMEOUT
-        ))),
+                crate::input::foreground::CODE_TIMEOUT
+            )
+        })),
     }
+}
+
+#[cfg(test)]
+#[tokio::test]
+async fn a_timed_out_input_worker_sends_nothing_more() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    // A worker that keeps sending events, as a stalled compositor's would
+    // once it answers again.
+    let sent = Arc::new(AtomicUsize::new(0));
+    let worker_sent = sent.clone();
+    let result = spawn_blocking_bounded(
+        "test input",
+        std::time::Duration::from_millis(100),
+        move || {
+            for _ in 0..50 {
+                crate::input::action::admit(|| worker_sent.fetch_add(1, Ordering::SeqCst))?;
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            Ok(())
+        },
+    )
+    .await
+    .unwrap();
+    assert!(result.is_err());
+    let at_timeout = sent.load(Ordering::SeqCst);
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    assert_eq!(sent.load(Ordering::SeqCst), at_timeout);
 }
 
 /// Map an input-path error to a tool error, attaching the structured

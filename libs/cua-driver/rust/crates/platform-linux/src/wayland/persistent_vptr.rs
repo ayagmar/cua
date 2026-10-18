@@ -194,22 +194,16 @@ fn handle_press(
     let mut gate = super::niri_pointer_gate(Some(window_id), &sess, &[(x, y)])?;
     let btn = evdev_pointer_button(button);
     super::niri_gate_holds(&mut gate, &sess)?;
+    sess.motion(px, py)?;
+    // A press whose round trip fails is released when `sess` drops.
+    sess.press(btn)?;
 
-    sess.vptr.motion_absolute(0, px, py, w, h);
-    sess.vptr.frame();
-    sess.vptr.button(0, btn, ButtonState::Pressed);
-    sess.vptr.frame();
-    sess.queue.roundtrip(&mut sess.state)?;
-
-    // Take ownership of the vptr handle by extracting it from the session.
-    // ZwlrVirtualPointerV1 is a Wayland proxy — cloning it gives another
-    // handle to the same wire object; destroying it sends the destructor.
-    let vptr = sess.vptr.clone();
-    // Persist the live connection so the proxy stays valid after this fn returns
-    // (the session goes out of scope; we need the conn alive).
-    // We do this by leaking the connection into a process-static slot keyed by
-    // cursor_id. Subsequent commands on the same cursor reuse this conn.
-    persist_conn(cursor_id, sess.conn);
+    // The vptr proxy stays valid while its connection lives: keep both for
+    // the cursor's later commands.
+    let (origin_x, origin_y) = (sess.origin_x, sess.origin_y);
+    let niri = sess.deadline.is_some();
+    let (conn, vptr) = sess.keep();
+    persist_conn(cursor_id, conn, niri);
 
     let mut held = HashSet::new();
     held.insert(btn);
@@ -220,8 +214,8 @@ fn handle_press(
             held,
             out_w: w,
             out_h: h,
-            origin_x: sess.origin_x,
-            origin_y: sess.origin_y,
+            origin_x,
+            origin_y,
         },
     );
     Ok(())
@@ -329,15 +323,20 @@ fn handle_release(
 //
 // We use a per-thread static rather than a Mutex<HashMap> because the owner
 // thread is the only accessor (no contention possible).
+/// A held cursor's connection, its queue, and whether it is niri's, whose
+/// round trips are bounded.
+type Persisted = (Connection, wayland_client::EventQueue<super::State>, bool);
+
 thread_local! {
-    static CONNS: std::cell::RefCell<HashMap<String, (Connection, wayland_client::EventQueue<super::State>)>>
+    static CONNS: std::cell::RefCell<HashMap<String, Persisted>>
         = std::cell::RefCell::new(HashMap::new());
 }
 
-fn persist_conn(cursor_id: &str, conn: Connection) {
+fn persist_conn(cursor_id: &str, conn: Connection, niri: bool) {
     let queue = conn.new_event_queue::<super::State>();
     CONNS.with(|c| {
-        c.borrow_mut().insert(cursor_id.to_string(), (conn, queue));
+        c.borrow_mut()
+            .insert(cursor_id.to_string(), (conn, queue, niri));
     });
 }
 
@@ -350,14 +349,13 @@ fn forget_conn(cursor_id: &str) {
 fn roundtrip_on_persistent(cursor_id: &str) -> anyhow::Result<()> {
     CONNS.with(|c| {
         let mut b = c.borrow_mut();
-        let (_conn, queue) = b
+        let (conn, queue, niri) = b
             .get_mut(cursor_id)
             .ok_or_else(|| anyhow::anyhow!("no persistent connection for cursor '{cursor_id}'"))?;
         let mut tmp = super::State::default();
-        queue
-            .roundtrip(&mut tmp)
-            .map_err(|e| anyhow::anyhow!("compositor roundtrip failed: {e}"))?;
-        Ok(())
+        let deadline = niri.then(|| std::time::Instant::now() + super::NIRI_ROUNDTRIP_TIMEOUT);
+        super::sync_by(conn, queue, &mut tmp, deadline)
+            .map_err(|e| anyhow::anyhow!("compositor roundtrip failed: {e:#}"))
     })
 }
 

@@ -392,6 +392,7 @@ fn launch_host_with_evidence(spec: &HostSpec, scenario: &str, evidence: &mut Evi
                         if last_tree.contains("WEB_HARNESS_MARKER_v1")
                             && fixture.journal.contains("WEB_HARNESS_MARKER_v1")
                         {
+                            assert_laid_out(&fixture);
                             return fixture;
                         }
                         thread::sleep(Duration::from_millis(250));
@@ -437,6 +438,21 @@ fn snapshot(fixture: &mut Fixture) -> ToolResponse {
             .unwrap_or("no reason given")
     );
     state
+}
+
+/// A web fixture page laid out collapsed (seen with WebKitGTK on a runner
+/// without a DRM render node) stacks its controls, so pointer rows would
+/// fail as misdelivered. Report the host's renderer instead.
+fn assert_laid_out(fixture: &Fixture) {
+    let client_height = fixture.journal.snapshot()["scroll-tall"]["clientHeight"].as_u64();
+    assert_ne!(
+        client_height,
+        Some(0),
+        "environment: the {} fixture page laid out collapsed (#scroll-tall clientHeight 0), \
+         so its controls are not where its accessibility tree places them; this host's web \
+         renderer is broken, and no row on this fixture can be judged",
+        fixture.name
+    );
 }
 
 #[cfg(target_os = "linux")]

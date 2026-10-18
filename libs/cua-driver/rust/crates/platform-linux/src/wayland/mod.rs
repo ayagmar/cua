@@ -1911,6 +1911,13 @@ pub fn click_desktop(
     )
 }
 
+/// The legacy wlroots route sends a click at `(0, 0)` to the output centre.
+/// On Hyprland and niri callers address the global layout, where `(0, 0)` is
+/// a real point (a window or bar at the top-left corner).
+fn centres_origin_click(x: i32, y: i32, layout_addressed: bool) -> bool {
+    x == 0 && y == 0 && !layout_addressed
+}
+
 /// On niri, window-addressed pointer input waits for the layout to settle,
 /// proves each layout point lands on the target window and then activates it
 /// (see [`niri::gate_pointer`]). Desktop-scope input names no window: its
@@ -1963,7 +1970,7 @@ fn click_vptr(
     let mut sess = open_vptr_session_in(window_id, snapshot)?;
     std::thread::sleep(std::time::Duration::from_millis(40));
     let (w, h) = (sess.output_w, sess.output_h);
-    let centre = x == 0 && y == 0 && !hyprland::is_session();
+    let centre = centres_origin_click(x, y, hyprland::is_session() || niri::is_session());
     let (px, py) = if centre {
         (w / 2, h / 2)
     } else {
@@ -4106,6 +4113,13 @@ mod output_transform_tests {
 mod tests {
     /// A point past the pointer space is clamped onto another pixel; the
     /// niri gate must see that rather than admit the clamped point.
+    #[test]
+    fn layout_addressed_origin_clicks_stay_at_the_origin() {
+        assert!(super::centres_origin_click(0, 0, false));
+        assert!(!super::centres_origin_click(0, 0, true));
+        assert!(!super::centres_origin_click(0, 1, false));
+    }
+
     #[test]
     fn clamped_points_are_not_reached() {
         // The lane's 1280x720 logical output at scale 1.5.

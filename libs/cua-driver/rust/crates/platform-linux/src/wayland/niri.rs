@@ -262,13 +262,22 @@ fn release_of(connection: UnixStream) -> Result<String> {
 }
 
 /// Whether the adapter supports niri `version`, such as `26.04 (8ed0da4)`.
+/// Only the leading digits of the year and month count: packagers may add
+/// a suffix, such as `26.04-1 (e35c630)`.
 fn release_supported(version: &str) -> Result<(), String> {
     let release = version
         .split_once(" (")
         .map_or(version, |(release, _)| release);
-    let mut numbers = release.split('.').map(str::parse::<u32>);
-    match (numbers.next(), numbers.next()) {
-        (Some(Ok(year)), Some(Ok(month))) if numbers.all(|number| number.is_ok()) => {
+    let leading = |part: Option<&str>| {
+        let part = part?;
+        let digits = part
+            .find(|c: char| !c.is_ascii_digit())
+            .unwrap_or(part.len());
+        part[..digits].parse::<u32>().ok()
+    };
+    let mut parts = release.split('.');
+    match (leading(parts.next()), leading(parts.next())) {
+        (Some(year), Some(month)) => {
             if (year, month) >= MIN_RELEASE {
                 Ok(())
             } else {
@@ -2890,6 +2899,9 @@ mod tests {
             "25.11.1 (abc)",
             "26.04 (8ed0da4)",
             "26.04",
+            // niri's packaging guide suggests a distribution suffix.
+            "26.04-1 (abc)",
+            "25.08.1-2",
         ] {
             assert_eq!(release_supported(version), Ok(()), "{version}");
         }

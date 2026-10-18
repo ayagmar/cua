@@ -353,8 +353,12 @@ scale for focused fractional-scale checks. The shell patches `wf-recorder`
 not offer.
 
 Every Wayland mode unsets inherited `WAYLAND_SOCKET`, `NIRI_SOCKET`,
-`SWAYSOCK`, `I3SOCK`, and `HYPRLAND_INSTANCE_SIGNATURE` before it starts its
-compositor, so a run from a desktop session never reaches the host compositor.
+`SWAYSOCK`, `I3SOCK`, `HYPRLAND_INSTANCE_SIGNATURE`,
+`DBUS_SESSION_BUS_ADDRESS`, and `AT_SPI_BUS_ADDRESS` before it starts its
+compositor, then starts its own session bus, AT-SPI bus, and Secret Service
+with keyrings under its runtime directory. A run from a desktop session
+therefore never reaches the host compositor, keyring, accessibility bus, or
+portals.
 
 Run the nested compositor wrapper through
 `nix develop .#cua-driver-inject-e2e`. This environment is experimental and

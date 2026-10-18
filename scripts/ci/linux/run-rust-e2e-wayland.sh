@@ -114,9 +114,11 @@ EOF
 
 unset DISPLAY
 unset WAYLAND_DISPLAY
-# A runner started from a desktop inherits that session's sockets. Export only
-# this session's own so no test can reach the host compositor.
+# A runner started from a desktop inherits that session's sockets and buses.
+# Export only this session's own so no test can reach the host compositor,
+# Secret Service, accessibility bus, or portals.
 unset WAYLAND_SOCKET NIRI_SOCKET SWAYSOCK I3SOCK HYPRLAND_INSTANCE_SIGNATURE
+unset DBUS_SESSION_BUS_ADDRESS AT_SPI_BUS_ADDRESS
 export XDG_RUNTIME_DIR="${RUNTIME_DIR}"
 export XDG_SESSION_TYPE=wayland
 if [[ "${SESSION_KIND}" == niri ]]; then
@@ -167,18 +169,16 @@ export WEBKIT_DISABLE_SANDBOX_THIS_IS_DANGEROUS=1
 export NO_AT_BRIDGE=0
 export ACCESSIBILITY_ENABLED=1
 
-if [[ -z "${DBUS_SESSION_BUS_ADDRESS:-}" ]]; then
-  dbus_daemon="$(command -v dbus-daemon)"
-  dbus_prefix="$(dirname "$(dirname "$(readlink -f "${dbus_daemon}")")")"
-  dbus_config="${dbus_prefix}/share/dbus-1/session.conf"
-  if [[ ! -f "${dbus_config}" ]]; then
-    echo "DBus session config is missing: ${dbus_config}" >&2
-    exit 1
-  fi
-  dbus_info="$(dbus-daemon --config-file="${dbus_config}" --fork --print-address=1 --print-pid=1)"
-  export DBUS_SESSION_BUS_ADDRESS="$(sed -n '1p' <<< "${dbus_info}")"
-  DBUS_PID="$(sed -n '2p' <<< "${dbus_info}")"
+dbus_daemon="$(command -v dbus-daemon)"
+dbus_prefix="$(dirname "$(dirname "$(readlink -f "${dbus_daemon}")")")"
+dbus_config="${dbus_prefix}/share/dbus-1/session.conf"
+if [[ ! -f "${dbus_config}" ]]; then
+  echo "DBus session config is missing: ${dbus_config}" >&2
+  exit 1
 fi
+dbus_info="$(dbus-daemon --config-file="${dbus_config}" --fork --print-address=1 --print-pid=1)"
+export DBUS_SESSION_BUS_ADDRESS="$(sed -n '1p' <<< "${dbus_info}")"
+DBUS_PID="$(sed -n '2p' <<< "${dbus_info}")"
 
 # The shared lane exercises the encrypted Computer History lifecycle. Give its
 # Linux key provider the same unlocked Secret Service that the canonical X11
@@ -189,8 +189,12 @@ if [[ "${CUA_E2E_INTERNAL_LANE:-all}" == "shared" \
     echo "gnome-keyring-daemon is required for the shared Wayland history gate" >&2
     exit 1
   fi
+  # gnome-keyring keeps its keyrings under XDG_DATA_HOME; keep the disposable
+  # test keyring out of the user's home.
   keyring_environment="$(
-    printf 'test-password' | gnome-keyring-daemon --unlock --components=secrets
+    printf 'test-password' \
+      | XDG_DATA_HOME="${RUNTIME_DIR}/keyring-data" \
+        gnome-keyring-daemon --unlock --components=secrets
   )"
   eval "${keyring_environment}"
   deadline=$((SECONDS + 15))

@@ -17,6 +17,7 @@ pub mod hyprland_capture;
 mod hyprland_compatibility;
 pub mod hyprland_input;
 pub mod kwin_helper;
+pub mod niri;
 pub mod overlay;
 pub mod persistent_vptr;
 pub(crate) mod portal;
@@ -1876,10 +1877,15 @@ pub fn scroll(window_id: u64, direction: &str, amount: u32) -> anyhow::Result<()
 
 /// Translate window-local screenshot coordinates into compositor output
 /// coordinates when the active compositor exposes the target geometry.
-pub fn window_local_to_output(window_id: u64, x: i32, y: i32) -> (i32, i32) {
-    window_geometry(window_id)
+/// On niri a window without a reported place (a tiled one) refuses: passing
+/// `(x, y)` through would aim window-local coordinates at the layout origin.
+pub fn window_local_to_output(window_id: u64, x: i32, y: i32) -> anyhow::Result<(i32, i32)> {
+    if is_wayland() && niri::is_session() {
+        return niri::aim(window_id, x, y);
+    }
+    Ok(window_geometry(window_id)
         .map(|(window_x, window_y, _, _)| (window_x.saturating_add(x), window_y.saturating_add(y)))
-        .unwrap_or((x, y))
+        .unwrap_or((x, y)))
 }
 
 /// Resolve geometry through stable title/app identity when a foreign-toplevel
@@ -1890,6 +1896,17 @@ pub fn window_geometry(window_id: u64) -> Option<(i32, i32, u32, u32)> {
         // Do not fall back to title, app-id, X11, or another compositor when
         // an explicit native Hyprland address is missing.
         return hyprland::window_for_address(window_id).map(|w| (w.x, w.y, w.width, w.height));
+    }
+    if is_wayland() && niri::is_session() {
+        // Only a placed floating niri window has geometry. A tiled one has
+        // none, and no title or app-id match may supply it.
+        let placed = niri::window_for_id(window_id).ok()?.placement.ok()?;
+        return Some((
+            placed.rect.x,
+            placed.rect.y,
+            placed.rect.width,
+            placed.rect.height,
+        ));
     }
     if let Some(window) = sway_ipc::window_for_id(window_id) {
         return Some((window.x, window.y, window.width, window.height));
@@ -3474,6 +3491,32 @@ fn wayland_atspi_windows(filter_pid: Option<u32>) -> Vec<WindowInfo> {
     windows
 }
 
+/// A niri window as a listing entry. Only a placed floating window has
+/// geometry; any other window lists as 0x0 at the origin, so no caller can
+/// mistake it for a real rectangle.
+fn niri_window_info(window: niri::Window) -> WindowInfo {
+    let (x, y, width, height) = window.placement.map_or((0, 0, 0, 0), |placed| {
+        (
+            placed.rect.x,
+            placed.rect.y,
+            placed.rect.width,
+            placed.rect.height,
+        )
+    });
+    WindowInfo {
+        xid: window.id,
+        pid: window.pid,
+        app_name: window.app_id,
+        title: window.title,
+        is_on_screen: window.on_screen,
+        z_index: None,
+        x,
+        y,
+        width,
+        height,
+    }
+}
+
 fn apply_pid_filter(mut windows: Vec<WindowInfo>, filter_pid: Option<u32>) -> Vec<WindowInfo> {
     if let Some(pid) = filter_pid {
         windows.retain(|window| window.pid == Some(pid));
@@ -3508,6 +3551,21 @@ pub fn list_windows_dispatch(filter_pid: Option<u32>) -> Vec<WindowInfo> {
                 )),
                 Err(error) => {
                     tracing::warn!("Hyprland window enumeration unavailable: {error:#}");
+                    Vec::new()
+                }
+            };
+        }
+        if niri::is_session() {
+            // niri IPC attests PIDs and its own window ids. Once niri is
+            // recognised, an IPC failure must not fall back to the
+            // foreign-toplevel title join, which loses that id namespace.
+            return match niri::list_windows() {
+                Ok(windows) => listed_windows(apply_pid_filter(
+                    windows.into_iter().map(niri_window_info).collect(),
+                    filter_pid,
+                )),
+                Err(error) => {
+                    tracing::warn!("niri window enumeration unavailable: {error:#}");
                     Vec::new()
                 }
             };

@@ -5064,14 +5064,14 @@ fn coordinate_less_mouse_button_up_survives_snapshot_replacement() {
 fn persistent_wayland_pointer_coordinates_include_window_origin() {
     let output = persistent_pointer_coordinates(true, 7, 10, 20, |window_id, x, y| {
         assert_eq!(window_id, 7);
-        (x + 100, y + 200)
+        Ok((x + 100, y + 200))
     });
-    assert_eq!(output, (110, 220));
+    assert_eq!(output.unwrap(), (110, 220));
 
     let x11 = persistent_pointer_coordinates(false, 7, 10, 20, |_, _, _| {
         panic!("X11 coordinates must remain window-local")
     });
-    assert_eq!(x11, (10, 20));
+    assert_eq!(x11.unwrap(), (10, 20));
 }
 
 #[cfg(test)]
@@ -5469,12 +5469,12 @@ fn persistent_pointer_coordinates(
     window_id: u64,
     x: i32,
     y: i32,
-    window_local_to_output: impl FnOnce(u64, i32, i32) -> (i32, i32),
-) -> (i32, i32) {
+    window_local_to_output: impl FnOnce(u64, i32, i32) -> anyhow::Result<(i32, i32)>,
+) -> anyhow::Result<(i32, i32)> {
     if is_wayland {
         window_local_to_output(window_id, x, y)
     } else {
-        (x, y)
+        Ok((x, y))
     }
 }
 
@@ -7071,11 +7071,10 @@ impl Tool for ClickTool {
         // always window-local screenshot pixels; native Wayland translates
         // through compositor/AT-SPI geometry while X11 uses XTranslateCoordinates.
         let wayland_output_point = if crate::wayland::wayland_input_enabled() {
-            Some(crate::wayland::window_local_to_output(
-                xid,
-                x.round() as i32,
-                y.round() as i32,
-            ))
+            match crate::wayland::window_local_to_output(xid, x.round() as i32, y.round() as i32) {
+                Ok(point) => Some(point),
+                Err(error) => return input_error_result(error),
+            }
         } else {
             None
         };
@@ -10104,9 +10103,15 @@ impl Tool for ScrollTool {
                 }
                 (None, cua_driver_core::element_token::ResolvedElement::None) => None,
             };
-            let output_point = local_point.map(|(x, y)| {
-                crate::wayland::window_local_to_output(xid, x.round() as i32, y.round() as i32)
-            });
+            let output_point = match local_point
+                .map(|(x, y)| {
+                    crate::wayland::window_local_to_output(xid, x.round() as i32, y.round() as i32)
+                })
+                .transpose()
+            {
+                Ok(point) => point,
+                Err(error) => return input_error_result(error),
+            };
             let result = tokio::task::spawn_blocking(move || {
                 crate::wayland::scroll_at(xid, output_point, &direction_for_wayland, amount as u32)
             })
@@ -10372,8 +10377,13 @@ impl Tool for DoubleClickTool {
                     }
                     let lxi = lx as i32;
                     let lyi = ly as i32;
-                    let wayland_point = crate::wayland::wayland_input_enabled()
-                        .then(|| crate::wayland::window_local_to_output(xid, lxi, lyi));
+                    let wayland_point = match crate::wayland::wayland_input_enabled()
+                        .then(|| crate::wayland::window_local_to_output(xid, lxi, lyi))
+                        .transpose()
+                    {
+                        Ok(point) => point,
+                        Err(error) => return input_error_result(error),
+                    };
                     let cursor_id_for_task = cursor_id.clone();
                     let click_result =
                         tokio::task::spawn_blocking(move || -> anyhow::Result<PointerRoute> {
@@ -10470,11 +10480,10 @@ impl Tool for DoubleClickTool {
             cursor_overlay::OverlayCommand::PinAbove(xid),
         );
         let wayland_output_point = if crate::wayland::wayland_input_enabled() {
-            Some(crate::wayland::window_local_to_output(
-                xid,
-                x.round() as i32,
-                y.round() as i32,
-            ))
+            match crate::wayland::window_local_to_output(xid, x.round() as i32, y.round() as i32) {
+                Ok(point) => Some(point),
+                Err(error) => return input_error_result(error),
+            }
         } else {
             None
         };
@@ -10659,8 +10668,13 @@ impl Tool for RightClickTool {
                     }
                     let lxi = lx as i32;
                     let lyi = ly as i32;
-                    let wayland_point = crate::wayland::wayland_input_enabled()
-                        .then(|| crate::wayland::window_local_to_output(xid, lxi, lyi));
+                    let wayland_point = match crate::wayland::wayland_input_enabled()
+                        .then(|| crate::wayland::window_local_to_output(xid, lxi, lyi))
+                        .transpose()
+                    {
+                        Ok(point) => point,
+                        Err(error) => return input_error_result(error),
+                    };
                     let cursor_id_for_task = cursor_id.clone();
                     let click_result =
                         tokio::task::spawn_blocking(move || -> anyhow::Result<PointerRoute> {
@@ -10757,11 +10771,10 @@ impl Tool for RightClickTool {
             cursor_overlay::OverlayCommand::PinAbove(xid),
         );
         let wayland_output_point = if crate::wayland::wayland_input_enabled() {
-            Some(crate::wayland::window_local_to_output(
-                xid,
-                x.round() as i32,
-                y.round() as i32,
-            ))
+            match crate::wayland::window_local_to_output(xid, x.round() as i32, y.round() as i32) {
+                Ok(point) => Some(point),
+                Err(error) => return input_error_result(error),
+            }
         } else {
             None
         };
@@ -11112,16 +11125,23 @@ impl Tool for DragTool {
                 );
             }
             let owner = named_session_cursor_key(&args);
-            let from = crate::wayland::window_local_to_output(
+            let points = crate::wayland::window_local_to_output(
                 xid,
                 from_x.round() as i32,
                 from_y.round() as i32,
-            );
-            let to = crate::wayland::window_local_to_output(
-                xid,
-                to_x.round() as i32,
-                to_y.round() as i32,
-            );
+            )
+            .and_then(|from| {
+                crate::wayland::window_local_to_output(
+                    xid,
+                    to_x.round() as i32,
+                    to_y.round() as i32,
+                )
+                .map(|to| (from, to))
+            });
+            let (from, to) = match points {
+                Ok(points) => points,
+                Err(error) => return input_error_result(error),
+            };
             let (started, acknowledged) = tokio::sync::oneshot::channel();
             let (_cancellation, mut dispatch) =
                 match spawn_isolated_hyprland(&args, move |cancellation| {
@@ -11175,16 +11195,23 @@ impl Tool for DragTool {
                 );
             }
             let owner = named_session_cursor_key(&args);
-            let from = crate::wayland::window_local_to_output(
+            let points = crate::wayland::window_local_to_output(
                 xid,
                 from_x.round() as i32,
                 from_y.round() as i32,
-            );
-            let to = crate::wayland::window_local_to_output(
-                xid,
-                to_x.round() as i32,
-                to_y.round() as i32,
-            );
+            )
+            .and_then(|from| {
+                crate::wayland::window_local_to_output(
+                    xid,
+                    to_x.round() as i32,
+                    to_y.round() as i32,
+                )
+                .map(|to| (from, to))
+            });
+            let (from, to) = match points {
+                Ok(points) => points,
+                Err(error) => return input_error_result(error),
+            };
             let (started, acknowledged) = tokio::sync::oneshot::channel();
             let (_cancellation, mut dispatch) =
                 match spawn_isolated_hyprland(&args, move |cancellation| {
@@ -11227,20 +11254,27 @@ impl Tool for DragTool {
             cursor_id.clone(),
             cursor_overlay::OverlayCommand::PinAbove(xid),
         );
-        let wayland_points = crate::wayland::wayland_input_enabled().then(|| {
-            (
+        let wayland_points = match crate::wayland::wayland_input_enabled()
+            .then(|| {
                 crate::wayland::window_local_to_output(
                     xid,
                     from_x.round() as i32,
                     from_y.round() as i32,
-                ),
-                crate::wayland::window_local_to_output(
-                    xid,
-                    to_x.round() as i32,
-                    to_y.round() as i32,
-                ),
-            )
-        });
+                )
+                .and_then(|from| {
+                    crate::wayland::window_local_to_output(
+                        xid,
+                        to_x.round() as i32,
+                        to_y.round() as i32,
+                    )
+                    .map(|to| (from, to))
+                })
+            })
+            .transpose()
+        {
+            Ok(points) => points,
+            Err(error) => return input_error_result(error),
+        };
         let screen_from = if let Some((from, _)) = wayland_points {
             Some((from.0 as f64, from.1 as f64))
         } else {
@@ -11695,13 +11729,16 @@ impl Tool for MouseButtonDownTool {
         // the existing input::send_button_down behaviour.
         let result = if is_wl {
             let cid = cursor_id.clone();
-            let (output_x, output_y) = persistent_pointer_coordinates(
+            let (output_x, output_y) = match persistent_pointer_coordinates(
                 is_wl,
                 xid,
                 xi,
                 yi,
                 crate::wayland::window_local_to_output,
-            );
+            ) {
+                Ok(point) => point,
+                Err(error) => return input_error_result(error),
+            };
             tokio::task::spawn_blocking(move || {
                 crate::wayland::persistent_vptr::press(&cid, xid, output_x, output_y, button)
             })
@@ -11871,17 +11908,21 @@ impl Tool for MouseDragTool {
             // X11 keeps the existing input::send_motion path.
             let cid_inner = cursor_id.clone();
             let move_result = if is_wl {
-                let (output_x, output_y) = persistent_pointer_coordinates(
+                match persistent_pointer_coordinates(
                     is_wl,
                     xid,
                     ix.round() as i32,
                     iy.round() as i32,
                     crate::wayland::window_local_to_output,
-                );
-                tokio::task::spawn_blocking(move || {
-                    crate::wayland::persistent_vptr::move_to(&cid_inner, output_x, output_y)
-                })
-                .await
+                ) {
+                    Ok((output_x, output_y)) => {
+                        tokio::task::spawn_blocking(move || {
+                            crate::wayland::persistent_vptr::move_to(&cid_inner, output_x, output_y)
+                        })
+                        .await
+                    }
+                    Err(error) => Ok(Err(error)),
+                }
             } else {
                 tokio::task::spawn_blocking(move || {
                     crate::input::send_motion(

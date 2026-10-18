@@ -5976,6 +5976,17 @@ fn window_to_screen_offset(pid: u32, xid: u64, title: Option<&str>) -> Option<(i
             }?;
             return (window.pid == pid).then_some((window.x, window.y));
         }
+        if crate::wayland::niri::is_session() {
+            // Only a placed floating niri window has an origin. A tiled one
+            // has none, and no observed or default origin may stand in.
+            let window = if xid != 0 {
+                crate::wayland::niri::window_for_id(xid).ok()
+            } else {
+                crate::wayland::niri::window_for_pid(pid)
+            }?;
+            let placed = window.placement.ok()?;
+            return (window.pid == Some(pid)).then_some((placed.rect.x, placed.rect.y));
+        }
         // Native Wayland: clients can't query a window's screen origin, and
         // AT-SPI CoordType::Screen collapses to (0,0) on Mutter. The bundled
         // `org.cua.WinRects` GNOME Shell extension supplies the window's screen
@@ -6297,7 +6308,7 @@ async fn element_bounds_for_visited(
             .await
             .flatten();
     if crate::wayland::is_wayland()
-        && crate::wayland::hyprland::is_session()
+        && (crate::wayland::hyprland::is_session() || crate::wayland::niri::is_session())
         && (offset.is_none() || scoped_frame.is_none())
     {
         return (Vec::new(), true);

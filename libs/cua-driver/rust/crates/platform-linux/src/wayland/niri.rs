@@ -1308,6 +1308,26 @@ fn restore_focus<C: FnMut(Instant) -> Result<UnixStream>>(
         );
         return Ok(());
     }
+    // The same for a workspace, which may hold no window to focus.
+    let prior_workspace = before
+        .iter()
+        .find(|workspace| workspace.is_focused)
+        .map(|workspace| workspace.id);
+    if let Some(chosen) = ipc
+        .query::<Vec<IpcWorkspace>>(Request::Workspaces)?
+        .into_iter()
+        .find(|workspace| workspace.is_focused)
+        .map(|workspace| workspace.id)
+        .filter(|focused| {
+            Some(*focused) != target.workspace_id && Some(*focused) != prior_workspace
+        })
+    {
+        tracing::info!(
+            workspace = chosen,
+            "niri focus moved to another workspace during input; leaving it there"
+        );
+        return Ok(());
+    }
     if let Some(active) = before
         .iter()
         .find(|workspace| Some(workspace.id) == target.workspace_id)
@@ -2876,6 +2896,31 @@ mod tests {
             .requests
             .iter()
             .any(|r| r.contains(r#""FocusWindow":{"id":5}"#)));
+    }
+
+    #[test]
+    fn an_empty_workspace_chosen_during_input_keeps_focus() {
+        let fake = focus_fixture();
+        fake.lock()
+            .unwrap()
+            .workspaces
+            .push(workspace(3, "winit", false, None));
+        with_focused_window_in(
+            &mut fake_ipc(&fake),
+            107,
+            7,
+            Duration::from_millis(100),
+            || {
+                fake.lock()
+                    .unwrap()
+                    .reply(r#"{"Action":{"FocusWorkspace":{"reference":{"Id":3}}}}"#);
+                Ok(())
+            },
+        )
+        .unwrap();
+        let fake = fake.lock().unwrap();
+        assert!(fake.active(3) && !fake.active(1));
+        assert_eq!(fake.focused(), None);
     }
 
     #[test]

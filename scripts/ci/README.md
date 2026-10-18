@@ -348,7 +348,8 @@ Before delegating to `run-rust-e2e.sh` it requires that niri drives only its
 `WAYLAND_DISPLAY` and `NIRI_SOCKET`, and it writes `niri-preflight.json` with
 the niri and cage versions. Harness windows float, the sentinel opens
 fullscreen, and animations are off. `CUA_E2E_NIRI_SCALE` changes the output
-scale for focused fractional-scale checks. The shell patches `wf-recorder`
+scale for focused fractional-scale checks; harness windows keep 940x780
+physical pixels, so at 1.5 they are 626x520 logical inside a 1280x720 output. The shell patches `wf-recorder`
 0.6.0, which otherwise binds `linux-dmabuf` version 4 that a GPU-less niri does
 not offer.
 

@@ -72,7 +72,12 @@ fi
 # niri's IPC reports destination geometry, not the animated position. Focus
 # does not follow the mouse, so floating windows stay hidden behind the focused
 # fullscreen sentinel; the testkit observer relies on that. CUA_E2E_NIRI_SCALE
-# sets the output scale for a focused fractional-scale smoke.
+# sets the output scale for a focused fractional-scale smoke. Harness sizes are
+# logical, so divide them by the scale: the windows keep Sway's 940x780
+# physical pixels and stay inside the smaller logical output.
+NIRI_SCALE="${CUA_E2E_NIRI_SCALE:-1}"
+NIRI_HARNESS_WIDTH="$(awk -v scale="${NIRI_SCALE}" 'BEGIN { printf "%d", 940 / scale }')"
+NIRI_HARNESS_HEIGHT="$(awk -v scale="${NIRI_SCALE}" 'BEGIN { printf "%d", 780 / scale }')"
 cat > "${NIRI_CONFIG}" <<EOF
 hotkey-overlay {
     skip-at-startup
@@ -84,7 +89,7 @@ animations {
     off
 }
 output "winit" {
-    scale ${CUA_E2E_NIRI_SCALE:-1}
+    scale ${NIRI_SCALE}
 }
 layout {
     focus-ring {
@@ -100,10 +105,10 @@ window-rule {
     open-floating true
     default-floating-position x=0 y=0 relative-to="top-left"
     default-column-width {
-        fixed 940
+        fixed ${NIRI_HARNESS_WIDTH}
     }
     default-window-height {
-        fixed 780
+        fixed ${NIRI_HARNESS_HEIGHT}
     }
 }
 window-rule {
@@ -379,7 +384,7 @@ PY
   niri_outputs="$(timeout 5 niri msg --json outputs)"
   if [[ "$(jq -c 'keys' <<< "${niri_outputs}")" != '["winit"]' ]] \
       || [[ "$(jq -c '.winit.logical | [.width, .height]' <<< "${niri_outputs}")" \
-        != "$(jq -nc --argjson scale "${CUA_E2E_NIRI_SCALE:-1}" '[1920, 1080] | map(. / $scale | floor)')" ]]; then
+        != "$(jq -nc --argjson scale "${NIRI_SCALE}" '[1920, 1080] | map(. / $scale | floor)')" ]]; then
     echo "nested niri must drive only its 1920x1080 winit output: ${niri_outputs}" >&2
     exit 1
   fi

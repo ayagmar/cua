@@ -54,11 +54,12 @@ const KEY_PRESSED: u32 = 1;
 
 // ── Planning ─────────────────────────────────────────────────────────────────
 
-/// One key: its evdev code and the modifiers its level needs.
+/// One key: its evdev code, and the layout and modifiers it is sent in.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct Key {
     code: u32,
     modifiers: u32,
+    group: u32,
 }
 
 /// Consecutive keys typed with one keymap: niri's own when `extended` is
@@ -359,6 +360,7 @@ fn find(map: &xkb::Keymap, group: u32, sym: xkb::Keysym) -> Option<Key> {
                 (state.key_get_one_sym(code) == sym).then_some(Key {
                     code: raw - 8,
                     modifiers,
+                    group,
                 })
             }));
         }
@@ -366,6 +368,39 @@ fn find(map: &xkb::Keymap, group: u32, sym: xkb::Keysym) -> Option<Key> {
     candidates
         .into_iter()
         .min_by_key(|key| (key.modifiers.count_ones(), key.code))
+}
+
+/// The key `name` (an X keysym name, exact or else in any case) with
+/// `modifiers` held: in the active layout `group`, or else in the first other
+/// layout that has it, so `ctrl+c` still copies while a layout without Latin
+/// letters is active.
+fn plan_key(map: &str, group: u32, modifiers: &[String], name: &str) -> Result<Key> {
+    let keymap = compile(map)?;
+    let sym = [xkb::KEYSYM_NO_FLAGS, xkb::KEYSYM_CASE_INSENSITIVE]
+        .into_iter()
+        .map(|flags| xkb::keysym_from_name(name, flags))
+        .find(|sym| sym.raw() != 0)
+        .ok_or_else(|| refused(format!("{name:?} is not a key name")))?;
+    let mut key = find(&keymap, group, sym)
+        .or_else(|| {
+            (0..keymap.num_layouts())
+                .filter(|&other| other != group)
+                .find_map(|other| find(&keymap, other, sym))
+        })
+        .ok_or_else(|| refused(format!("key {name:?} is in no layout of niri's keymap")))?;
+    for modifier in modifiers {
+        let name = match modifier.as_str() {
+            "ctrl" => xkb::MOD_NAME_CTRL,
+            "shift" => xkb::MOD_NAME_SHIFT,
+            "alt" => xkb::MOD_NAME_ALT,
+            "logo" => xkb::MOD_NAME_LOGO,
+            other => return Err(refused(format!("unsupported modifier {other:?}"))),
+        };
+        key.modifiers |= 1_u32
+            .checked_shl(keymap.mod_get_index(name))
+            .ok_or_else(|| refused(format!("niri's keymap has no {name} modifier")))?;
+    }
+    Ok(key)
 }
 
 // ── Typing ───────────────────────────────────────────────────────────────────
@@ -377,33 +412,86 @@ pub(super) fn type_text(text: &str) -> Result<()> {
     if text.is_empty() {
         return Ok(());
     }
-    let deadline = Instant::now() + CALL_BASE + PER_KEY * text.chars().count() as u32;
-    let target = super::niri::keyboard_focus()
-        .map_err(super::niri::input_unavailable)?
-        .ok_or_else(|| {
-            anyhow!(
-                "foreground_unavailable: no niri window has keyboard focus (the screen may be \
-                 locked, or the overview, a layer-shell surface or a niri dialog has it); \
-                 nothing was typed"
-            )
-        })?;
-    let group = super::niri::keyboard_layout().map_err(super::niri::input_unavailable)?;
-    let mut keyboard = Keyboard::bind(deadline).map_err(|error| refused(format!("{error:#}")))?;
-    let parts = plan_text(keyboard.base_text(), group, text)?;
+    let mut session = Session::begin(text.chars().count())?;
+    let parts = plan_text(session.keyboard.base_text(), session.group, text)?;
     let total: usize = parts.iter().map(|part| part.keys.len()).sum();
     let mut sent = 0;
-    let typed = type_parts(&mut keyboard, &parts, group, deadline, &mut sent, || {
-        match super::niri::keyboard_focus() {
-            Ok(Some(focused)) if focused == target => Ok(()),
-            Ok(focused) => Err(anyhow!(
-                "foreground_unavailable: niri keyboard focus moved from window {target} to {}",
-                focused.map_or_else(|| "no window".to_owned(), |id| format!("window {id}"))
-            )),
-            Err(error) => Err(super::niri::input_unavailable(error)),
-        }
-    });
-    let finished = keyboard.finish(group);
-    outcome(sent, total, typed, finished)
+    let typed = session.send(&parts, &mut sent);
+    outcome(sent, total, typed, session.finish())
+}
+
+/// Press the key `name` (an X keysym name) with `modifiers` (`ctrl`,
+/// `shift`, `alt`, `logo`) held, into the niri window that has keyboard
+/// focus. The modifiers are held through the keyboard's modifier state.
+pub(super) fn press(modifiers: &[String], name: &str) -> Result<()> {
+    let mut session = Session::begin(1)?;
+    let key = plan_key(session.keyboard.base_text(), session.group, modifiers, name)?;
+    let parts = [Part {
+        keys: vec![key],
+        extended: None,
+    }];
+    let typed = session.send(&parts, &mut 0);
+    match (typed, session.finish()) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Err(error), _) => Err(error),
+        (Ok(()), Err(error)) => Err(error.context("pressed the key, but could not finish")),
+    }
+}
+
+/// One call's keyboard, bound to the window that had keyboard focus when it
+/// began and to niri's active layout then.
+struct Session {
+    keyboard: Keyboard,
+    target: u64,
+    group: u32,
+    deadline: Instant,
+}
+
+impl Session {
+    fn begin(keys: usize) -> Result<Self> {
+        let deadline =
+            Instant::now() + CALL_BASE + PER_KEY * u32::try_from(keys).unwrap_or(u32::MAX);
+        let target = super::niri::keyboard_focus()
+            .map_err(super::niri::input_unavailable)?
+            .ok_or_else(|| {
+                anyhow!(
+                    "foreground_unavailable: no niri window has keyboard focus (the screen may \
+                     be locked, or the overview, a layer-shell surface or a niri dialog has \
+                     it); nothing was typed"
+                )
+            })?;
+        let group = super::niri::keyboard_layout().map_err(super::niri::input_unavailable)?;
+        let keyboard = Keyboard::bind(deadline).map_err(|error| refused(format!("{error:#}")))?;
+        Ok(Self {
+            keyboard,
+            target,
+            group,
+            deadline,
+        })
+    }
+
+    fn send(&mut self, parts: &[Part], sent: &mut usize) -> Result<()> {
+        let target = self.target;
+        type_parts(
+            &mut self.keyboard,
+            parts,
+            self.group,
+            self.deadline,
+            sent,
+            || match super::niri::keyboard_focus() {
+                Ok(Some(focused)) if focused == target => Ok(()),
+                Ok(focused) => Err(anyhow!(
+                    "foreground_unavailable: niri keyboard focus moved from window {target} to {}",
+                    focused.map_or_else(|| "no window".to_owned(), |id| format!("window {id}"))
+                )),
+                Err(error) => Err(super::niri::input_unavailable(error)),
+            },
+        )
+    }
+
+    fn finish(self) -> Result<()> {
+        self.keyboard.finish(self.group)
+    }
 }
 
 /// A stop before any key keeps its refusal; a stop after some keys went out
@@ -425,6 +513,7 @@ fn outcome(sent: usize, total: usize, typed: Result<()>, finished: Result<()>) -
 /// What sends keys: the virtual keyboard, or a recorder in tests.
 trait Strokes {
     fn upload(&mut self, map: &str) -> Result<()>;
+    /// Send `key` in its layout, then return to the active layout `group`.
     fn stroke(&mut self, key: Key, group: u32, deadline: Instant) -> Result<()>;
 }
 
@@ -563,7 +652,7 @@ impl Strokes for Keyboard {
     }
 
     fn stroke(&mut self, key: Key, group: u32, deadline: Instant) -> Result<()> {
-        self.device.modifiers(key.modifiers, 0, 0, group);
+        self.device.modifiers(key.modifiers, 0, 0, key.group);
         self.pressed.push(key.code);
         self.device
             .key(super::event_time_ms(), key.code, KEY_PRESSED);
@@ -843,6 +932,43 @@ mod tests {
             spare + 1
         );
         assert!(parts.iter().all(|part| part.extended.is_some()));
+    }
+
+    fn ctrl() -> u32 {
+        let keymap = compile(US_DE).unwrap();
+        1 << keymap.mod_get_index(xkb::MOD_NAME_CTRL)
+    }
+
+    #[test]
+    fn a_chord_goes_out_on_the_layouts_key_with_its_modifier() {
+        let copy = plan_key(US_DE, 0, &["ctrl".into()], "c").unwrap();
+        assert_eq!((copy.code, copy.modifiers, copy.group), (46, ctrl(), 0));
+        // German has Z where US has Y.
+        let undo = plan_key(US_DE, 1, &["ctrl".into()], "z").unwrap();
+        assert_eq!((undo.code, undo.group), (21, 1));
+        let enter = plan_key(US_DE, 0, &[], "Return").unwrap();
+        assert_eq!((enter.code, enter.modifiers), (ENTER, 0));
+    }
+
+    #[test]
+    fn a_key_the_active_layout_lacks_goes_out_in_one_that_has_it() {
+        // German has no plain `grave` keysym (only a dead key).
+        let grave = plan_key(US_DE, 1, &[], "grave").unwrap();
+        assert_eq!((grave.code, grave.group), (41, 0));
+    }
+
+    #[test]
+    fn an_unknown_key_or_modifier_refuses() {
+        for error in [
+            plan_key(US_DE, 0, &[], "NoSuchKey").unwrap_err(),
+            plan_key(US_DE, 0, &["hyper".into()], "a").unwrap_err(),
+        ] {
+            assert_eq!(
+                crate::input::foreground::error_code(&error),
+                Some(crate::input::foreground::CODE_UNAVAILABLE),
+                "{error}"
+            );
+        }
     }
 
     #[derive(Default)]

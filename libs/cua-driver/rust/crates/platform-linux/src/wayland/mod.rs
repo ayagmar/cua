@@ -2630,6 +2630,10 @@ pub fn type_text_focused(text: &str) -> anyhow::Result<()> {
 /// process after the text has landed.
 pub fn type_text_then_key_focused(text: &str, key: &str) -> anyhow::Result<()> {
     let keysym = key_to_keysym(key);
+    if is_wayland() && niri::is_session() {
+        niri_keyboard::type_text(text)?;
+        return niri_keyboard::press(&[], &keysym);
+    }
     let result = wtype_output(&[
         "-k",
         "Shift_L",
@@ -2658,6 +2662,9 @@ pub fn type_text_then_key_focused(text: &str, key: &str) -> anyhow::Result<()> {
 pub fn press_key(window_id: u64, key: &str) -> anyhow::Result<()> {
     activate_window_for_input(window_id)?;
     let keysym = key_to_keysym(key);
+    if is_wayland() && niri::is_session() {
+        return niri_keyboard::press(&[], &keysym);
+    }
     // Keep the sacrificial modifier and requested key in one virtual-keyboard
     // lifetime. Starting a second wtype process creates a fresh protocol object,
     // causing headless seats to drop the requested key as their first event.
@@ -2682,6 +2689,9 @@ pub fn press_key_focused(key: &str) -> anyhow::Result<()> {
         return inject_press_key(pid, window_id, key);
     }
     let keysym = key_to_keysym(key);
+    if is_wayland() && niri::is_session() {
+        return niri_keyboard::press(&[], &keysym);
+    }
     let result = wtype_output(&["-k", "Shift_L", "-k", keysym.as_str()])?;
     match result {
         Ok(out) if out.status.success() => Ok(()),
@@ -2703,6 +2713,9 @@ pub fn press_key_focused(key: &str) -> anyhow::Result<()> {
 pub fn hotkey(window_id: u64, keys: &[String]) -> anyhow::Result<()> {
     activate_window_for_input(window_id)?;
     let (mods, final_key) = partition_modifiers(keys)?;
+    if is_wayland() && niri::is_session() {
+        return niri_keyboard::press(&mods, &chord_keysym(&final_key));
+    }
     if let Ok(()) = virtual_keyboard::hotkey(&mods, &final_key) {
         return Ok(());
     }
@@ -2743,6 +2756,9 @@ pub fn hotkey_focused(keys: &[String]) -> anyhow::Result<()> {
         return inject_hotkey(pid, window_id, keys);
     }
     let (mods, final_key) = partition_modifiers(keys)?;
+    if is_wayland() && niri::is_session() {
+        return niri_keyboard::press(&mods, &chord_keysym(&final_key));
+    }
     if let Ok(()) = virtual_keyboard::hotkey(&mods, &final_key) {
         return Ok(());
     }
@@ -2854,6 +2870,16 @@ fn partition_modifiers(keys: &[String]) -> anyhow::Result<(Vec<String>, String)>
         .cloned()
         .ok_or_else(|| anyhow::anyhow!("hotkey requires at least one non-modifier key"))?;
     Ok((mods, final_key))
+}
+
+/// The keysym of a chord's final key. A letter names its key whatever its
+/// case, as the virtual-keyboard chord route reads it: `ctrl+A` is `ctrl+a`,
+/// and Shift is held only when asked for.
+fn chord_keysym(key: &str) -> String {
+    match key.as_bytes() {
+        [letter] if letter.is_ascii_alphabetic() => key.to_ascii_lowercase(),
+        _ => key_to_keysym(key),
+    }
 }
 
 /// Map cua key names to X keysym names that `wtype -k` understands. Unknown
@@ -4393,6 +4419,13 @@ mod tests {
             "foreground_unavailable: layout changed"
         );
         assert_eq!(delivered, 0);
+    }
+
+    #[test]
+    fn a_chord_letter_names_its_key_in_either_case() {
+        assert_eq!(super::chord_keysym("A"), "a");
+        assert_eq!(super::chord_keysym("enter"), "Return");
+        assert_eq!(super::chord_keysym("F5"), "F5");
     }
 
     #[test]

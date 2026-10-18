@@ -1101,6 +1101,16 @@ fn correlate_niri_frame(
     correlate_hyprland_frame(frames, clients, target)
 }
 
+/// Whether a toolkit frame's Window extents are niri's window size, give or
+/// take a pixel of rounding. An unknown frame or window never fits.
+fn niri_frame_fits(frame: Option<(i32, i32, i32, i32)>, window: Option<(u32, u32)>) -> bool {
+    let (Some((_, _, width, height)), Some((window_width, window_height))) = (frame, window) else {
+        return false;
+    };
+    (i64::from(width) - i64::from(window_width)).abs() <= 1
+        && (i64::from(height) - i64::from(window_height)).abs() <= 1
+}
+
 #[cfg(test)]
 mod hyprland_frame_tests {
     use super::*;
@@ -1189,6 +1199,22 @@ mod hyprland_frame_tests {
             correlate_niri_frame(&[frame("untitled")], &[("A", 800, 600)], 0, 1),
             Some(0)
         );
+    }
+
+    #[test]
+    fn niri_frames_publish_only_when_the_toolkit_frame_is_the_window() {
+        // Measured in the nested niri lane: GTK 3's frame with client-side
+        // decorations includes a 26 px shadow on every side of a 940x780
+        // window, which put every element 26 px right and below its pixels.
+        assert!(!niri_frame_fits(Some((0, 0, 992, 832)), Some((940, 780))));
+        // With niri's prefer-no-csd the frame is the window.
+        assert!(niri_frame_fits(Some((0, 0, 940, 780)), Some((940, 780))));
+        // A pixel of rounding (fractional scale) and nothing more.
+        assert!(niri_frame_fits(Some((0, 0, 627, 519)), Some((626, 520))));
+        assert!(!niri_frame_fits(Some((0, 0, 942, 780)), Some((940, 780))));
+        // An unknown frame or an unplaced window proves nothing.
+        assert!(!niri_frame_fits(None, Some((940, 780))));
+        assert!(!niri_frame_fits(Some((0, 0, 940, 780)), None));
     }
 
     #[test]
@@ -3787,6 +3813,11 @@ pub fn element_bounds_ref(
     if in_web_content {
         return Err(anyhow!(
             "web-content bounds need the document origin; re-walk"
+        ));
+    }
+    if crate::wayland::is_wayland() && crate::wayland::niri::is_session() {
+        return Err(anyhow!(
+            "niri element bounds need the window's frame size check; re-walk"
         ));
     }
     let offset = window_to_screen_offset(pid, xid, None);
@@ -6478,7 +6509,7 @@ async fn element_bounds_for_visited(
     // title-bar offset). Normalize that frame to the compositor window origin
     // before adding the screen offset. Native GTK reports (0,0), so this is a
     // no-op there.
-    let window_frame_origin = if offset.is_some() {
+    let window_frame_extents = if offset.is_some() {
         let frame = visited.iter().find(|node| {
             scoped_frame.is_none_or(|scope| node.frame_ordinal == scope)
                 && node.has_component
@@ -6492,7 +6523,7 @@ async fn element_bounds_for_visited(
                 Some(Ok(proxies)) => match call(proxies.component()).await {
                     Some(Ok(component)) => {
                         match call(component.get_extents(CoordType::Window)).await {
-                            Some(Ok((x, y, _, _))) => Some((x, y)),
+                            Some(Ok(extents)) => Some(extents),
                             _ => None,
                         }
                     }
@@ -6506,6 +6537,33 @@ async fn element_bounds_for_visited(
     } else {
         None
     };
+    let window_frame_origin = window_frame_extents.map(|(x, y, _, _)| (x, y));
+    // niri's origin is its window geometry. A toolkit's Window extents start
+    // there only when its frame is that size: GTK 3 measures from its
+    // client-side shadow, Chromium from its resize margins, and where the
+    // window starts inside such a frame is not on the bus. Publish no frames
+    // rather than shifted ones.
+    if crate::wayland::is_wayland() && crate::wayland::niri::is_session() {
+        let window = bounded_blocking(move || {
+            if xid != 0 {
+                crate::wayland::niri::window_for_id(xid).ok()
+            } else {
+                crate::wayland::niri::window_for_pid(pid)
+            }
+        })
+        .await
+        .flatten();
+        let window_size = window
+            .and_then(|window| window.placement.ok())
+            .map(|placed| (placed.rect.width, placed.rect.height));
+        if !niri_frame_fits(window_frame_extents, window_size) {
+            dlog!(
+                "element bounds: niri window {xid} is {window_size:?} but its accessible frame \
+                 is {window_frame_extents:?}; publishing no frames"
+            );
+            return (Vec::new(), true);
+        }
+    }
     // Add compositor decorations and the embedded document origin for web
     // descendants only. Electron commonly contributes zero for both; WebKitGTK
     // under Sway needs the sum.

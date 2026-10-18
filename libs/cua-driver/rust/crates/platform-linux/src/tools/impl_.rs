@@ -268,6 +268,14 @@ fn screenshot_scale(
     state
         .snapshots
         .screenshot_scale(pid as i32, window_id, args)
+        .map_err(|missing| {
+            // A tiled niri window never has a screenshot: say why instead of
+            // asking for the get_window_state read that cannot give one.
+            window_id
+                .filter(|_| crate::wayland::is_wayland() && crate::wayland::niri::is_session())
+                .and_then(crate::wayland::niri::tiled_refusal)
+                .map_or(missing, input_error_result)
+        })
 }
 
 // ── list_apps ────────────────────────────────────────────────────────────────
@@ -6725,6 +6733,9 @@ impl Tool for ClickTool {
                 .with_structured(
                     json!({ "path": if crate::wayland::wayland_input_enabled() { "wayland_desktop" } else { "xtest_desktop" }, "verified": false, "effect": "unverifiable" }),
                 ),
+                Ok(Err(e)) if crate::input::foreground::error_code(&e).is_some() => {
+                    input_error_result(e)
+                }
                 Ok(Err(e)) => ToolResult::error(format!("desktop-scope click failed: {e}")),
                 Err(e) => ToolResult::error(format!("task error: {e}")),
             };
@@ -9958,6 +9969,9 @@ impl Tool for ScrollTool {
                     .with_structured(
                         json!({"scope":"desktop","path":path,"effect":"unverifiable"}),
                     ),
+                Ok(Err(error)) if crate::input::foreground::error_code(&error).is_some() => {
+                    input_error_result(error)
+                }
                 Ok(Err(error)) => ToolResult::error(error.to_string()),
                 Err(error) => ToolResult::error(format!("Task error: {error}")),
             };
@@ -11164,6 +11178,9 @@ impl Tool for DragTool {
                 Ok(Ok(())) => ToolResult::text("Dragged on the desktop.").with_structured(
                     json!({"scope":"desktop","path":path,"effect":"unverifiable"}),
                 ),
+                Ok(Err(error)) if crate::input::foreground::error_code(&error).is_some() => {
+                    input_error_result(error)
+                }
                 Ok(Err(error)) => ToolResult::error(error.to_string()),
                 Err(error) => ToolResult::error(format!("Task error: {error}")),
             };
@@ -13276,6 +13293,9 @@ impl Tool for MoveCursorTool {
                 .with_structured(
                     json!({"scope":"desktop","path":path,"x":xi,"y":yi,"effect":"unverifiable"}),
                 ),
+                Ok(Err(error)) if crate::input::foreground::error_code(&error).is_some() => {
+                    input_error_result(error)
+                }
                 Ok(Err(error)) => ToolResult::error(error.to_string()),
                 Err(error) => ToolResult::error(format!("Task error: {error}")),
             };

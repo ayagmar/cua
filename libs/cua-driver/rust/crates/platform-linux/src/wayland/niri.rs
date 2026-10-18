@@ -2276,6 +2276,17 @@ fn placed_or_refuse(window: &Window) -> Result<&Placed> {
     })
 }
 
+/// The refusal for window-coordinate input on `window_id` when niri shows it
+/// tiled, so a caller without a screenshot of it learns why it has none.
+pub fn tiled_refusal(window_id: u64) -> Option<anyhow::Error> {
+    let scene = ipc().scene().ok()?;
+    let window = scene.window(window_id).ok()?;
+    match &window.placement {
+        Err(Unplaced::Tiled) => placed_or_refuse(&window).err(),
+        _ => None,
+    }
+}
+
 /// Translate window coordinates into the global layout. A floating window's
 /// coordinates are window-local; the geometry used is remembered so the
 /// pointer gate can prove it still holds. A window without a place (a tiled

@@ -482,9 +482,18 @@ impl Session {
         )
     }
 
+    /// Finish in the layout active now: the user may have switched layouts,
+    /// or focus moved to a window with its own, during the call.
     fn finish(self) -> Result<()> {
-        self.keyboard.finish(self.group)
+        let group = closing_group(super::niri::keyboard_layout(), self.group);
+        self.keyboard.finish(group)
     }
+}
+
+/// The layout group a call leaves the keyboard in: niri's active one at the
+/// end, or the one it started in when niri cannot say.
+fn closing_group(current: Result<u32>, start: u32) -> u32 {
+    current.unwrap_or(start)
 }
 
 /// The window a call types into: the one with keyboard focus, which must be
@@ -1095,6 +1104,12 @@ mod tests {
             "foreground_unavailable: niri keyboard focus is on window 6, not window 5; \
              nothing was typed"
         );
+    }
+
+    #[test]
+    fn a_call_ends_in_the_layout_active_when_it_ends() {
+        assert_eq!(closing_group(Ok(1), 0), 1);
+        assert_eq!(closing_group(Err(anyhow!("niri did not answer")), 1), 1);
     }
 
     #[test]

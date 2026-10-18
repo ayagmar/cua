@@ -2228,6 +2228,16 @@ pub fn adopt_frame(window: u64, frame: Option<OutputFrame>, capture_id: Option<&
     frames.push(record);
 }
 
+/// Held while `get_window_state` publishes a screenshot to the snapshot
+/// store and adopts its frame, so concurrent calls on one window leave the
+/// store's latest screenshot and the adopted frame from the same call.
+pub fn publication() -> std::sync::MutexGuard<'static, ()> {
+    static PUBLICATION: Mutex<()> = Mutex::new(());
+    PUBLICATION
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 fn adopted(window: u64) -> Option<Adopted> {
     frames()
         .lock()
@@ -4512,6 +4522,48 @@ mod tests {
         // Its latest screenshot shows only the window (it was floated).
         adopt_frame(9001, None, Some("c3"));
         assert!(adopted_frame(9001).is_err());
+    }
+
+    #[test]
+    fn the_screenshot_published_last_is_the_one_whose_frame_is_adopted() {
+        use std::sync::{mpsc, Arc};
+        let frame = OutputFrame {
+            window: 9004,
+            ..tiled_frame(history())
+        };
+        // The snapshot store's latest screenshot of the window.
+        let store = Arc::new(Mutex::new(Vec::new()));
+        let (published, wait_published) = mpsc::channel();
+        let (release, wait_release) = mpsc::channel::<()>();
+        let first = std::thread::spawn({
+            let (frame, store) = (frame.clone(), store.clone());
+            move || {
+                let _publication = publication();
+                store.lock().unwrap().push("a");
+                published.send(()).unwrap();
+                wait_release.recv().unwrap();
+                adopt_frame(9004, Some(frame), Some("a"));
+            }
+        });
+        wait_published.recv().unwrap();
+        let second = std::thread::spawn({
+            let store = store.clone();
+            move || {
+                let _publication = publication();
+                store.lock().unwrap().push("b");
+                adopt_frame(9004, Some(frame), Some("b"));
+            }
+        });
+        // The second call would publish and adopt now, between the first
+        // call's publish and adopt, unless the publication holds it off.
+        std::thread::sleep(Duration::from_millis(100));
+        release.send(()).unwrap();
+        first.join().unwrap();
+        second.join().unwrap();
+        assert_eq!(
+            adopted(9004).unwrap().capture.as_deref(),
+            store.lock().unwrap().last().copied()
+        );
     }
 
     #[test]

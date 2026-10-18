@@ -1377,6 +1377,7 @@ impl Tool for GetWindowStateTool {
             // niri: a tiled window's screenshot is its whole output.
             let mut output_frame = None;
             let mut output_screenshot = None;
+            let mut adoption = None;
             // Same-pid popups (menus, combo lists) and transient dialogs mapped
             // over this window: listed for the caller, and when one overlaps
             // the window the screenshot is taken from the screen, since the
@@ -1458,16 +1459,13 @@ impl Tool for GetWindowStateTool {
                             .map(|frame| frame.output().to_owned());
                         // The published screenshot is the window's pixel
                         // frame from now on; on niri a tiled window's frame
-                        // is its output, checked against niri's layout.
+                        // is its output, checked against niri's layout. It is
+                        // adopted where the snapshot is published.
                         if !observation_only
                             && crate::wayland::is_wayland()
                             && crate::wayland::niri::is_session()
                         {
-                            crate::wayland::niri::adopt_frame(
-                                xid,
-                                output_frame.take(),
-                                capture_id.as_deref(),
-                            );
+                            adoption = Some((output_frame.take(), capture_id.clone()));
                         }
                         Some((b64, file_path, w, h, original_w, capture_id))
                     }
@@ -1500,12 +1498,25 @@ impl Tool for GetWindowStateTool {
                 screenshot_error,
                 overlays,
                 output_screenshot,
+                adoption,
             ))
         })
         .await;
 
         match result {
-            Ok(Ok((tree_opt, shot_opt, bounds, screenshot_error, overlays, output_screenshot))) => {
+            Ok(Ok((
+                tree_opt,
+                shot_opt,
+                bounds,
+                screenshot_error,
+                overlays,
+                output_screenshot,
+                adoption,
+            ))) => {
+                // Concurrent reads of one window must leave the snapshot
+                // store's latest screenshot and niri's adopted frame from the
+                // same read.
+                let publication = adoption.is_some().then(crate::wayland::niri::publication);
                 let mut content = Vec::new();
                 let mut structured = json!({ "window_id": xid, "pid": pid });
                 let screenshot_scale = shot_opt.as_ref().map(|(_, _, w, _, original_w, _)| {
@@ -1751,6 +1762,10 @@ impl Tool for GetWindowStateTool {
                         }
                     }
                 }
+                if let Some((frame, capture_id)) = adoption {
+                    crate::wayland::niri::adopt_frame(xid, frame, capture_id.as_deref());
+                }
+                drop(publication);
                 if let Some(id) = refreshed {
                     let sid = cua_driver_core::element_token::format_snapshot_id(id);
                     content.push(cua_driver_core::protocol::Content::text(format!(

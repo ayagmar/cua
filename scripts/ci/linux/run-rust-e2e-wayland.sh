@@ -30,27 +30,39 @@ DBUS_PID=""
 ATSPI_PID=""
 KEYRING_PID=""
 
+# SIGTERM, then SIGKILL after a 5 second grace, so a wedged or stopped
+# process cannot hold cleanup. Children of this shell are also reaped.
+stop_process() {
+  local pid="$1"
+  kill -TERM "${pid}" 2>/dev/null || return 0
+  local deadline=$((SECONDS + 5))
+  while kill -0 "${pid}" 2>/dev/null \
+      && [[ "$(ps -o stat= -p "${pid}" 2>/dev/null)" != Z* ]] \
+      && ((SECONDS < deadline)); do
+    sleep 0.1
+  done
+  kill -KILL "${pid}" 2>/dev/null || true
+  wait "${pid}" 2>/dev/null || true
+}
+
 cleanup() {
   if [[ -n "${COMPOSITOR_PID}" ]]; then
-    kill "${COMPOSITOR_PID}" 2>/dev/null || true
-    wait "${COMPOSITOR_PID}" 2>/dev/null || true
+    stop_process "${COMPOSITOR_PID}"
   fi
   if [[ -n "${CAGE_PID}" ]]; then
     # cage exits once its client does, and a SIGTERM exit removes the X11
     # socket and lock it binds in /tmp.
     pkill -TERM -P "${CAGE_PID}" 2>/dev/null || true
-    kill "${CAGE_PID}" 2>/dev/null || true
-    wait "${CAGE_PID}" 2>/dev/null || true
+    stop_process "${CAGE_PID}"
   fi
   if [[ -n "${KEYRING_PID}" ]]; then
-    kill "${KEYRING_PID}" 2>/dev/null || true
+    stop_process "${KEYRING_PID}"
   fi
   if [[ -n "${DBUS_PID}" ]]; then
-    kill "${DBUS_PID}" 2>/dev/null || true
+    stop_process "${DBUS_PID}"
   fi
   if [[ -n "${ATSPI_PID}" ]]; then
-    kill "${ATSPI_PID}" 2>/dev/null || true
-    wait "${ATSPI_PID}" 2>/dev/null || true
+    stop_process "${ATSPI_PID}"
   fi
   rm -f "${SWAY_CONFIG}" "${NIRI_CONFIG}"
   rm -rf "${RUNTIME_DIR}"
@@ -330,7 +342,7 @@ elif [[ "${SESSION_KIND}" == niri ]]; then
   # niri's winit output takes the size of cage's headless output.
   if [[ ! -S "${CAGE_RUNTIME_DIR}/wayland-0" ]] \
       || ! XDG_RUNTIME_DIR="${CAGE_RUNTIME_DIR}" WAYLAND_DISPLAY=wayland-0 \
-        wlr-randr --output HEADLESS-1 --custom-mode 1920x1080 >> "${CAGE_LOG}" 2>&1; then
+        timeout 5 wlr-randr --output HEADLESS-1 --custom-mode 1920x1080 >> "${CAGE_LOG}" 2>&1; then
     echo "cage did not provide a 1920x1080 headless output for niri" >&2
     cat "${CAGE_LOG}" >&2
     exit 1
@@ -386,6 +398,7 @@ import sys
 
 for path in sys.argv[1:]:
     with socket.socket(socket.AF_UNIX) as connection:
+        connection.settimeout(5)
         connection.connect(path)
         credentials = connection.getsockopt(
             socket.SOL_SOCKET, socket.SO_PEERCRED, struct.calcsize("3i")

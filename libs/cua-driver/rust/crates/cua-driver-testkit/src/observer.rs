@@ -975,8 +975,8 @@ pub mod linux {
                     SessionKind::CuaCompositor
                 } else if sway_available() {
                     SessionKind::Sway
-                } else if std::env::var_os("NIRI_SOCKET").is_some() {
-                    match super::niri::probe() {
+                } else if let Some(niri) = niri_session() {
+                    match niri {
                         Ok(()) => SessionKind::Niri,
                         Err(error) => {
                             probe_error = Some(error);
@@ -1137,6 +1137,17 @@ pub mod linux {
 
     pub(crate) fn hyprland_cursor_position() -> Result<(f64, f64), ObserverError> {
         super::hyprland::cursor_position()
+    }
+
+    /// `None` unless `NIRI_SOCKET` belongs to this session's compositor, so an
+    /// unrelated inherited socket leaves the session to the other observers.
+    fn niri_session() -> Option<Result<(), ObserverError>> {
+        std::env::var_os("NIRI_SOCKET")?;
+        match super::niri::attest() {
+            Ok(false) => None,
+            Ok(true) => Some(super::niri::probe()),
+            Err(error) => Some(Err(error)),
+        }
     }
 
     pub(crate) fn niri_focus(target: TargetWindow) -> Result<(), ObserverError> {

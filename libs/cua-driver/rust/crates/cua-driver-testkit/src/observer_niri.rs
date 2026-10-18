@@ -14,8 +14,11 @@
 
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Read, Write};
+use std::os::fd::{AsRawFd, FromRawFd};
 use std::os::unix::net::UnixStream;
-use std::time::Duration;
+use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
+use std::time::{Duration, Instant};
 
 use serde::de::DeserializeOwned;
 use serde::Deserialize;
@@ -27,15 +30,145 @@ const REPLY_LIMIT: u64 = 1024 * 1024;
 /// Logical pixels of slack when comparing a fullscreen tile with its output.
 const FULLSCREEN_TOLERANCE: f64 = 1.0;
 
+/// Connects without blocking past `timeout`: a wedged compositor stops
+/// accepting, and a full backlog would block a plain connect forever.
+fn connect(path: &Path, timeout: Duration) -> std::io::Result<UnixStream> {
+    use std::os::unix::ffi::OsStrExt as _;
+
+    let bytes = path.as_os_str().as_bytes();
+    // SAFETY: an all-zero sockaddr_un is a valid empty address.
+    let mut address: libc::sockaddr_un = unsafe { std::mem::zeroed() };
+    if bytes.len() >= address.sun_path.len() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "socket path is too long",
+        ));
+    }
+    address.sun_family = libc::AF_UNIX as libc::sa_family_t;
+    for (slot, byte) in address.sun_path.iter_mut().zip(bytes) {
+        *slot = *byte as libc::c_char;
+    }
+    let deadline = Instant::now() + timeout;
+    loop {
+        // SAFETY: plain socket creation; ownership moves into UnixStream below.
+        let fd = unsafe {
+            libc::socket(
+                libc::AF_UNIX,
+                libc::SOCK_STREAM | libc::SOCK_NONBLOCK | libc::SOCK_CLOEXEC,
+                0,
+            )
+        };
+        if fd < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        // SAFETY: fd is a fresh socket owned only here.
+        let stream = unsafe { UnixStream::from_raw_fd(fd) };
+        // SAFETY: address is a valid sockaddr_un of the given length.
+        let connected = unsafe {
+            libc::connect(
+                fd,
+                (&address as *const libc::sockaddr_un).cast(),
+                std::mem::size_of::<libc::sockaddr_un>() as libc::socklen_t,
+            )
+        };
+        if connected == 0 {
+            stream.set_nonblocking(false)?;
+            return Ok(stream);
+        }
+        let error = std::io::Error::last_os_error();
+        // A Unix stream connect either completes or reports a full backlog.
+        if error.raw_os_error() != Some(libc::EAGAIN) || Instant::now() >= deadline {
+            return Err(error);
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+fn peer_pid(stream: &UnixStream) -> std::io::Result<i32> {
+    // SAFETY: an all-zero ucred is valid output storage.
+    let mut credentials: libc::ucred = unsafe { std::mem::zeroed() };
+    let mut length = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
+    // SAFETY: the pointer and length describe `credentials`.
+    let result = unsafe {
+        libc::getsockopt(
+            stream.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_PEERCRED,
+            (&mut credentials as *mut libc::ucred).cast(),
+            &mut length,
+        )
+    };
+    if result != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(credentials.pid)
+}
+
+fn socket_peer(path: &Path) -> std::io::Result<i32> {
+    peer_pid(&connect(path, QUERY_TIMEOUT)?)
+}
+
+fn niri_socket() -> Option<PathBuf> {
+    std::env::var_os("NIRI_SOCKET")
+        .filter(|socket| !socket.is_empty())
+        .map(PathBuf::from)
+}
+
+fn wayland_socket() -> Option<PathBuf> {
+    let display = PathBuf::from(std::env::var_os("WAYLAND_DISPLAY")?);
+    if display.is_absolute() {
+        return Some(display);
+    }
+    Some(PathBuf::from(std::env::var_os("XDG_RUNTIME_DIR")?).join(display))
+}
+
+/// The niri pid this process attested first. A later niri, for example a
+/// restarted compositor, is a different session and is refused.
+static ATTESTED: OnceLock<i32> = OnceLock::new();
+
+/// Whether `NIRI_SOCKET` belongs to the compositor serving `WAYLAND_DISPLAY`.
+/// `Ok(false)` means an unrelated or stale socket, inherited for example by a
+/// nested session started from a niri desktop, so other observers may claim
+/// the session. A pid that differs from the attested one is an error.
+pub(super) fn attest() -> Result<bool, ObserverError> {
+    let (Some(niri), Some(wayland)) = (niri_socket(), wayland_socket()) else {
+        return Ok(false);
+    };
+    let (Ok(niri), Ok(wayland)) = (socket_peer(&niri), socket_peer(&wayland)) else {
+        return Ok(false);
+    };
+    if niri != wayland {
+        return Ok(false);
+    }
+    let attested = *ATTESTED.get_or_init(|| niri);
+    if attested != niri {
+        return Err(ObserverError::new(format!(
+            "niri pid changed from {attested} to {niri}; refusing a new compositor"
+        )));
+    }
+    Ok(true)
+}
+
 /// Sends one request on a fresh connection and returns the `Ok` payload.
 fn request(request: &serde_json::Value) -> Result<serde_json::Value, ObserverError> {
-    let socket = std::env::var_os("NIRI_SOCKET")
-        .filter(|socket| !socket.is_empty())
-        .ok_or_else(|| ObserverError::new("niri observer requires NIRI_SOCKET"))?;
+    let socket =
+        niri_socket().ok_or_else(|| ObserverError::new("niri observer requires NIRI_SOCKET"))?;
     let error = |operation: &str, error: std::io::Error| {
         ObserverError::new(format!("niri IPC {operation} {request}: {error}"))
     };
-    let mut stream = UnixStream::connect(&socket).map_err(|e| error("connect", e))?;
+    if ATTESTED.get().is_none() && !attest()? {
+        return Err(ObserverError::new(
+            "NIRI_SOCKET is not served by the WAYLAND_DISPLAY compositor",
+        ));
+    }
+    let mut stream = connect(&socket, QUERY_TIMEOUT).map_err(|e| error("connect", e))?;
+    let peer = peer_pid(&stream).map_err(|e| error("read peer of", e))?;
+    if Some(&peer) != ATTESTED.get() {
+        return Err(ObserverError::new(format!(
+            "niri IPC peer {peer} is not the attested niri {:?}",
+            ATTESTED.get()
+        )));
+    }
     stream
         .set_read_timeout(Some(QUERY_TIMEOUT))
         .and_then(|()| stream.set_write_timeout(Some(QUERY_TIMEOUT)))
@@ -505,6 +638,15 @@ mod tests {
         // decide this canary.
         assert!(classify(&after, sentinel).is_err());
         assert!(focus_transferred(&after.windows, sentinel, sentinel).is_err());
+    }
+
+    #[test]
+    fn socket_peer_is_the_listening_process() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("niri.sock");
+        let _listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        assert_eq!(socket_peer(&path).unwrap() as u32, std::process::id());
+        assert!(socket_peer(&directory.path().join("missing.sock")).is_err());
     }
 
     #[test]

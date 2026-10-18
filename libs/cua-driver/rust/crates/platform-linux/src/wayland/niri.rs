@@ -59,8 +59,9 @@ pub const FRAME_MAX_AGE: Duration = Duration::from_secs(60);
 
 /// The compositor process recognised as niri for this driver process.
 static RECOGNIZED: OnceLock<libc::pid_t> = OnceLock::new();
-/// Why the recognised niri is too old for the adapter, if it is.
-static UNSUPPORTED: OnceLock<String> = OnceLock::new();
+/// Whether the adapter supports the recognised niri's release: `None` until
+/// niri answers a `Version` request, and every route refuses meanwhile.
+static RELEASE: Mutex<Option<Result<(), String>>> = Mutex::new(None);
 /// The oldest niri release the adapter supports: 25.08 reports the window
 /// layout that geometry needs, and serves several requests per connection.
 const MIN_RELEASE: (u32, u32) = (25, 8);
@@ -187,22 +188,15 @@ pub fn is_session() -> bool {
     let (attestation, connection, lasting) = probe(None, QUERY_TIMEOUT);
     match attestation {
         Attestation::Attested(pid) => {
-            // A niri too old for the adapter is still niri: it is recognised,
-            // and every route refuses with the reason.
-            let version = connection
-                .context("niri IPC connection unavailable")
-                .and_then(release_of);
-            match version {
-                Ok(version) => {
-                    if let Err(reason) = release_supported(&version) {
-                        tracing::warn!("{reason}");
-                        let _ = UNSUPPORTED.set(reason);
-                    }
-                }
-                Err(error) => {
-                    tracing::warn!("niri did not report its version: {error:#}");
-                    return false;
-                }
+            // A proven niri stays niri even when it is too old for the
+            // adapter or its version is not read yet: routes refuse with the
+            // reason instead of falling back to generic Wayland discovery.
+            if let Err(error) = release_check(&RELEASE, || {
+                connection
+                    .context("niri IPC connection unavailable")
+                    .and_then(release_of)
+            }) {
+                tracing::warn!("{error:#}");
             }
             let pinned = *RECOGNIZED.get_or_init(|| pid);
             tracing::info!(pid = pinned, "niri session recognised");
@@ -294,14 +288,42 @@ fn release_supported(version: &str) -> Result<(), String> {
     }
 }
 
-/// The recognised niri process, when the adapter supports it.
+/// Decide whether the adapter supports niri's release, reading its version
+/// through `read` while undecided. A failed read leaves it undecided.
+fn release_check(
+    release: &Mutex<Option<Result<(), String>>>,
+    read: impl FnOnce() -> Result<String>,
+) -> Result<()> {
+    let mut release = release
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let verdict = match release.as_ref() {
+        Some(verdict) => verdict.clone(),
+        None => {
+            let version = read().context(
+                "niri did not report its version, so the niri adapter cannot yet check that it supports it",
+            )?;
+            let verdict = release_supported(&version);
+            if let Err(reason) = &verdict {
+                tracing::warn!("{reason}");
+            }
+            release.insert(verdict).clone()
+        }
+    };
+    verdict.map_err(|reason| anyhow!(reason))
+}
+
+/// The recognised niri process, when the adapter supports it. Until niri's
+/// release is known, each call asks a newly attested connection.
 fn pinned() -> Result<libc::pid_t> {
     let pinned = *RECOGNIZED
         .get()
         .context("niri session has not been recognised")?;
-    if let Some(reason) = UNSUPPORTED.get() {
-        bail!("{reason}");
-    }
+    release_check(&RELEASE, || match probe(Some(pinned), QUERY_TIMEOUT) {
+        (Attestation::Attested(_), Some(ipc), _) => release_of(ipc),
+        (Attestation::Unrelated(reason) | Attestation::Refused(reason), ..) => bail!("{reason}"),
+        (Attestation::Attested(_), None, _) => bail!("niri IPC connection unavailable"),
+    })?;
     Ok(pinned)
 }
 
@@ -1257,9 +1279,9 @@ pub fn health_note() -> Option<String> {
         };
         return Some(describe_health(session, Ok(1)));
     }
-    if let Some(reason) = UNSUPPORTED.get() {
+    if let Err(reason) = pinned() {
         return Some(format!(
-            "niri: {reason}; niri window ids, focus and geometry refuse."
+            "niri: {reason:#}; niri window ids, focus and geometry refuse."
         ));
     }
     let scene = ipc().scene();
@@ -2890,6 +2912,37 @@ mod tests {
         assert_eq!(session_check(true, false, false), SessionCheck::NotNiri);
         assert_eq!(session_check(true, false, true), SessionCheck::Probe);
         assert_eq!(session_check(false, true, true), SessionCheck::NotNiri);
+    }
+
+    #[test]
+    fn a_proven_niri_refuses_until_a_version_read_answers() {
+        let release = Mutex::new(None);
+        // niri did not answer: still niri, refused, and asked again later.
+        assert_eq!(
+            format!(
+                "{:#}",
+                release_check(&release, || bail!("niri IPC request timed out")).unwrap_err()
+            ),
+            "niri did not report its version, so the niri adapter cannot yet check that it supports it: niri IPC request timed out"
+        );
+        release_check(&release, || Ok("26.04 (8ed0da4)".into())).unwrap();
+        // Answered once: never read again.
+        release_check(&release, || panic!("the release was read again")).unwrap();
+
+        let release = Mutex::new(None);
+        let old = "niri 25.05 is not supported: the niri adapter needs niri 25.08 or later";
+        assert_eq!(
+            release_check(&release, || Ok("25.05 (abc)".into()))
+                .unwrap_err()
+                .to_string(),
+            old
+        );
+        assert_eq!(
+            release_check(&release, || panic!("the release was read again"))
+                .unwrap_err()
+                .to_string(),
+            old
+        );
     }
 
     #[test]

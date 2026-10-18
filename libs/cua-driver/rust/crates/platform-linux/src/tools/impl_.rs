@@ -54,6 +54,9 @@ fn desktop_point_window_resolver() -> cua_driver_core::window_target::DesktopPoi
         let (x, y) = if crate::wayland::is_wayland() && crate::wayland::hyprland::is_session() {
             let frame = crate::wayland::hyprland::desktop_frame().ok()?;
             (x + f64::from(frame.x), y + f64::from(frame.y))
+        } else if crate::wayland::is_wayland() && crate::wayland::niri::is_session() {
+            let frame = crate::wayland::niri::desktop_snapshot().ok()?.frame;
+            (x + f64::from(frame.x), y + f64::from(frame.y))
         } else {
             (x, y)
         };
@@ -93,6 +96,9 @@ fn topmost_window_at(
 fn pid_fallback_window_resolver() -> cua_driver_core::window_target::PidFallbackWindowResolver {
     Arc::new(|pid| {
         let pid = u32::try_from(pid).ok()?;
+        if crate::wayland::is_wayland() && crate::wayland::niri::is_session() {
+            return crate::wayland::niri::window_in_use(pid);
+        }
         let windows: Vec<crate::x11::WindowInfo> = crate::wayland::list_windows_dispatch(Some(pid))
             .into_iter()
             .filter(|w| w.pid == Some(pid))
@@ -1527,9 +1533,12 @@ impl Tool for GetWindowStateTool {
                     structured["timeout_ms"] = json!(timeout_ms);
                     structured["tree_markdown"] = json!(tr.tree_markdown);
 
-                    let target_scoped = !(crate::wayland::is_wayland()
-                        && crate::wayland::hyprland::is_session())
-                        || tr.window_scoped;
+                    let target_scoped = snapshot_target_scoped(
+                        crate::wayland::is_wayland()
+                            && (crate::wayland::hyprland::is_session()
+                                || crate::wayland::niri::is_session()),
+                        tr.window_scoped,
+                    );
                     if !observation_only && !target_scoped {
                         invalidated.extend(state.snapshots.remove(pid as i32, xid));
                         crate::atspi::snapshot::forget_window(pid, xid);
@@ -2622,6 +2631,24 @@ async fn spawn_blocking_bounded<T: Send + 'static>(
 /// Map an input-path error to a tool error, attaching the structured
 /// foreground `code` (`foreground_unavailable` / `foreground_timeout`) when the
 /// message carries one so the caller can branch instead of parsing prose.
+/// Whether a snapshot's elements may become actionable tokens for the
+/// requested window. On compositors addressed by exact window ids (Hyprland,
+/// niri) an application-wide walk can include another window of the same
+/// process, so only a walk scoped to the requested window publishes.
+fn snapshot_target_scoped(exact_window_ids: bool, window_scoped: bool) -> bool {
+    !exact_window_ids || window_scoped
+}
+
+#[cfg(test)]
+mod snapshot_scope_tests {
+    #[test]
+    fn exact_id_compositors_publish_only_window_scoped_walks() {
+        assert!(!super::snapshot_target_scoped(true, false));
+        assert!(super::snapshot_target_scoped(true, true));
+        assert!(super::snapshot_target_scoped(false, false));
+    }
+}
+
 fn input_error_result(e: anyhow::Error) -> ToolResult {
     let text = e.to_string();
     if crate::input::is_uinput_unavailable(&e) {
@@ -5064,14 +5091,14 @@ fn coordinate_less_mouse_button_up_survives_snapshot_replacement() {
 fn persistent_wayland_pointer_coordinates_include_window_origin() {
     let output = persistent_pointer_coordinates(true, 7, 10, 20, |window_id, x, y| {
         assert_eq!(window_id, 7);
-        (x + 100, y + 200)
+        Ok((x + 100, y + 200))
     });
-    assert_eq!(output, (110, 220));
+    assert_eq!(output.unwrap(), (110, 220));
 
     let x11 = persistent_pointer_coordinates(false, 7, 10, 20, |_, _, _| {
         panic!("X11 coordinates must remain window-local")
     });
-    assert_eq!(x11, (10, 20));
+    assert_eq!(x11.unwrap(), (10, 20));
 }
 
 #[cfg(test)]
@@ -5469,12 +5496,12 @@ fn persistent_pointer_coordinates(
     window_id: u64,
     x: i32,
     y: i32,
-    window_local_to_output: impl FnOnce(u64, i32, i32) -> (i32, i32),
-) -> (i32, i32) {
+    window_local_to_output: impl FnOnce(u64, i32, i32) -> anyhow::Result<(i32, i32)>,
+) -> anyhow::Result<(i32, i32)> {
     if is_wayland {
         window_local_to_output(window_id, x, y)
     } else {
-        (x, y)
+        Ok((x, y))
     }
 }
 
@@ -6009,6 +6036,30 @@ fn capture_admission_error(error: anyhow::Error) -> ToolResult {
 }
 static CLICK_DEF: std::sync::OnceLock<ToolDef> = std::sync::OnceLock::new();
 
+/// Presses in one click train: 1 to 3, as the contract states. A niri click
+/// train is one gated action, so a larger count would mean seconds of
+/// presses no recheck covers.
+fn click_train(requested: u64) -> usize {
+    requested.clamp(1, 3) as usize
+}
+
+#[cfg(test)]
+#[test]
+fn click_trains_stop_at_the_advertised_triple_click() {
+    // A niri click train is rechecked once, before its first press, so a
+    // `count: 20` must not become seconds of ungated presses.
+    let tool = ClickTool {
+        state: ToolState::new(),
+    };
+    let count = &tool.def().input_schema["properties"]["count"];
+    assert_eq!(
+        (count["minimum"].as_u64(), count["maximum"].as_u64()),
+        (Some(1), Some(3))
+    );
+    assert_eq!(click_train(20), 3);
+    assert_eq!(click_train(2), 2);
+}
+
 /// Where a foreground element click may put the real pointer.
 enum ForegroundElementPlacement {
     /// The element centre lies inside the target window (or a popup of the
@@ -6438,7 +6489,7 @@ impl Tool for ClickTool {
                     // [left,right,middle]); kept inline to carry the Linux/Wayland
                     // back-compat prose the click button-schema test asserts on.
                     "button":{"type":"string","enum":["left","right","middle"],"description":"Mouse button. Default: \"left\" (legacy back-compat). X11: routed via ButtonPress/Release with the matching evdev code. Native Wayland: only left-button is supported via the virtual-pointer protocol; right/middle return an error."},
-                    "count":{"type":"integer","minimum":1,"description":"Number of clicks in one press train: 1 (default), 2 = double-click, 3 = triple-click (line/paragraph selection). There is no separate triple_click tool — pass count: 3 here."},
+                    "count":{"type":"integer","minimum":1,"maximum":3,"description":"Number of clicks in one press train: 1 (default), 2 = double-click, 3 = triple-click (line/paragraph selection). There is no separate triple_click tool — pass count: 3 here."},
                     "modifier": cua_driver_core::tool_schema::modifier_schema(),
                     "from_zoom":{"type":"boolean","description":"Set true after a zoom call to auto-translate zoom-image pixel coordinates back to full-window space."},
                     "scope":{"type":"string","enum":["window","desktop"],"default":"window","description":"Coordinate frame (default \"window\"). Pass \"desktop\" with x,y and no pid/window_id for a screen-absolute click in get_desktop_state coordinates."},
@@ -6484,11 +6535,12 @@ impl Tool for ClickTool {
                 Err(result) => return result,
             };
             let button = parse_mouse_button(input.button.unwrap_or(ClickButton::Left).as_str());
-            let n = input.count.unwrap_or(1) as usize;
+            let n = input.count.unwrap_or(1);
             if n == 0 {
                 return ToolResult::error("click.count must be at least 1.")
                     .with_structured(json!({ "code": "invalid_arguments" }));
             }
+            let n = click_train(u64::from(n));
             let space = match desktop_input_space().await {
                 Ok(space) => space,
                 Err(error) => {
@@ -6565,7 +6617,7 @@ impl Tool for ClickTool {
             Err(e) => return e,
         };
         let delivery = crate::input::delivery::DeliveryMode::from_args(&args);
-        let count = args.u64_or("count", 1) as usize;
+        let count = click_train(args.u64_or("count", 1));
         let isolated_background = isolated_hyprland_background(delivery);
         // Surface 5: reject unknown buttons so a typo can't silently fall through
         // to a left-click. Empty string keeps back-compat with old clients.
@@ -7071,11 +7123,10 @@ impl Tool for ClickTool {
         // always window-local screenshot pixels; native Wayland translates
         // through compositor/AT-SPI geometry while X11 uses XTranslateCoordinates.
         let wayland_output_point = if crate::wayland::wayland_input_enabled() {
-            Some(crate::wayland::window_local_to_output(
-                xid,
-                x.round() as i32,
-                y.round() as i32,
-            ))
+            match crate::wayland::window_local_to_output(xid, x.round() as i32, y.round() as i32) {
+                Ok(point) => Some(point),
+                Err(error) => return input_error_result(error),
+            }
         } else {
             None
         };
@@ -10104,9 +10155,15 @@ impl Tool for ScrollTool {
                 }
                 (None, cua_driver_core::element_token::ResolvedElement::None) => None,
             };
-            let output_point = local_point.map(|(x, y)| {
-                crate::wayland::window_local_to_output(xid, x.round() as i32, y.round() as i32)
-            });
+            let output_point = match local_point
+                .map(|(x, y)| {
+                    crate::wayland::window_local_to_output(xid, x.round() as i32, y.round() as i32)
+                })
+                .transpose()
+            {
+                Ok(point) => point,
+                Err(error) => return input_error_result(error),
+            };
             let result = tokio::task::spawn_blocking(move || {
                 crate::wayland::scroll_at(xid, output_point, &direction_for_wayland, amount as u32)
             })
@@ -10372,8 +10429,13 @@ impl Tool for DoubleClickTool {
                     }
                     let lxi = lx as i32;
                     let lyi = ly as i32;
-                    let wayland_point = crate::wayland::wayland_input_enabled()
-                        .then(|| crate::wayland::window_local_to_output(xid, lxi, lyi));
+                    let wayland_point = match crate::wayland::wayland_input_enabled()
+                        .then(|| crate::wayland::window_local_to_output(xid, lxi, lyi))
+                        .transpose()
+                    {
+                        Ok(point) => point,
+                        Err(error) => return input_error_result(error),
+                    };
                     let cursor_id_for_task = cursor_id.clone();
                     let click_result =
                         tokio::task::spawn_blocking(move || -> anyhow::Result<PointerRoute> {
@@ -10470,11 +10532,10 @@ impl Tool for DoubleClickTool {
             cursor_overlay::OverlayCommand::PinAbove(xid),
         );
         let wayland_output_point = if crate::wayland::wayland_input_enabled() {
-            Some(crate::wayland::window_local_to_output(
-                xid,
-                x.round() as i32,
-                y.round() as i32,
-            ))
+            match crate::wayland::window_local_to_output(xid, x.round() as i32, y.round() as i32) {
+                Ok(point) => Some(point),
+                Err(error) => return input_error_result(error),
+            }
         } else {
             None
         };
@@ -10659,8 +10720,13 @@ impl Tool for RightClickTool {
                     }
                     let lxi = lx as i32;
                     let lyi = ly as i32;
-                    let wayland_point = crate::wayland::wayland_input_enabled()
-                        .then(|| crate::wayland::window_local_to_output(xid, lxi, lyi));
+                    let wayland_point = match crate::wayland::wayland_input_enabled()
+                        .then(|| crate::wayland::window_local_to_output(xid, lxi, lyi))
+                        .transpose()
+                    {
+                        Ok(point) => point,
+                        Err(error) => return input_error_result(error),
+                    };
                     let cursor_id_for_task = cursor_id.clone();
                     let click_result =
                         tokio::task::spawn_blocking(move || -> anyhow::Result<PointerRoute> {
@@ -10757,11 +10823,10 @@ impl Tool for RightClickTool {
             cursor_overlay::OverlayCommand::PinAbove(xid),
         );
         let wayland_output_point = if crate::wayland::wayland_input_enabled() {
-            Some(crate::wayland::window_local_to_output(
-                xid,
-                x.round() as i32,
-                y.round() as i32,
-            ))
+            match crate::wayland::window_local_to_output(xid, x.round() as i32, y.round() as i32) {
+                Ok(point) => Some(point),
+                Err(error) => return input_error_result(error),
+            }
         } else {
             None
         };
@@ -11112,16 +11177,23 @@ impl Tool for DragTool {
                 );
             }
             let owner = named_session_cursor_key(&args);
-            let from = crate::wayland::window_local_to_output(
+            let points = crate::wayland::window_local_to_output(
                 xid,
                 from_x.round() as i32,
                 from_y.round() as i32,
-            );
-            let to = crate::wayland::window_local_to_output(
-                xid,
-                to_x.round() as i32,
-                to_y.round() as i32,
-            );
+            )
+            .and_then(|from| {
+                crate::wayland::window_local_to_output(
+                    xid,
+                    to_x.round() as i32,
+                    to_y.round() as i32,
+                )
+                .map(|to| (from, to))
+            });
+            let (from, to) = match points {
+                Ok(points) => points,
+                Err(error) => return input_error_result(error),
+            };
             let (started, acknowledged) = tokio::sync::oneshot::channel();
             let (_cancellation, mut dispatch) =
                 match spawn_isolated_hyprland(&args, move |cancellation| {
@@ -11175,16 +11247,23 @@ impl Tool for DragTool {
                 );
             }
             let owner = named_session_cursor_key(&args);
-            let from = crate::wayland::window_local_to_output(
+            let points = crate::wayland::window_local_to_output(
                 xid,
                 from_x.round() as i32,
                 from_y.round() as i32,
-            );
-            let to = crate::wayland::window_local_to_output(
-                xid,
-                to_x.round() as i32,
-                to_y.round() as i32,
-            );
+            )
+            .and_then(|from| {
+                crate::wayland::window_local_to_output(
+                    xid,
+                    to_x.round() as i32,
+                    to_y.round() as i32,
+                )
+                .map(|to| (from, to))
+            });
+            let (from, to) = match points {
+                Ok(points) => points,
+                Err(error) => return input_error_result(error),
+            };
             let (started, acknowledged) = tokio::sync::oneshot::channel();
             let (_cancellation, mut dispatch) =
                 match spawn_isolated_hyprland(&args, move |cancellation| {
@@ -11227,20 +11306,27 @@ impl Tool for DragTool {
             cursor_id.clone(),
             cursor_overlay::OverlayCommand::PinAbove(xid),
         );
-        let wayland_points = crate::wayland::wayland_input_enabled().then(|| {
-            (
+        let wayland_points = match crate::wayland::wayland_input_enabled()
+            .then(|| {
                 crate::wayland::window_local_to_output(
                     xid,
                     from_x.round() as i32,
                     from_y.round() as i32,
-                ),
-                crate::wayland::window_local_to_output(
-                    xid,
-                    to_x.round() as i32,
-                    to_y.round() as i32,
-                ),
-            )
-        });
+                )
+                .and_then(|from| {
+                    crate::wayland::window_local_to_output(
+                        xid,
+                        to_x.round() as i32,
+                        to_y.round() as i32,
+                    )
+                    .map(|to| (from, to))
+                })
+            })
+            .transpose()
+        {
+            Ok(points) => points,
+            Err(error) => return input_error_result(error),
+        };
         let screen_from = if let Some((from, _)) = wayland_points {
             Some((from.0 as f64, from.1 as f64))
         } else {
@@ -11695,13 +11781,16 @@ impl Tool for MouseButtonDownTool {
         // the existing input::send_button_down behaviour.
         let result = if is_wl {
             let cid = cursor_id.clone();
-            let (output_x, output_y) = persistent_pointer_coordinates(
+            let (output_x, output_y) = match persistent_pointer_coordinates(
                 is_wl,
                 xid,
                 xi,
                 yi,
                 crate::wayland::window_local_to_output,
-            );
+            ) {
+                Ok(point) => point,
+                Err(error) => return input_error_result(error),
+            };
             tokio::task::spawn_blocking(move || {
                 crate::wayland::persistent_vptr::press(&cid, xid, output_x, output_y, button)
             })
@@ -11871,17 +11960,21 @@ impl Tool for MouseDragTool {
             // X11 keeps the existing input::send_motion path.
             let cid_inner = cursor_id.clone();
             let move_result = if is_wl {
-                let (output_x, output_y) = persistent_pointer_coordinates(
+                match persistent_pointer_coordinates(
                     is_wl,
                     xid,
                     ix.round() as i32,
                     iy.round() as i32,
                     crate::wayland::window_local_to_output,
-                );
-                tokio::task::spawn_blocking(move || {
-                    crate::wayland::persistent_vptr::move_to(&cid_inner, output_x, output_y)
-                })
-                .await
+                ) {
+                    Ok((output_x, output_y)) => {
+                        tokio::task::spawn_blocking(move || {
+                            crate::wayland::persistent_vptr::move_to(&cid_inner, output_x, output_y)
+                        })
+                        .await
+                    }
+                    Err(error) => Ok(Err(error)),
+                }
             } else {
                 tokio::task::spawn_blocking(move || {
                     crate::input::send_motion(
@@ -12479,6 +12572,12 @@ impl Tool for GetScreenSizeTool {
                 let (frame, monitors) = crate::wayland::hyprland::screen_report()?;
                 return Ok((frame.width, frame.height, frame.scale, Some(monitors)));
             }
+            if crate::wayland::is_wayland() && crate::wayland::niri::is_session() {
+                // niri reports logical output geometry and its fractional
+                // scale over attested IPC, for a single-output layout.
+                let (frame, monitors) = crate::wayland::niri::screen_report()?;
+                return Ok((frame.width, frame.height, frame.scale, Some(monitors)));
+            }
             // X11 reports pixel dimensions; scale factor on X11 is not
             // well-defined per-monitor, so report 1.0 (matches DPI-unaware
             // assumption). Other Wayland compositors retain their existing
@@ -12650,6 +12749,11 @@ impl Tool for GetDesktopStateTool {
                 } else {
                     None
                 };
+            // niri: the single output's frame, read before the capture and
+            // compared after it.
+            let niri_frame = (crate::wayland::is_wayland() && crate::wayland::niri::is_session())
+                .then(|| crate::wayland::niri::desktop_snapshot().map(|snapshot| snapshot.frame))
+                .transpose()?;
             let (native_png, overlay_capture) =
                 cursor_overlay::capture_exclusion::capture_excluding_overlays(
                     &crate::overlay_capture::OverlayExcluder,
@@ -12723,6 +12827,14 @@ impl Tool for GetDesktopStateTool {
                 anyhow::ensure!(
                     crate::wayland::hyprland::desktop_frame()? == *frame,
                     "the Hyprland monitor layout changed during get_desktop_state; call it again"
+                );
+                frame.rebase_windows(&mut windows);
+            } else if let Some(frame) = &niri_frame {
+                // niri window geometry is in layout coordinates; screenshot
+                // pixel (0, 0) is the single output's logical origin.
+                anyhow::ensure!(
+                    crate::wayland::niri::desktop_snapshot()?.frame == *frame,
+                    "the niri output layout changed during get_desktop_state; call it again"
                 );
                 frame.rebase_windows(&mut windows);
             }

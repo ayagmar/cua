@@ -915,6 +915,53 @@ pub fn single_output_transform() -> Result<u32> {
     transform_code(&scene.single_output()?.1.transform)
 }
 
+/// Doctor note: `None` without `NIRI_SOCKET`, otherwise whether this process
+/// drives niri, its version and the single-output limit.
+pub fn health_note() -> Option<String> {
+    if std::env::var_os("NIRI_SOCKET").is_none_or(|socket| socket.is_empty()) {
+        return None;
+    }
+    if !is_session() {
+        let reason = match probe(RECOGNIZED.get().copied(), QUERY_TIMEOUT).0 {
+            Attestation::Unrelated(reason) | Attestation::Refused(reason) => reason,
+            Attestation::Attested(_) => "the native Wayland backend is not active".to_owned(),
+        };
+        return Some(describe_health(Err(reason), Ok(1)));
+    }
+    let scene = ipc().scene();
+    Some(describe_health(
+        Ok(version()),
+        scene.map(|scene| scene.laid_out().len()),
+    ))
+}
+
+fn describe_health(
+    session: std::result::Result<Result<String>, String>,
+    outputs: Result<usize>,
+) -> String {
+    let version = match session {
+        Err(reason) => {
+            return format!(
+                "niri: NIRI_SOCKET is not this session's compositor ({reason}); niri window \
+                 ids, focus and geometry are off."
+            )
+        }
+        Ok(Ok(version)) => version,
+        Ok(Err(error)) => format!("version unavailable: {error:#}"),
+    };
+    match outputs {
+        Ok(1) => format!("niri {version}: IPC attested to WAYLAND_DISPLAY."),
+        Ok(count) => format!(
+            "niri {version}: IPC attested to WAYLAND_DISPLAY; display capture and desktop \
+             input refuse because {count} outputs are enabled (one is supported)."
+        ),
+        Err(error) => format!(
+            "niri {version}: IPC attested to WAYLAND_DISPLAY; the output layout is \
+             unavailable: {error:#}."
+        ),
+    }
+}
+
 // ── Focus ────────────────────────────────────────────────────────────────────
 
 fn focus_window_action(id: u64) -> serde_json::Value {
@@ -2388,6 +2435,24 @@ mod tests {
                 "foreground_unavailable: niri window 5: {}",
                 Unplaced::Tiled.reason()
             )
+        );
+    }
+
+    #[test]
+    fn health_note_states_attestation_and_the_single_output_limit() {
+        assert_eq!(
+            describe_health(Ok(Ok("26.04 (8ed0da4)".into())), Ok(1)),
+            "niri 26.04 (8ed0da4): IPC attested to WAYLAND_DISPLAY."
+        );
+        assert!(describe_health(Ok(Ok("26.04".into())), Ok(2))
+            .contains("refuse because 2 outputs are enabled"));
+        assert_eq!(
+            describe_health(
+                Err("NIRI_SOCKET is served by pid 1 but WAYLAND_DISPLAY by pid 2".into()),
+                Ok(1)
+            ),
+            "niri: NIRI_SOCKET is not this session's compositor (NIRI_SOCKET is served by pid 1 \
+             but WAYLAND_DISPLAY by pid 2); niri window ids, focus and geometry are off."
         );
     }
 }

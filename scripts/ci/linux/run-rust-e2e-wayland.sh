@@ -355,8 +355,13 @@ elif [[ "${SESSION_KIND}" == niri ]]; then
     cat "${CAGE_LOG}" >&2
     exit 1
   fi
-  WAYLAND_DISPLAY="${CAGE_RUNTIME_DIR}/wayland-0" niri --config "${NIRI_CONFIG}" \
-    >> "${COMPOSITOR_LOG}" 2>&1 &
+  # Without a GPU, niri redraws the whole output in llvmpipe for every frame
+  # the behaviour recording copies, and llvmpipe's thread per CPU starves the
+  # apps under test: Electron AT-SPI walks ran about 4x slower while recording
+  # on the 4-vCPU hosted runner. One render thread keeps the recording and
+  # leaves the other CPUs to the apps. It has no effect on a hardware GPU.
+  WAYLAND_DISPLAY="${CAGE_RUNTIME_DIR}/wayland-0" LP_NUM_THREADS=1 \
+    niri --config "${NIRI_CONFIG}" >> "${COMPOSITOR_LOG}" 2>&1 &
 else
   sway --unsupported-gpu --config "${SWAY_CONFIG}" > "${COMPOSITOR_LOG}" 2>&1 &
 fi

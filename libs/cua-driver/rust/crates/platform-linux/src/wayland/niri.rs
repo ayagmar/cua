@@ -716,29 +716,64 @@ pub struct Placed {
     /// The output's logical rectangle: niri shows no part of the window
     /// outside it.
     pub area: Rect,
-    /// The tiles of the workspace's other floating windows. IPC reports no
-    /// stacking order, so any of them may be above this window.
-    pub others: Vec<Rect>,
+    /// The exact tiles of the workspace's other floating windows. IPC
+    /// reports no stacking order, so any of them may be above this window.
+    pub others: Vec<Exact>,
+}
+
+/// A rectangle in exact, possibly fractional, logical coordinates: at a
+/// fractional scale niri aligns windows to physical pixels, and rounding to
+/// whole logical pixels can hide a one-pixel overlap.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Exact {
+    pub x: f64,
+    pub y: f64,
+    pub width: f64,
+    pub height: f64,
+}
+
+impl Exact {
+    fn contains(&self, x: f64, y: f64) -> bool {
+        x >= self.x && y >= self.y && x < self.x + self.width && y < self.y + self.height
+    }
+
+    fn intersects(&self, other: &Exact) -> bool {
+        self.x < other.x + other.width
+            && other.x < self.x + self.width
+            && self.y < other.y + other.height
+            && other.y < self.y + self.height
+    }
 }
 
 impl Placed {
-    pub fn overlapped(&self) -> bool {
-        self.others.iter().any(|other| other.intersects(&self.rect))
+    /// The window's exact geometry.
+    pub fn exact(&self) -> Exact {
+        Exact {
+            x: self.origin.0,
+            y: self.origin.1,
+            width: f64::from(self.rect.width),
+            height: f64::from(self.rect.height),
+        }
     }
 
-    /// Whether a layout point lies inside the exact, possibly fractional,
-    /// window geometry rather than only inside its rounded rectangle.
+    pub fn overlapped(&self) -> bool {
+        let exact = self.exact();
+        self.others.iter().any(|other| other.intersects(&exact))
+    }
+
+    /// Whether a layout point lies inside the exact window geometry rather
+    /// than only inside its rounded rectangle.
     pub fn covers(&self, x: i32, y: i32) -> bool {
-        let (x, y) = (f64::from(x), f64::from(y));
-        x >= self.origin.0
-            && y >= self.origin.1
-            && x < self.origin.0 + f64::from(self.rect.width)
-            && y < self.origin.1 + f64::from(self.rect.height)
+        self.exact().contains(f64::from(x), f64::from(y))
     }
 
     /// Whether a layout point surely lands on this window.
     pub fn hits(&self, x: i32, y: i32) -> bool {
-        self.covers(x, y) && !self.others.iter().any(|other| other.contains(x, y))
+        self.covers(x, y)
+            && !self
+                .others
+                .iter()
+                .any(|other| other.contains(f64::from(x), f64::from(y)))
     }
 }
 
@@ -926,17 +961,21 @@ impl Scene {
     }
 }
 
-fn floating_tile(logical: &IpcLogical, layout: &IpcLayout) -> Option<Rect> {
+fn floating_tile(logical: &IpcLogical, layout: &IpcLayout) -> Option<Exact> {
     if layout.pos_in_scrolling_layout.is_some() {
         return None;
     }
     let (x, y) = layout.tile_pos_in_workspace_view?;
-    Rect::from_f64(
-        f64::from(logical.x) + x,
-        f64::from(logical.y) + y,
-        layout.tile_size.0,
-        layout.tile_size.1,
-    )
+    let tile = Exact {
+        x: f64::from(logical.x) + x,
+        y: f64::from(logical.y) + y,
+        width: layout.tile_size.0,
+        height: layout.tile_size.1,
+    };
+    [tile.x, tile.y, tile.width, tile.height]
+        .iter()
+        .all(|v| v.is_finite())
+        .then_some(tile)
 }
 
 fn bounding_box(rects: &[Rect]) -> Option<(i32, i32, u32, u32)> {
@@ -2542,6 +2581,27 @@ mod tests {
                 scale: 1.5,
                 image: (1920, 1080),
             })
+        );
+    }
+
+    #[test]
+    fn a_one_physical_pixel_overlap_at_a_fractional_scale_refuses() {
+        // At 1.5 the target spans physical x 152..602 and the other tile
+        // starts at physical 601. Rounded to logical pixels (101 and 401)
+        // they would only touch.
+        let scene = one_output(vec![
+            floating(7, 1, (152.0 / 1.5, 60.0), (300, 200)),
+            floating(8, 1, (601.0 / 1.5, 60.0), (100, 100)),
+        ]);
+        assert_eq!(
+            capture_plan_in(&scene, 7, None),
+            Err("another floating window overlaps it, and niri reports no stacking order")
+        );
+        let placed = placement(&scene, 7).unwrap();
+        assert!(placed.hits(400, 100));
+        assert!(
+            !placed.hits(401, 100),
+            "x=401 is also on the tile from 400.667"
         );
     }
 

@@ -644,13 +644,6 @@ impl Rect {
             && i64::from(y) < self.bottom()
     }
 
-    fn intersects(&self, other: &Rect) -> bool {
-        i64::from(self.x) < other.right()
-            && i64::from(other.x) < self.right()
-            && i64::from(self.y) < other.bottom()
-            && i64::from(other.y) < self.bottom()
-    }
-
     fn inside(&self, outer: &Rect) -> bool {
         self.x >= outer.x
             && self.y >= outer.y

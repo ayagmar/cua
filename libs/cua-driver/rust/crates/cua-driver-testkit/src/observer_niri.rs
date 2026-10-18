@@ -265,7 +265,9 @@ struct Desktop {
     outputs: HashMap<String, Output>,
     overview_open: bool,
     /// The canonical niri lane's config: animations and focus-follows-mouse
-    /// off, and only the sentinel's fullscreen column covers the output.
+    /// off, and gaps keep every non-fullscreen column smaller than the output,
+    /// so only the sentinel's fullscreen column covers it. IPC cannot tell
+    /// fullscreen from maximize-to-edges, which nothing in the lane requests.
     lane_config: bool,
 }
 
@@ -702,6 +704,19 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("only certified under the niri lane config"));
+    }
+
+    #[test]
+    fn maximized_column_under_the_lane_config_does_not_occlude() {
+        // The lane keeps niri's 16 px gaps, so a maximized column is smaller
+        // than the output and floating windows stay drawn above it.
+        let mut maximized = window(10, 100, false, true);
+        maximized["layout"]["tile_size"] = json!([1888.0, 1048.0]);
+        let desktop = desktop(vec![maximized, window(20, 200, true, false)]);
+        assert_eq!(
+            classify(&desktop, target(20, 200)).unwrap(),
+            TargetZ::BackgroundVisible
+        );
     }
 
     #[test]

@@ -109,6 +109,9 @@ output "winit" {
     scale ${NIRI_SCALE}
 }
 layout {
+    // The observer treats only an output-sized tile as fullscreen; gaps keep
+    // a maximized column smaller than the output.
+    gaps 16
     focus-ring {
         off
     }

@@ -598,6 +598,11 @@ fn require_element(snapshot: &ToolResponse, id: &str) -> u64 {
 }
 
 fn element_center(snapshot: &ToolResponse, element_index: u64) -> (f64, f64) {
+    element_frame_center(snapshot, element_index)
+        .unwrap_or_else(|| panic!("element [{element_index}] has no frame"))
+}
+
+fn element_frame_center(snapshot: &ToolResponse, element_index: u64) -> Option<(f64, f64)> {
     let frame = snapshot.structured()["elements"]
         .as_array()
         .and_then(|elements| {
@@ -605,12 +610,22 @@ fn element_center(snapshot: &ToolResponse, element_index: u64) -> (f64, f64) {
                 .iter()
                 .find(|element| element["element_index"].as_u64() == Some(element_index))
         })
-        .and_then(|element| element["frame"].as_object())
-        .unwrap_or_else(|| panic!("element [{element_index}] has no frame"));
-    (
+        .and_then(|element| element["frame"].as_object())?;
+    Some((
         frame["x"].as_f64().unwrap_or(0.0) + frame["w"].as_f64().unwrap_or(0.0) / 2.0,
         frame["y"].as_f64().unwrap_or(0.0) + frame["h"].as_f64().unwrap_or(0.0) / 2.0,
-    )
+    ))
+}
+
+/// Native Wayland background pixel rows are typed refusals. A compositor may
+/// withhold the per-window crop size or the element frames for a window it
+/// hides (niri hides a floating window behind a fullscreen one and reports no
+/// geometry for it), so these rows aim at inert coordinates and let the
+/// driver publish its refusal without an unverifiable screenshot oracle.
+fn wayland_background_px_row(delivery: &str) -> bool {
+    delivery == "background"
+        && cua_driver_testkit::e2e::DisplayServer::current()
+            == cua_driver_testkit::e2e::DisplayServer::Wayland
 }
 
 fn assert_fixture_contains(fixture: &Fixture, marker: &str) {
@@ -771,27 +786,21 @@ fn action_target_args(
     } else {
         let origin = window_origin(fixture, state);
         let scale = screenshot_scale(state);
-        let screen_point = element_center(state, index);
-        let (local_x, local_y) = screenshot_local_point(screen_point, origin, scale);
         let width = state.structured()["screenshot_width"].as_f64();
         let height = state.structured()["screenshot_height"].as_f64();
-        if width.is_none() || height.is_none() {
-            // Native Wayland may intentionally omit a per-window crop size.
-            // Background pixel rows are typed refusals in that environment;
-            // use inert coordinates so the driver can publish that refusal
-            // without requiring an unverifiable screenshot oracle.
-            if delivery == "background"
-                && cua_driver_testkit::e2e::DisplayServer::current()
-                    == cua_driver_testkit::e2e::DisplayServer::Wayland
-            {
+        let frame_center = element_frame_center(state, index);
+        let (Some(width), Some(height), Some(screen_point)) = (width, height, frame_center) else {
+            if wayland_background_px_row(delivery) {
                 object.insert("x".to_owned(), serde_json::json!(0.0));
                 object.insert("y".to_owned(), serde_json::json!(0.0));
                 return args;
             }
+            if frame_center.is_none() {
+                panic!("element [{index}] has no frame");
+            }
             panic!("PX action requires screenshot dimensions for {delivery} delivery");
-        }
-        let width = width.unwrap();
-        let height = height.unwrap();
+        };
+        let (local_x, local_y) = screenshot_local_point(screen_point, origin, scale);
         eprintln!(
             "[shared-px] {} target={id} screen=({:.1},{:.1}) origin=({:.1},{:.1}) scale=({:.3},{:.3}) local=({local_x:.1},{local_y:.1}) capture=({width:.1}x{height:.1})",
             fixture.name, screen_point.0, screen_point.1, origin.0, origin.1, scale.0, scale.1
@@ -1418,9 +1427,15 @@ fn run_drag_action(fixture: &mut Fixture, delivery: &str) -> Observation {
     let target = require_element(&pre, "drop-target");
     let origin = window_origin(fixture, &pre);
     let scale = screenshot_scale(&pre);
-    let point = |index: u64| screenshot_local_point(element_center(&pre, index), origin, scale);
-    let (from_x, from_y) = point(source);
-    let (to_x, to_y) = point(target);
+    let frames = element_frame_center(&pre, source).zip(element_frame_center(&pre, target));
+    let ((from_x, from_y), (to_x, to_y)) = match frames {
+        Some((from, to)) => (
+            screenshot_local_point(from, origin, scale),
+            screenshot_local_point(to, origin, scale),
+        ),
+        None if wayland_background_px_row(delivery) => ((0.0, 0.0), (0.0, 0.0)),
+        None => (element_center(&pre, source), element_center(&pre, target)),
+    };
     let response = fixture.driver.call(
         "drag",
         serde_json::json!({

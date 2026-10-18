@@ -2014,41 +2014,31 @@ fn pointer_space_holds(
     Ok(())
 }
 
-/// Deliver the presses of one click train (at most a triple click) as one
-/// action: the last recheck runs before the first press. A refusal after a
-/// press had landed would report no effect while the app already reacted,
-/// and a retry would add to it.
-fn gated_series<S>(
+/// Deliver the `count` events of one gesture, the presses of a click train
+/// or the ticks of a scroll, rechecking right before each one, after the
+/// `pause` that separates them. A first press can close its target or open
+/// another window over the point, so the next press would reach whatever is
+/// there now: it stops instead. A refusal after an event landed says how
+/// many did, without the `foreground_unavailable` prefix that would report
+/// no effect.
+fn gated_events<S>(
     sess: &mut S,
     count: u32,
-    recheck: impl FnOnce(&S) -> anyhow::Result<()>,
-    mut deliver: impl FnMut(&mut S, u32) -> anyhow::Result<()>,
-) -> anyhow::Result<()> {
-    recheck(sess)?;
-    for i in 0..count.max(1) {
-        deliver(sess, i)?;
-    }
-    Ok(())
-}
-
-/// Deliver the `count` ticks of a scroll, rechecking before each one. A
-/// scroll is a stream of independent events, up to about 1.3 s long, so
-/// stopping partway is safe while sending the rest to whatever is now under
-/// the pointer is not. A refusal after a tick landed says how many did,
-/// without the `foreground_unavailable` prefix that would report no effect.
-fn gated_ticks<S>(
-    sess: &mut S,
-    count: u32,
+    pause: std::time::Duration,
+    (gesture, events): (&str, &str),
     mut recheck: impl FnMut(&S) -> anyhow::Result<()>,
     mut deliver: impl FnMut(&mut S, u32) -> anyhow::Result<()>,
 ) -> anyhow::Result<()> {
     let count = count.max(1);
     for i in 0..count {
+        if i > 0 {
+            std::thread::sleep(pause);
+        }
         if let Err(refusal) = recheck(sess) {
             if i == 0 {
                 return Err(refusal);
             }
-            anyhow::bail!("scroll stopped after {i} of {count} ticks: {refusal}");
+            anyhow::bail!("{gesture} stopped after {i} of {count} {events}: {refusal}");
         }
         deliver(sess, i)?;
     }
@@ -2131,13 +2121,14 @@ fn click_vptr(
     niri_gate_holds(&mut gate, &sess)?;
     sess.point_at(px, py)?;
     std::thread::sleep(std::time::Duration::from_millis(15));
-    gated_series(
+    gated_events(
         &mut sess,
         count,
+        std::time::Duration::from_millis(80),
+        ("click", "presses"),
         |sess| niri_gate_holds(&mut gate, sess),
         |sess, i| {
             if i > 0 {
-                std::thread::sleep(std::time::Duration::from_millis(80));
                 sess.vptr.motion_absolute(event_time_ms(), px, py, w, h);
                 sess.vptr.frame();
                 sess.queue.roundtrip(&mut sess.state)?;
@@ -2354,14 +2345,13 @@ fn scroll_vptr(
     // axis_discrete: `value` is logical units (the wayland-rs wrapper
     // converts to wl_fixed internally); `discrete` is the tick count.
     let value: f64 = (sign as f64) * 10.0;
-    gated_ticks(
+    gated_events(
         &mut sess,
         amount,
+        std::time::Duration::from_millis(25),
+        ("scroll", "ticks"),
         |sess| niri_gate_holds(&mut gate, sess),
-        |sess, i| {
-            if i > 0 {
-                std::thread::sleep(std::time::Duration::from_millis(25));
-            }
+        |sess, _| {
             sess.vptr.axis_source(AxisSource::Wheel);
             sess.vptr.axis_discrete(event_time_ms(), axis, value, sign);
             sess.vptr.frame();
@@ -4408,46 +4398,6 @@ mod tests {
     }
 
     #[test]
-    fn a_gesture_refuses_only_before_its_first_event() {
-        // The first click opens a window over the point, so every later
-        // recheck would refuse. A refusal must mean nothing was delivered:
-        // the double click goes through as one action.
-        let mut delivered = 0;
-        let mut checks = 0;
-        super::gated_series(
-            &mut (),
-            2,
-            |_| {
-                checks += 1;
-                anyhow::ensure!(checks == 1, "foreground_unavailable: layout changed");
-                Ok(())
-            },
-            |_, _| {
-                delivered += 1;
-                Ok(())
-            },
-        )
-        .unwrap();
-        assert_eq!(delivered, 2);
-
-        let mut delivered = 0;
-        let refused = super::gated_series(
-            &mut (),
-            3,
-            |_| anyhow::bail!("foreground_unavailable: layout changed"),
-            |_, _| {
-                delivered += 1;
-                Ok(())
-            },
-        );
-        assert_eq!(
-            refused.unwrap_err().to_string(),
-            "foreground_unavailable: layout changed"
-        );
-        assert_eq!(delivered, 0);
-    }
-
-    #[test]
     fn niri_focused_keyboard_input_expects_the_held_foreground_window() {
         assert_eq!(super::niri_expected_window(), None);
         {
@@ -4465,38 +4415,42 @@ mod tests {
     }
 
     #[test]
-    fn a_scroll_stops_at_the_first_refused_tick_and_reports_the_partial_effect() {
-        // The user switches workspace after two of five ticks: the rest must
-        // not reach whatever is now under the pointer, and the error must not
-        // read as "nothing was delivered".
-        let mut checks = 0;
+    fn a_gesture_stops_at_the_first_refused_event_and_reports_the_partial_effect() {
+        // The first press of a double click closes the target window, which
+        // uncovers another one under the point: the second press must not
+        // reach it, and the error must not read as "nothing was delivered".
+        let mut target_open = true;
         let mut delivered = 0;
-        let stopped = super::gated_ticks(
-            &mut (),
-            5,
-            |_| {
-                checks += 1;
-                anyhow::ensure!(checks <= 2, "foreground_unavailable: layout changed");
+        let stopped = super::gated_events(
+            &mut target_open,
+            2,
+            std::time::Duration::ZERO,
+            ("click", "presses"),
+            |open| {
+                anyhow::ensure!(*open, "foreground_unavailable: layout changed");
                 Ok(())
             },
-            |_, _| {
+            |open, _| {
                 delivered += 1;
+                *open = false;
                 Ok(())
             },
         )
         .unwrap_err();
-        assert_eq!(delivered, 2);
+        assert_eq!(delivered, 1);
         assert_eq!(
             stopped.to_string(),
-            "scroll stopped after 2 of 5 ticks: foreground_unavailable: layout changed"
+            "click stopped after 1 of 2 presses: foreground_unavailable: layout changed"
         );
         assert_eq!(crate::input::foreground::error_code(&stopped), None);
 
-        // A refusal before the first tick still means no effect.
+        // A refusal before the first event still means no effect.
         let mut delivered = 0;
-        let refused = super::gated_ticks(
+        let refused = super::gated_events(
             &mut (),
             5,
+            std::time::Duration::ZERO,
+            ("scroll", "ticks"),
             |_| anyhow::bail!("foreground_unavailable: layout changed"),
             |_, _| {
                 delivered += 1;

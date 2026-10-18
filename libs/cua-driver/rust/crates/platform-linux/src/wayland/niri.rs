@@ -17,6 +17,7 @@ use anyhow::{anyhow, bail, Context, Result};
 use serde::de::DeserializeOwned;
 use serde::Deserialize;
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::ffi::OsString;
 use std::io::{self, Read, Write};
 use std::os::fd::AsRawFd;
 use std::os::unix::net::UnixStream;
@@ -112,15 +113,33 @@ fn connect(timeout: Duration) -> Result<UnixStream> {
     Ok(socket.into())
 }
 
-fn probe(pinned: Option<libc::pid_t>, timeout: Duration) -> (Attestation, Option<UnixStream>) {
+/// The attestation, the IPC connection, and whether the answer is lasting:
+/// a socket nobody serves, or two different live peers. A timeout is not.
+fn probe(
+    pinned: Option<libc::pid_t>,
+    timeout: Duration,
+) -> (Attestation, Option<UnixStream>, bool) {
     let ipc = connect(timeout);
     let ipc_peer = ipc
         .as_ref()
         .map_err(|e| anyhow!("{e:#}"))
         .and_then(|ipc| peer_pid(ipc.as_raw_fd()));
-    let wayland_peer = wayland_connection_with_timeout(timeout)
-        .and_then(|wayland| peer_pid(wayland.backend().poll_fd().as_raw_fd()));
-    (attest(pinned, ipc_peer, wayland_peer), ipc.ok())
+    // Without an IPC peer there is nothing to compare the Wayland peer with.
+    let wayland_peer = match &ipc_peer {
+        Ok(_) => wayland_connection_with_timeout(timeout)
+            .and_then(|wayland| peer_pid(wayland.backend().poll_fd().as_raw_fd())),
+        Err(_) => Err(anyhow!("not checked")),
+    };
+    let lasting = match &ipc {
+        Err(error) => error.downcast_ref::<io::Error>().is_some_and(|error| {
+            matches!(
+                error.kind(),
+                io::ErrorKind::NotFound | io::ErrorKind::ConnectionRefused
+            )
+        }),
+        Ok(_) => ipc_peer.is_ok() && wayland_peer.is_ok(),
+    };
+    (attest(pinned, ipc_peer, wayland_peer), ipc.ok(), lasting)
 }
 
 /// True when this process drives a niri session: `NIRI_SOCKET` and
@@ -137,7 +156,21 @@ pub fn is_session() -> bool {
     if std::env::var_os("NIRI_SOCKET").is_none_or(|socket| socket.is_empty()) {
         return false;
     }
-    match probe(None, QUERY_TIMEOUT).0 {
+    // An unrelated socket stays unrelated for the same environment: a stale
+    // NIRI_SOCKET on another desktop must not cost a probe on every call.
+    static UNRELATED: Mutex<Option<(OsString, OsString)>> = Mutex::new(None);
+    let environment = (
+        std::env::var_os("NIRI_SOCKET").unwrap_or_default(),
+        std::env::var_os("WAYLAND_DISPLAY").unwrap_or_default(),
+    );
+    if UNRELATED
+        .lock()
+        .is_ok_and(|unrelated| unrelated.as_ref() == Some(&environment))
+    {
+        return false;
+    }
+    let (attestation, _, lasting) = probe(None, QUERY_TIMEOUT);
+    match attestation {
         Attestation::Attested(pid) => {
             let pinned = *RECOGNIZED.get_or_init(|| pid);
             tracing::info!(pid = pinned, "niri session recognised");
@@ -148,6 +181,9 @@ pub fn is_session() -> bool {
                 std::sync::atomic::AtomicBool::new(false);
             if !LOGGED.swap(true, std::sync::atomic::Ordering::Relaxed) {
                 tracing::warn!("NIRI_SOCKET is not this Wayland session's niri: {reason}");
+            }
+            if let (true, Ok(mut unrelated)) = (lasting, UNRELATED.lock()) {
+                *unrelated = Some(environment);
             }
             false
         }
@@ -160,9 +196,9 @@ fn attested_connection(deadline: Instant) -> Result<UnixStream> {
         .get()
         .context("niri session has not been recognised")?;
     match probe(Some(pinned), time_remaining(deadline)?) {
-        (Attestation::Attested(_), Some(ipc)) => Ok(ipc),
-        (Attestation::Unrelated(reason) | Attestation::Refused(reason), _) => bail!("{reason}"),
-        (Attestation::Attested(_), None) => bail!("niri IPC connection unavailable"),
+        (Attestation::Attested(_), Some(ipc), _) => Ok(ipc),
+        (Attestation::Unrelated(reason) | Attestation::Refused(reason), ..) => bail!("{reason}"),
+        (Attestation::Attested(_), None, _) => bail!("niri IPC connection unavailable"),
     }
 }
 

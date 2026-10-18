@@ -6683,6 +6683,7 @@ impl Tool for ClickTool {
         // We resolve before the legacy `opt_u64("element_index")` branch
         // so a token-only call (no integer arg) still takes the element path.
         let capture_id_arg = args.opt_str("capture_id");
+        let bound_capture = capture_id_arg.clone();
         let window_id_arg = args.opt_u64("window_id");
         let resolved = match self.state.snapshots.resolve(pid as i32, &args) {
             Ok(r) => r,
@@ -7110,7 +7111,8 @@ impl Tool for ClickTool {
                 return refusal;
             }
             // A tiled niri window's pixels are checked against the layout of
-            // its latest screenshot only.
+            // its latest screenshot only. This refuses early; the pointer gate
+            // checks again against the frame it admits the click on.
             if crate::wayland::is_wayland() && crate::wayland::niri::is_session() {
                 if let Err(error) = crate::wayland::niri::frame_admits_capture(xid, &capture_id) {
                     return input_error_result(error);
@@ -7255,6 +7257,9 @@ impl Tool for ClickTool {
         // then restore prior active. Mirrors macOS/Windows.
         let fg_budget = foreground_budget(0);
         let result = spawn_blocking_bounded("foreground click", fg_budget, move || -> anyhow::Result<(&'static str, Option<crate::input::ForegroundReport>, Option<PointerRoute>, Option<crate::input::FocusGuardReport>)> {
+            // niri's pointer gate checks the capture against the very frame
+            // it admits the click on.
+            let _capture = crate::wayland::niri::bind_capture(bound_capture);
             if crate::wayland::wayland_input_enabled() {
                 if !modifiers_for_task.is_empty() {
                     anyhow::bail!(

@@ -1906,11 +1906,19 @@ impl PointerGate {
 /// still hold (see [`OutputFrame`]). With `activate`, focus the window only
 /// once all of that holds, so a refused action leaves focus alone.
 pub fn gate_pointer(window_id: u64, points: &[(i32, i32)], activate: bool) -> Result<PointerGate> {
+    // One read: the frame admitted below is the one the bound capture is
+    // checked against.
+    let adopted = adopted(window_id);
+    if let Some(capture_id) = bound_capture() {
+        admits_capture(adopted.as_ref(), window_id, &capture_id)?;
+    }
     let mut ipc = ipc();
     let scene = ipc.scene().map_err(input_unavailable)?;
     let window = scene.window(window_id).map_err(input_unavailable)?;
     if matches!(window.placement, Err(Unplaced::Tiled)) {
-        let frame = adopted_frame(window_id)?;
+        let frame = adopted
+            .map(|(frame, _)| frame)
+            .ok_or_else(|| no_frame(window_id))?;
         frame.admit(&scene, &window, points, activate, &HISTORY)?;
         return Ok(PointerGate {
             history: &HISTORY,
@@ -2199,18 +2207,52 @@ fn adopted(window: u64) -> Option<Adopted> {
 }
 
 fn adopted_frame(window: u64) -> Result<OutputFrame> {
-    adopted(window).map(|(frame, _)| frame).ok_or_else(|| {
-        foreground_unavailable(format!(
-            "niri does not report where tiled window {window} is, so its coordinates are pixels of its get_window_state screenshot, which shows its whole output; take one first"
-        ))
-    })
+    adopted(window)
+        .map(|(frame, _)| frame)
+        .ok_or_else(|| no_frame(window))
+}
+
+fn no_frame(window: u64) -> anyhow::Error {
+    foreground_unavailable(format!(
+        "niri does not report where tiled window {window} is, so its coordinates are pixels of its get_window_state screenshot, which shows its whole output; take one first"
+    ))
+}
+
+thread_local! {
+    /// The `capture_id` the pointer action on this thread is bound to.
+    static BOUND_CAPTURE: std::cell::RefCell<Option<String>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Restores the previous capture binding when dropped.
+pub struct CaptureBinding(Option<String>);
+
+impl Drop for CaptureBinding {
+    fn drop(&mut self) {
+        let previous = self.0.take();
+        BOUND_CAPTURE.with(|bound| *bound.borrow_mut() = previous);
+    }
+}
+
+/// Bind the pointer action run on this thread to `capture_id`, so the
+/// pointer gate checks it against the same frame it admits the action on.
+pub fn bind_capture(capture_id: Option<String>) -> CaptureBinding {
+    CaptureBinding(BOUND_CAPTURE.with(|bound| bound.replace(capture_id)))
+}
+
+fn bound_capture() -> Option<String> {
+    BOUND_CAPTURE.with(|bound| bound.borrow().clone())
 }
 
 /// A click bound to `capture_id` on a tiled window needs that capture to be
 /// the window's latest screenshot: only that one's frame is checked against
 /// the layout, and an earlier one may show another.
 pub fn frame_admits_capture(window: u64, capture_id: &str) -> Result<()> {
-    match adopted(window) {
+    admits_capture(adopted(window).as_ref(), window, capture_id)
+}
+
+fn admits_capture(adopted: Option<&Adopted>, window: u64, capture_id: &str) -> Result<()> {
+    match adopted {
         Some((_, adopted)) if adopted.as_deref() != Some(capture_id) => {
             Err(foreground_unavailable(format!(
                 "capture {capture_id} is not the latest screenshot of tiled niri window {window}, and only that one's pixels are checked against niri's layout; use the latest get_window_state screenshot"
@@ -4386,6 +4428,26 @@ mod tests {
                 .aim_window(&focused, &focused.window(5).unwrap(), history, 10, 20)
                 .unwrap(),
             (1930, 20)
+        );
+    }
+
+    #[test]
+    fn a_click_bound_to_a_capture_refuses_once_a_newer_screenshot_is_adopted() {
+        // A window id no other test adopts: the frames are process-wide.
+        let frame = OutputFrame {
+            window: 9002,
+            ..tiled_frame(history())
+        };
+        adopt_frame(9002, Some(frame.clone()), Some("c1"));
+        let _bound = bind_capture(Some("c1".to_owned()));
+        // Another call adopts a newer screenshot while the click is checked.
+        adopt_frame(9002, Some(frame), Some("c2"));
+        let refusal = gate_pointer(9002, &[(2500, 400)], false)
+            .err()
+            .expect("a click bound to an older capture is refused");
+        assert_eq!(
+            refusal.to_string(),
+            "foreground_unavailable: capture c1 is not the latest screenshot of tiled niri window 9002, and only that one's pixels are checked against niri's layout; use the latest get_window_state screenshot"
         );
     }
 

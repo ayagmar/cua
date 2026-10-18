@@ -1136,7 +1136,7 @@ fn screenshot_dispatch_for_pid(xid: u64, pid: Option<u32>) -> anyhow::Result<Vec
         });
     }
     if is_wayland() && niri::is_session() {
-        return niri_window_capture(xid, pid);
+        return niri_window_capture(xid, pid).map(|(png, _)| png);
     }
     if is_wayland() {
         // A GNOME helper with API 9+ snapshots the window's own actor, so a
@@ -1195,12 +1195,29 @@ fn niri_display_capture() -> anyhow::Result<niri::DisplayCapture> {
     })
 }
 
+/// The window capture `get_window_state` returns, which becomes the window's
+/// pixel frame. On niri a tiled window's capture is its whole output, with
+/// the [`niri::OutputFrame`] its coordinates use once adopted.
+pub fn screenshot_for_window_state(
+    xid: u64,
+    pid: u32,
+) -> anyhow::Result<(Vec<u8>, Option<niri::OutputFrame>)> {
+    if is_wayland() && niri::is_session() {
+        return niri_window_capture(xid, Some(pid));
+    }
+    screenshot_dispatch_with_pid(xid, pid).map(|png| (png, None))
+}
+
 /// niri has no per-toplevel capture protocol: crop a settled display capture
-/// to a placed, unoverlapped floating window and scale it to the window's
-/// logical size, the window-local coordinate frame input uses.
-fn niri_window_capture(xid: u64, pid: Option<u32>) -> anyhow::Result<Vec<u8>> {
-    let (png, plan) = niri::capture_window(xid, pid, niri_display_capture)
-        .map_err(|reason| surface_identity_unproven(xid, format!("niri: {reason}")))?;
+/// to a placed, unoverlapped floating window, or keep the whole output for a
+/// tiled one, and scale it to logical size, the coordinate frame input uses.
+fn niri_window_capture(
+    xid: u64,
+    pid: Option<u32>,
+) -> anyhow::Result<(Vec<u8>, Option<niri::OutputFrame>)> {
+    let niri::WindowCapture { png, plan, frame } =
+        niri::capture_window(xid, pid, niri_display_capture)
+            .map_err(|reason| surface_identity_unproven(xid, format!("niri: {reason}")))?;
     let pixels = plan.pixels;
     let crop = crop_png_to_rect(
         &png,
@@ -1212,7 +1229,7 @@ fn niri_window_capture(xid: u64, pid: Option<u32>) -> anyhow::Result<Vec<u8>> {
     )?;
     let image = image::load_from_memory_with_format(&crop, image::ImageFormat::Png)?;
     if (image.width(), image.height()) == (plan.width, plan.height) {
-        return Ok(crop);
+        return Ok((crop, frame));
     }
     let image = image.resize_exact(
         plan.width,
@@ -1221,7 +1238,7 @@ fn niri_window_capture(xid: u64, pid: Option<u32>) -> anyhow::Result<Vec<u8>> {
     );
     let mut out = std::io::Cursor::new(Vec::new());
     image.write_to(&mut out, image::ImageFormat::Png)?;
-    Ok(out.into_inner())
+    Ok((out.into_inner(), frame))
 }
 
 fn crop_png_to_rect(
@@ -2358,7 +2375,7 @@ fn niri_window_centre(window_id: u64) -> anyhow::Result<(i32, i32)> {
     let (_, _, width, height) = window_geometry(window_id).ok_or_else(|| {
         anyhow::anyhow!(
             "foreground_unavailable: niri reports no on-screen place for window {window_id}; \
-             pass a point inside a floating window"
+             pass a point from the window's screenshot"
         )
     })?;
     niri::aim(window_id, (width / 2) as i32, (height / 2) as i32)

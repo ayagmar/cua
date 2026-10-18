@@ -1374,6 +1374,9 @@ impl Tool for GetWindowStateTool {
             // binding must identify the bytes returned to the caller, including
             // any max-dimension resize, rather than the backend's raw frame.
             let mut screenshot_error = None;
+            // niri: a tiled window's screenshot is its whole output.
+            let mut output_frame = None;
+            let mut output_screenshot = None;
             // Same-pid popups (menus, combo lists) and transient dialogs mapped
             // over this window: listed for the caller, and when one overlaps
             // the window the screenshot is taken from the screen, since the
@@ -1404,7 +1407,10 @@ impl Tool for GetWindowStateTool {
                         .or_else(|_| crate::wayland::screenshot_dispatch_with_pid(xid, pid))
                         .map(|png| (png, None))
                 } else {
-                    crate::wayland::screenshot_dispatch_with_pid(xid, pid).map(|png| (png, None))
+                    crate::wayland::screenshot_for_window_state(xid, pid).map(|(png, frame)| {
+                        output_frame = frame;
+                        (png, None)
+                    })
                 };
                 match captured {
                     Ok((raw, original_size)) => {
@@ -1447,6 +1453,22 @@ impl Tool for GetWindowStateTool {
                                 (orig_w, orig_h),
                             )?)
                         };
+                        output_screenshot = output_frame
+                            .as_ref()
+                            .map(|frame| frame.output().to_owned());
+                        // The published screenshot is the window's pixel
+                        // frame from now on; on niri a tiled window's frame
+                        // is its output, checked against niri's layout.
+                        if !observation_only
+                            && crate::wayland::is_wayland()
+                            && crate::wayland::niri::is_session()
+                        {
+                            crate::wayland::niri::adopt_frame(
+                                xid,
+                                output_frame.take(),
+                                capture_id.as_deref(),
+                            );
+                        }
                         Some((b64, file_path, w, h, original_w, capture_id))
                     }
                     Err(error) if crate::wayland::is_surface_identity_unproven(&error) => {
@@ -1471,12 +1493,19 @@ impl Tool for GetWindowStateTool {
             } else {
                 None
             };
-            Ok((tree_result, screenshot, bounds, screenshot_error, overlays))
+            Ok((
+                tree_result,
+                screenshot,
+                bounds,
+                screenshot_error,
+                overlays,
+                output_screenshot,
+            ))
         })
         .await;
 
         match result {
-            Ok(Ok((tree_opt, shot_opt, bounds, screenshot_error, overlays))) => {
+            Ok(Ok((tree_opt, shot_opt, bounds, screenshot_error, overlays, output_screenshot))) => {
                 let mut content = Vec::new();
                 let mut structured = json!({ "window_id": xid, "pid": pid });
                 let screenshot_scale = shot_opt.as_ref().map(|(_, _, w, _, original_w, _)| {
@@ -1823,6 +1852,19 @@ impl Tool for GetWindowStateTool {
                      window_bounds is where it sits on the screen. Pass scope:\"desktop\" only \
                      for get_desktop_state pixels."
                 );
+                if let Some(output) = &output_screenshot {
+                    let note = format!(
+                        "niri does not report where tiled window {xid} is, so this screenshot \
+                         is its whole output {output}, and x/y for pointer actions on this window \
+                         are pixels of it. They are accepted only while niri's layout on that \
+                         output stays as captured, and the window stays focused; a point can land \
+                         on another tiled window or a panel shown there. Float the window for a \
+                         window-only screenshot."
+                    );
+                    structured["screenshot_scope"] = json!("output");
+                    structured["frame_note"] = json!(note);
+                    content.push(cua_driver_core::protocol::Content::text(note));
+                }
                 if display_only {
                     cua_driver_core::window_state_view::mark_display_only(&mut structured);
                 }
@@ -7063,6 +7105,13 @@ impl Tool for ClickTool {
         } else if let Some(capture_id) = capture_id_arg {
             if let Some(refusal) = native_refusal {
                 return refusal;
+            }
+            // A tiled niri window's pixels are checked against the layout of
+            // its latest screenshot only.
+            if crate::wayland::is_wayland() && crate::wayland::niri::is_session() {
+                if let Err(error) = crate::wayland::niri::frame_admits_capture(xid, &capture_id) {
+                    return input_error_result(error);
+                }
             }
             match crate::capture_action_frame::admit_window_click(
                 &self.state.capture_service,

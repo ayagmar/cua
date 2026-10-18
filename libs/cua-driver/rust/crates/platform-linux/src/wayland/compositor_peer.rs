@@ -37,6 +37,15 @@ pub(super) fn peer_pid(fd: RawFd) -> Result<libc::pid_t> {
 pub(super) fn wayland_connection_with_timeout(
     timeout: Duration,
 ) -> Result<wayland_client::Connection> {
+    wayland_client::Connection::from_socket(wayland_socket_with_timeout(timeout)?)
+        .context("Wayland connection failed")
+}
+
+/// A raw client socket to the `WAYLAND_DISPLAY` compositor, for a peer check
+/// before a Wayland client (in or out of process) uses it.
+pub(super) fn wayland_socket_with_timeout(
+    timeout: Duration,
+) -> Result<std::os::unix::net::UnixStream> {
     if std::env::var_os("WAYLAND_SOCKET").is_some() {
         bail!("compositor observation requires a named WAYLAND_DISPLAY socket");
     }
@@ -57,5 +66,5 @@ pub(super) fn wayland_connection_with_timeout(
     };
     let socket = socket2::Socket::new(socket2::Domain::UNIX, socket2::Type::STREAM, None)?;
     socket.connect_timeout(&socket2::SockAddr::unix(path)?, timeout)?;
-    wayland_client::Connection::from_socket(socket.into()).context("Wayland connection failed")
+    Ok(socket.into())
 }

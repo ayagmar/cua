@@ -107,6 +107,9 @@ impl Dispatch<ZwpVirtualKeyboardV1, ()> for State {
 pub(super) fn hotkey(modifiers: &[String], key: &str) -> anyhow::Result<()> {
     let transitions = hotkey_transitions(modifiers, key)?;
     let conn = Connection::connect_to_env()?;
+    if super::is_wayland() && super::niri::is_session() {
+        super::niri::verify_wayland_peer(&conn)?;
+    }
     let mut queue = conn.new_event_queue::<State>();
     let qh = queue.handle();
     conn.display().get_registry(&qh, ());

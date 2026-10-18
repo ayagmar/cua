@@ -236,6 +236,20 @@ pub(super) fn verify_wayland_peer(connection: &wayland_client::Connection) -> Re
     Ok(())
 }
 
+/// A Wayland client socket proven to reach the recognised niri process, for
+/// a keyboard helper that must not rediscover the display on its own.
+pub(super) fn attested_wayland_socket() -> Result<UnixStream> {
+    let pinned = *RECOGNIZED
+        .get()
+        .context("niri session has not been recognised")?;
+    let socket = super::compositor_peer::wayland_socket_with_timeout(QUERY_TIMEOUT)?;
+    let peer = peer_pid(socket.as_raw_fd())?;
+    if peer != pinned {
+        bail!("WAYLAND_DISPLAY is served by pid {peer}, not the recognised niri pid {pinned}");
+    }
+    Ok(socket)
+}
+
 fn ipc() -> Ipc<impl FnMut(Instant) -> Result<UnixStream>> {
     Ipc {
         connect: attested_connection,

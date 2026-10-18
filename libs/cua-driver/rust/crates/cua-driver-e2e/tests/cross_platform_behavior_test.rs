@@ -2064,7 +2064,7 @@ fn run_browser_tool_roundtrip(fixture: &mut Fixture) -> Observation {
     delivered_observation()
 }
 
-fn run_browser_tool_refusal(fixture: &mut Fixture) -> Observation {
+fn run_browser_tool_refusal(fixture: &mut Fixture, expected: RefusalCode) -> Observation {
     let session = format!("browser-embedded-refusal-{}", fixture.pid);
     let started = fixture
         .driver
@@ -2093,8 +2093,7 @@ fn run_browser_tool_refusal(fixture: &mut Fixture) -> Observation {
             )
         });
     assert_eq!(
-        code,
-        RefusalCode::BrowserRouteUnavailable,
+        code, expected,
         "embedded browser returned the wrong refusal: {}",
         response.raw
     );
@@ -2150,10 +2149,34 @@ fn embedded_browser_case(spec: &HostSpec) -> CaseSpec {
         cua_driver_testkit::e2e::DriverRoute::Cdp,
         oracles,
     );
-    if spec.name == "electron" {
-        case
+    match embedded_browser_refusal(spec) {
+        None => case,
+        Some(code) => case.expecting_refusal(vec![code]),
+    }
+}
+
+/// The refusal an embedded browser row declares, or `None` when it must
+/// bind. Browser identity is not accepted on niri: its Linux browser route
+/// has no exact window geometry there, so Electron binding fails closed.
+fn embedded_browser_refusal(spec: &HostSpec) -> Option<RefusalCode> {
+    if spec.name != "electron" {
+        Some(RefusalCode::BrowserRouteUnavailable)
+    } else if niri_session() {
+        Some(RefusalCode::BrowserWrongTargetRefused)
     } else {
-        case.expecting_refusal(vec![RefusalCode::BrowserRouteUnavailable])
+        None
+    }
+}
+
+fn niri_session() -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        platform_linux::wayland::wayland_input_enabled()
+            && platform_linux::wayland::niri::is_session()
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        false
     }
 }
 
@@ -2168,10 +2191,11 @@ fn embedded_browser_routes_are_exact_or_refused() {
             continue;
         }
         selected += 1;
-        let result = if spec.name == "electron" {
-            run_host_case_with_outcome(case, &spec, run_browser_tool_roundtrip)
-        } else {
-            run_host_case_with_outcome(case, &spec, run_browser_tool_refusal)
+        let result = match embedded_browser_refusal(&spec) {
+            None => run_host_case_with_outcome(case, &spec, run_browser_tool_roundtrip),
+            Some(code) => run_host_case_with_outcome(case, &spec, |fixture| {
+                run_browser_tool_refusal(fixture, code)
+            }),
         };
         if failure.is_none() {
             failure = result;

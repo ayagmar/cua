@@ -18,6 +18,7 @@ mod hyprland_compatibility;
 pub mod hyprland_input;
 pub mod kwin_helper;
 pub mod niri;
+mod niri_keyboard;
 pub mod overlay;
 pub mod persistent_vptr;
 pub(crate) mod portal;
@@ -1169,6 +1170,7 @@ fn screenshot_dispatch_for_pid(xid: u64, pid: Option<u32>) -> anyhow::Result<Vec
 /// are not tied to the attested compositor or orient differently, so niri
 /// never falls back to them.
 fn niri_display_capture() -> anyhow::Result<niri::DisplayCapture> {
+    niri::refuse_if_locked()?;
     // Read the transforms on both sides of the copy: a change in between
     // would orient the buffer with a transform it was not taken in.
     let before = niri::output_transforms()?;
@@ -2056,6 +2058,7 @@ fn niri_pointer_gate(
     if !(is_wayland() && niri::is_session()) {
         return Ok(None);
     }
+    niri::refuse_if_locked().map_err(niri::input_unavailable)?;
     // `motion_absolute` clamps into the pointer space: a point it would move
     // lands somewhere other than where it was aimed.
     for &(x, y) in points {
@@ -2566,12 +2569,16 @@ fn drag_vptr(
 /// backend's XSendEvent typing and the capture slice's shell-out to `grim`.
 /// foreign-toplevel exposes no pid and Wayland delivers keys to the *focused*
 /// surface, so this is window_id-free; pair it with `click`/`activate` to put
-/// the intended window in focus first.
+/// the intended window in focus first. Under niri, text goes out on niri's
+/// own keymap instead (see [`niri_keyboard`]).
 pub fn type_text(window_id: u64, text: &str) -> anyhow::Result<()> {
     if text.is_empty() {
         return Ok(());
     }
     activate_window_for_input(window_id)?;
+    if is_wayland() && niri::is_session() {
+        return niri_keyboard::type_text(Some(window_id), text);
+    }
     // Lead with a no-op Shift_L tap: on a freshly-focused window under a headless
     // seat (notably sway), the compositor needs the first virtual-keyboard event
     // to wire up keyboard routing, and that first key is dropped. Sacrificing a
@@ -2597,10 +2604,14 @@ pub fn type_text(window_id: u64, text: &str) -> anyhow::Result<()> {
 
 /// Type into a surface whose exact Sway container is already held focused by
 /// the caller. This avoids re-resolving a title that can change mid-sequence
-/// (for example after opening a Chromium tab).
+/// (for example after opening a Chromium tab). Under niri, text goes out on
+/// niri's own keymap and stops if focus leaves the window that had it.
 pub fn type_text_focused(text: &str) -> anyhow::Result<()> {
     if text.is_empty() {
         return Ok(());
+    }
+    if is_wayland() && niri::is_session() {
+        return niri_keyboard::type_text(niri_expected_window(), text);
     }
     let result = wtype_output(&["-k", "Shift_L", "--", text])?;
     match result {
@@ -2621,6 +2632,10 @@ pub fn type_text_focused(text: &str) -> anyhow::Result<()> {
 /// process after the text has landed.
 pub fn type_text_then_key_focused(text: &str, key: &str) -> anyhow::Result<()> {
     let keysym = key_to_keysym(key);
+    if is_wayland() && niri::is_session() {
+        niri_keyboard::type_text(niri_expected_window(), text)?;
+        return niri_keyboard::press(niri_expected_window(), &[], &keysym);
+    }
     let result = wtype_output(&[
         "-k",
         "Shift_L",
@@ -2649,6 +2664,9 @@ pub fn type_text_then_key_focused(text: &str, key: &str) -> anyhow::Result<()> {
 pub fn press_key(window_id: u64, key: &str) -> anyhow::Result<()> {
     activate_window_for_input(window_id)?;
     let keysym = key_to_keysym(key);
+    if is_wayland() && niri::is_session() {
+        return niri_keyboard::press(Some(window_id), &[], &keysym);
+    }
     // Keep the sacrificial modifier and requested key in one virtual-keyboard
     // lifetime. Starting a second wtype process creates a fresh protocol object,
     // causing headless seats to drop the requested key as their first event.
@@ -2673,6 +2691,9 @@ pub fn press_key_focused(key: &str) -> anyhow::Result<()> {
         return inject_press_key(pid, window_id, key);
     }
     let keysym = key_to_keysym(key);
+    if is_wayland() && niri::is_session() {
+        return niri_keyboard::press(niri_expected_window(), &[], &keysym);
+    }
     let result = wtype_output(&["-k", "Shift_L", "-k", keysym.as_str()])?;
     match result {
         Ok(out) if out.status.success() => Ok(()),
@@ -2694,6 +2715,9 @@ pub fn press_key_focused(key: &str) -> anyhow::Result<()> {
 pub fn hotkey(window_id: u64, keys: &[String]) -> anyhow::Result<()> {
     activate_window_for_input(window_id)?;
     let (mods, final_key) = partition_modifiers(keys)?;
+    if is_wayland() && niri::is_session() {
+        return niri_keyboard::press(Some(window_id), &mods, &chord_keysym(&final_key));
+    }
     if let Ok(()) = virtual_keyboard::hotkey(&mods, &final_key) {
         return Ok(());
     }
@@ -2734,6 +2758,9 @@ pub fn hotkey_focused(keys: &[String]) -> anyhow::Result<()> {
         return inject_hotkey(pid, window_id, keys);
     }
     let (mods, final_key) = partition_modifiers(keys)?;
+    if is_wayland() && niri::is_session() {
+        return niri_keyboard::press(niri_expected_window(), &mods, &chord_keysym(&final_key));
+    }
     if let Ok(()) = virtual_keyboard::hotkey(&mods, &final_key) {
         return Ok(());
     }
@@ -2845,6 +2872,23 @@ fn partition_modifiers(keys: &[String]) -> anyhow::Result<(Vec<String>, String)>
         .cloned()
         .ok_or_else(|| anyhow::anyhow!("hotkey requires at least one non-modifier key"))?;
     Ok((mods, final_key))
+}
+
+/// The niri window focused keyboard input must reach: the target an outer
+/// [`with_target_foreground`] focused, or `None` for desktop-scoped input
+/// into whatever has focus.
+fn niri_expected_window() -> Option<u64> {
+    current_foreground_target().map(|(_, window_id)| window_id)
+}
+
+/// The keysym of a chord's final key. A letter names its key whatever its
+/// case, as the virtual-keyboard chord route reads it: `ctrl+A` is `ctrl+a`,
+/// and Shift is held only when asked for.
+fn chord_keysym(key: &str) -> String {
+    match key.as_bytes() {
+        [letter] if letter.is_ascii_alphabetic() => key.to_ascii_lowercase(),
+        _ => key_to_keysym(key),
+    }
 }
 
 /// Map cua key names to X keysym names that `wtype -k` understands. Unknown
@@ -4384,6 +4428,23 @@ mod tests {
             "foreground_unavailable: layout changed"
         );
         assert_eq!(delivered, 0);
+    }
+
+    #[test]
+    fn niri_focused_keyboard_input_expects_the_held_foreground_window() {
+        assert_eq!(super::niri_expected_window(), None);
+        {
+            let _held = super::bind_foreground_target(7, 42);
+            assert_eq!(super::niri_expected_window(), Some(42));
+        }
+        assert_eq!(super::niri_expected_window(), None);
+    }
+
+    #[test]
+    fn a_chord_letter_names_its_key_in_either_case() {
+        assert_eq!(super::chord_keysym("A"), "a");
+        assert_eq!(super::chord_keysym("enter"), "Return");
+        assert_eq!(super::chord_keysym("F5"), "F5");
     }
 
     #[test]

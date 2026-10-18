@@ -1432,7 +1432,24 @@ fn within<T: Send + 'static>(
         .map_err(|_| anyhow!("could not {what} within {timeout:?}"))
 }
 
+/// How long one whole logind query (connection, `GetSession`, `LockedHint`)
+/// may take.
+const LOCK_QUERY_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// logind's `LockedHint` for `session`. zbus's blocking calls run on its own
+/// Tokio runtime and panic on a Tokio worker thread, where capture-bound
+/// clicks and recording reach this check, so the whole query runs on a
+/// thread of its own.
 fn locked_hint(session: &str) -> Result<bool> {
+    let session = session.to_owned();
+    locked_hint_with(move || logind_locked_hint(&session))
+}
+
+fn locked_hint_with(query: impl FnOnce() -> Result<bool> + Send + 'static) -> Result<bool> {
+    within(LOCK_QUERY_TIMEOUT, "read logind's LockedHint", query)?
+}
+
+fn logind_locked_hint(session: &str) -> Result<bool> {
     static BUS: Mutex<Option<zbus::blocking::Connection>> = Mutex::new(None);
     let mut bus = BUS
         .lock()
@@ -1440,12 +1457,10 @@ fn locked_hint(session: &str) -> Result<bool> {
     let connection = match bus.as_ref() {
         Some(connection) => connection.clone(),
         None => {
-            let connection = within(LOGIND_TIMEOUT, "connect to the system bus", || {
-                zbus::blocking::connection::Builder::system()?
-                    .method_timeout(LOGIND_TIMEOUT)
-                    .build()
-            })?
-            .context("connect to the system bus")?;
+            let connection = zbus::blocking::connection::Builder::system()?
+                .method_timeout(LOGIND_TIMEOUT)
+                .build()
+                .context("connect to the system bus")?;
             bus.insert(connection).clone()
         }
     };
@@ -2079,6 +2094,14 @@ mod tests {
                 String::from_utf8_lossy(environ)
             );
         }
+    }
+
+    /// Capture-bound clicks and recording call the lock check from a Tokio
+    /// worker; a zbus blocking call made there panics.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_lock_query_runs_off_the_tokio_worker() {
+        let locked = locked_hint_with(|| Ok(zbus::block_on(async { true }))).unwrap();
+        assert!(locked);
     }
 
     #[test]

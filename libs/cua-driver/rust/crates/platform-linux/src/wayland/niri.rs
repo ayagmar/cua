@@ -1337,8 +1337,13 @@ fn active_layout(layouts: &KeyboardLayouts) -> Result<u32> {
     Ok(layouts.current_idx)
 }
 
-/// How long one logind query may take.
+/// How long each logind method call may take.
 const LOGIND_TIMEOUT: Duration = Duration::from_secs(1);
+/// The method calls of one lock query: `GetSession`, then `LockedHint`.
+const LOGIND_CALLS: u32 = 2;
+/// The share of a lock query left for opening the system-bus connection,
+/// which zbus does not bound itself.
+const LOGIND_CONNECT_TIMEOUT: Duration = Duration::from_secs(1);
 
 /// Refuse input and capture while the niri session is locked; input routes
 /// add the `foreground_unavailable` code (see [`input_unavailable`]). niri records
@@ -1472,9 +1477,10 @@ impl<T: Send + 'static> Flight<T> {
     }
 }
 
-/// How long one whole logind query (connection, `GetSession`, `LockedHint`)
-/// may take.
-const LOCK_QUERY_TIMEOUT: Duration = Duration::from_secs(2);
+/// How long one whole logind query may take: the connection's share and
+/// both method calls, so a slow but working bus still answers in time.
+const LOCK_QUERY_TIMEOUT: Duration =
+    LOGIND_CONNECT_TIMEOUT.saturating_add(LOGIND_TIMEOUT.saturating_mul(LOGIND_CALLS));
 
 /// logind's `LockedHint` for `session`. zbus's blocking calls run on its own
 /// Tokio runtime and panic on a Tokio worker thread, where capture-bound
@@ -2140,6 +2146,13 @@ mod tests {
                 String::from_utf8_lossy(environ)
             );
         }
+    }
+
+    /// A slow but working bus must answer within the wait; a wait shorter than
+    /// the query refuses, and blocks later checks until the stale query ends.
+    #[test]
+    fn the_lock_query_wait_covers_the_connection_and_both_calls() {
+        assert!(LOCK_QUERY_TIMEOUT >= LOGIND_CONNECT_TIMEOUT + LOGIND_TIMEOUT * LOGIND_CALLS);
     }
 
     /// Capture-bound clicks and recording call the lock check from a Tokio

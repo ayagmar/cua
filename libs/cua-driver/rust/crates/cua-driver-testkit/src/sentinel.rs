@@ -277,6 +277,8 @@ impl ForegroundSentinel {
         raise_for_focus_canary(driver, background_target)?;
         #[cfg(target_os = "linux")]
         focus_sway_target(driver, background_target)?;
+        #[cfg(target_os = "linux")]
+        focus_niri_target(background_target)?;
         if is_wayland_session() {
             wait_for_native_focus_lost(self.target, background_target)?;
         } else {
@@ -571,6 +573,10 @@ fn try_activate_native_foreground(
     focus_sway_target(driver, target).map_err(|error| {
         format!("could not focus foreground sentinel through Sway IPC: {error}")
     })?;
+    #[cfg(target_os = "linux")]
+    focus_niri_target(target).map_err(|error| {
+        format!("could not focus foreground sentinel through niri IPC: {error}")
+    })?;
     #[cfg(target_os = "windows")]
     physically_focus_windows_sentinel(target);
     #[cfg(target_os = "macos")]
@@ -616,6 +622,18 @@ fn focus_sway_target(driver: &mut impl Driver, target: TargetWindow) -> Result<(
 
     let (_, con_id) = sway_tree_and_container_for_target(driver, target)?;
     run_sway_container_command(con_id, &["focus"], "focus canary")
+}
+
+/// niri shows a focused floating window above the fullscreen sentinel, so the
+/// niri canary needs no fullscreen toggle, only the compositor's own focus.
+#[cfg(target_os = "linux")]
+fn focus_niri_target(target: TargetWindow) -> Result<(), String> {
+    let is_niri = is_wayland_session()
+        && std::env::var("CUA_E2E_WAYLAND_SESSION").is_ok_and(|session| session == "niri");
+    if !is_niri {
+        return Ok(());
+    }
+    crate::observer::linux::niri_focus(target).map_err(|error| error.to_string())
 }
 
 #[cfg(target_os = "linux")]

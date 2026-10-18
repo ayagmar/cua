@@ -919,6 +919,10 @@ pub mod macos {
 #[path = "observer_hyprland.rs"]
 mod hyprland;
 
+#[cfg(any(target_os = "linux", all(test, unix)))]
+#[path = "observer_niri.rs"]
+mod niri;
+
 #[cfg(target_os = "linux")]
 pub mod linux {
     use std::process::{Command, Stdio};
@@ -944,6 +948,7 @@ pub mod linux {
         X11,
         Sway,
         Hyprland,
+        Niri,
         Gnome,
         CuaCompositor,
         Missing,
@@ -970,6 +975,14 @@ pub mod linux {
                     SessionKind::CuaCompositor
                 } else if sway_available() {
                     SessionKind::Sway
+                } else if std::env::var_os("NIRI_SOCKET").is_some() {
+                    match super::niri::probe() {
+                        Ok(()) => SessionKind::Niri,
+                        Err(error) => {
+                            probe_error = Some(error);
+                            SessionKind::Missing
+                        }
+                    }
                 } else if std::env::var_os("HYPRLAND_INSTANCE_SIGNATURE").is_some() {
                     match super::hyprland::probe() {
                         Ok(()) => SessionKind::Hyprland,
@@ -1018,14 +1031,15 @@ pub mod linux {
                     cursor: true,
                     leaked_input: false,
                 },
-                SessionKind::Sway | SessionKind::Gnome | SessionKind::CuaCompositor => {
-                    ObserverCapabilities {
-                        focus: true,
-                        z_order: true,
-                        cursor: false,
-                        leaked_input: false,
-                    }
-                }
+                SessionKind::Sway
+                | SessionKind::Niri
+                | SessionKind::Gnome
+                | SessionKind::CuaCompositor => ObserverCapabilities {
+                    focus: true,
+                    z_order: true,
+                    cursor: false,
+                    leaked_input: false,
+                },
                 SessionKind::Missing => ObserverCapabilities::default(),
             }
         }
@@ -1038,6 +1052,7 @@ pub mod linux {
                 SessionKind::X11 => x11_snapshot(target),
                 SessionKind::Sway => sway_snapshot(target),
                 SessionKind::Hyprland => super::hyprland::snapshot(target),
+                SessionKind::Niri => super::niri::snapshot(target),
                 SessionKind::Gnome => gnome_snapshot(target),
                 SessionKind::CuaCompositor => cua_compositor_snapshot(target),
                 SessionKind::Missing => Ok(DesktopSnapshot {
@@ -1073,6 +1088,7 @@ pub mod linux {
                     SessionKind::X11 => x11_focus_identity(),
                     SessionKind::Sway => sway_focus_identity(),
                     SessionKind::Hyprland => super::hyprland::focus_identity(),
+                    SessionKind::Niri => super::niri::focus_identity(),
                     SessionKind::Gnome => gnome_focus_identity(),
                     SessionKind::CuaCompositor => cua_compositor_focus_identity(),
                     SessionKind::Missing => Ok(None),
@@ -1121,6 +1137,10 @@ pub mod linux {
 
     pub(crate) fn hyprland_cursor_position() -> Result<(f64, f64), ObserverError> {
         super::hyprland::cursor_position()
+    }
+
+    pub(crate) fn niri_focus(target: TargetWindow) -> Result<(), ObserverError> {
+        super::niri::focus(target)
     }
 
     pub(crate) fn hyprland_monitor_regions() -> Result<Vec<(f64, f64, f64, f64)>, ObserverError> {

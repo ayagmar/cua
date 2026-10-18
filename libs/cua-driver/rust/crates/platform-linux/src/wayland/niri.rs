@@ -1689,7 +1689,10 @@ fn with_focused_window_in<C: FnMut(Instant) -> Result<UnixStream>, T>(
     match (result, restore) {
         (Ok(value), Ok(())) => Ok(value),
         (Err(error), Ok(())) => Err(error),
-        (Ok(_), Err(error)) => Err(error),
+        // The body sent its input: say so, so the caller does not repeat it.
+        (Ok(_), Err(error)) => {
+            Err(error.context("the input was sent, but niri could not restore the prior focus"))
+        }
         (Err(error), Err(restore)) => {
             let note =
                 format!("{error}; the prior niri focus also could not be restored: {restore:#}");
@@ -4004,7 +4007,10 @@ mod tests {
         )
         .unwrap_err();
         assert!(ran);
-        assert_eq!(error.to_string(), "niri could not restore prior window 5");
+        assert_eq!(
+            format!("{error:#}"),
+            "the input was sent, but niri could not restore the prior focus: niri could not restore prior window 5: foreground_unavailable: niri did not confirm focus on window 5 (focused: 7)"
+        );
         assert_eq!(
             format!("{:#}", error.root_cause()),
             "foreground_unavailable: niri did not confirm focus on window 5 (focused: 7)"

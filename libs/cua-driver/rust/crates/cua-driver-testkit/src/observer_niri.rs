@@ -209,13 +209,13 @@ fn query<T: DeserializeOwned>(name: &str) -> Result<T, ObserverError> {
         .map_err(|error| ObserverError::new(format!("invalid niri {name} JSON: {error}")))
 }
 
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize, PartialEq)]
 struct Layout {
     tile_size: (f64, f64),
     tile_pos_in_workspace_view: Option<(f64, f64)>,
 }
 
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize, PartialEq)]
 struct Window {
     id: u64,
     pid: Option<i64>,
@@ -258,14 +258,26 @@ struct Desktop {
     lane_config: bool,
 }
 
+/// One desktop state from four requests. Each request is its own connection,
+/// so the windows are read again last and the read is retried when they
+/// changed in between, for example across a workspace switch.
 fn desktop() -> Result<Desktop, ObserverError> {
-    Ok(Desktop {
-        windows: query("Windows")?,
-        workspaces: query("Workspaces")?,
-        outputs: query("Outputs")?,
-        overview_open: query::<Overview>("OverviewState")?.is_open,
-        lane_config: std::env::var("CUA_E2E_WAYLAND_SESSION").as_deref() == Ok("niri"),
-    })
+    for _ in 0..3 {
+        let windows: Vec<Window> = query("Windows")?;
+        let desktop = Desktop {
+            workspaces: query("Workspaces")?,
+            outputs: query("Outputs")?,
+            overview_open: query::<Overview>("OverviewState")?.is_open,
+            lane_config: std::env::var("CUA_E2E_WAYLAND_SESSION").as_deref() == Ok("niri"),
+            windows: query("Windows")?,
+        };
+        if desktop.windows == windows {
+            return Ok(desktop);
+        }
+    }
+    Err(ObserverError::new(
+        "niri windows kept changing while the desktop was read",
+    ))
 }
 
 fn focused(windows: &[Window]) -> Result<Option<&Window>, ObserverError> {

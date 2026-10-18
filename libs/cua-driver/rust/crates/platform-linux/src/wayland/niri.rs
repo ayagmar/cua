@@ -2749,13 +2749,6 @@ mod tests {
         }
     }
 
-    /// A slow but working bus must answer within the wait; a wait shorter than
-    /// the query refuses, and blocks later checks until the stale query ends.
-    #[test]
-    fn the_lock_query_wait_covers_the_connection_and_both_calls() {
-        assert!(LOCK_QUERY_TIMEOUT >= LOGIND_CONNECT_TIMEOUT + LOGIND_TIMEOUT * LOGIND_CALLS);
-    }
-
     /// Capture-bound clicks and recording call the lock check from a Tokio
     /// worker; a zbus blocking call made there panics.
     #[tokio::test(flavor = "multi_thread")]

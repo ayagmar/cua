@@ -2770,7 +2770,7 @@ pub fn type_text(window_id: u64, text: &str) -> anyhow::Result<()> {
     // to wire up keyboard routing, and that first key is dropped. Sacrificing a
     // modifier tap (no character) absorbs the drop so the real text lands intact;
     // it's harmless where routing is already live (labwc).
-    let result = wtype_output(&["-k", "Shift_L", "--", text])?;
+    let result = wtype_output(&["-k", "Shift_L", "--", text]);
     match result {
         Ok(out) if out.status.success() => Ok(()),
         // `wtype` relies on `zwp_virtual_keyboard_v1`, which KWin/Plasma and
@@ -2799,7 +2799,7 @@ pub fn type_text_focused(text: &str) -> anyhow::Result<()> {
     if is_wayland() && niri::is_session() {
         return niri_keyboard::type_text(niri_expected_window(), text);
     }
-    let result = wtype_output(&["-k", "Shift_L", "--", text])?;
+    let result = wtype_output(&["-k", "Shift_L", "--", text]);
     match result {
         Ok(out) if out.status.success() => Ok(()),
         other => with_wtype_libei_fallback(
@@ -2832,7 +2832,7 @@ pub fn type_text_then_key_focused(text: &str, key: &str) -> anyhow::Result<()> {
         "50",
         "-k",
         keysym.as_str(),
-    ])?;
+    ]);
     match result {
         Ok(out) if out.status.success() => Ok(()),
         other => with_wtype_libei_fallback(
@@ -2856,7 +2856,7 @@ pub fn press_key(window_id: u64, key: &str) -> anyhow::Result<()> {
     // Keep the sacrificial modifier and requested key in one virtual-keyboard
     // lifetime. Starting a second wtype process creates a fresh protocol object,
     // causing headless seats to drop the requested key as their first event.
-    let result = wtype_output(&["-k", "Shift_L", "-k", keysym.as_str()])?;
+    let result = wtype_output(&["-k", "Shift_L", "-k", keysym.as_str()]);
     match result {
         Ok(out) if out.status.success() => Ok(()),
         other => with_wtype_libei_fallback(
@@ -2880,7 +2880,7 @@ pub fn press_key_focused(key: &str) -> anyhow::Result<()> {
     if is_wayland() && niri::is_session() {
         return niri_keyboard::press(niri_expected_window(), &[], &keysym);
     }
-    let result = wtype_output(&["-k", "Shift_L", "-k", keysym.as_str()])?;
+    let result = wtype_output(&["-k", "Shift_L", "-k", keysym.as_str()]);
     match result {
         Ok(out) if out.status.success() => Ok(()),
         other => with_wtype_libei_fallback(
@@ -2909,7 +2909,7 @@ pub fn hotkey(window_id: u64, keys: &[String]) -> anyhow::Result<()> {
     }
     let keysym = key_to_keysym(&final_key);
     let args = wtype_hotkey_args(&mods, &keysym);
-    let result = wtype_output(&args)?;
+    let result = wtype_output(&args);
     match result {
         Ok(out) if out.status.success() => Ok(()),
         other => {
@@ -2952,7 +2952,7 @@ pub fn hotkey_focused(keys: &[String]) -> anyhow::Result<()> {
     }
     let keysym = key_to_keysym(&final_key);
     let args = wtype_hotkey_args(&mods, &keysym);
-    let result = wtype_output(&args)?;
+    let result = wtype_output(&args);
     match result {
         Ok(out) if out.status.success() => Ok(()),
         other => {
@@ -2979,37 +2979,9 @@ pub fn hotkey_focused(keys: &[String]) -> anyhow::Result<()> {
     }
 }
 
-/// Run `wtype` with `args`. The outer error refuses before anything is
-/// typed; the inner result is the run itself, as `Command::output` reports
-/// it. Under niri, wtype gets a Wayland socket already proven to reach the
-/// recognised niri (through `WAYLAND_SOCKET`) instead of rediscovering the
-/// display, so a replaced compositor cannot receive the keys.
-fn wtype_output<S: AsRef<std::ffi::OsStr>>(
-    args: &[S],
-) -> anyhow::Result<std::io::Result<std::process::Output>> {
-    let mut command = std::process::Command::new("wtype");
-    command.args(args);
-    if !(is_wayland() && niri::is_session()) {
-        return Ok(command.output());
-    }
-    let socket = niri::attested_wayland_socket()
-        .map_err(|error| anyhow::anyhow!("foreground_unavailable: {error:#}"))?;
-    let fd = std::os::fd::AsRawFd::as_raw_fd(&socket);
-    command.env("WAYLAND_SOCKET", fd.to_string());
-    // SAFETY: fcntl is async-signal-safe; it lets the child inherit the
-    // socket, which Rust opened close-on-exec.
-    unsafe {
-        use std::os::unix::process::CommandExt as _;
-        command.pre_exec(move || {
-            if libc::fcntl(fd, libc::F_SETFD, 0) == -1 {
-                return Err(std::io::Error::last_os_error());
-            }
-            Ok(())
-        });
-    }
-    let output = command.output();
-    drop(socket);
-    Ok(output)
+/// Run `wtype` with `args`.
+fn wtype_output<S: AsRef<std::ffi::OsStr>>(args: &[S]) -> std::io::Result<std::process::Output> {
+    std::process::Command::new("wtype").args(args).output()
 }
 
 fn wtype_hotkey_args(mods: &[String], keysym: &str) -> Vec<String> {
@@ -3122,24 +3094,9 @@ fn key_to_keysym(key: &str) -> String {
 /// virtual-keyboard shell-out failed (`wtype_err`), try the libei `run` on a
 /// portal-input build, otherwise surface the original wtype failure.
 fn with_wtype_libei_fallback(
-    run: impl FnOnce() -> anyhow::Result<()>,
-    wtype_err: Result<String, std::io::Error>,
-) -> anyhow::Result<()> {
-    wtype_recovery(is_wayland() && niri::is_session(), run, wtype_err)
-}
-
-/// [`with_wtype_libei_fallback`] for a session known to be (or not be) niri.
-fn wtype_recovery(
-    on_niri: bool,
     #[allow(unused_variables)] run: impl FnOnce() -> anyhow::Result<()>,
     wtype_err: Result<String, std::io::Error>,
 ) -> anyhow::Result<()> {
-    if on_niri {
-        return Err(niri_refuses_libei(match wtype_err {
-            Ok(stderr) => format!("wtype failed: {stderr}"),
-            Err(e) => format!("wtype unavailable: {e}"),
-        }));
-    }
     #[cfg(feature = "portal-input")]
     {
         match wtype_err {
@@ -4553,15 +4510,6 @@ mod tests {
 
     #[test]
     fn niri_never_recovers_input_through_libei() {
-        let typed = super::wtype_recovery(
-            true,
-            || panic!("libei must not run under niri"),
-            Ok("failed to connect\n".to_string()),
-        );
-        assert_eq!(
-            typed.unwrap_err().to_string(),
-            "foreground_unavailable: wtype failed: failed to connect; under niri the libei/portal fallback is refused because it is not attested"
-        );
         let pointed: anyhow::Result<()> = super::libei_recovery(
             true,
             || anyhow::bail!("{}: none bound", super::NO_VPTR_MARKER),

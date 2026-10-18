@@ -2577,7 +2577,7 @@ pub fn type_text(window_id: u64, text: &str) -> anyhow::Result<()> {
     }
     activate_window_for_input(window_id)?;
     if is_wayland() && niri::is_session() {
-        return niri_keyboard::type_text(text);
+        return niri_keyboard::type_text(Some(window_id), text);
     }
     // Lead with a no-op Shift_L tap: on a freshly-focused window under a headless
     // seat (notably sway), the compositor needs the first virtual-keyboard event
@@ -2611,7 +2611,7 @@ pub fn type_text_focused(text: &str) -> anyhow::Result<()> {
         return Ok(());
     }
     if is_wayland() && niri::is_session() {
-        return niri_keyboard::type_text(text);
+        return niri_keyboard::type_text(niri_expected_window(), text);
     }
     let result = wtype_output(&["-k", "Shift_L", "--", text])?;
     match result {
@@ -2633,8 +2633,8 @@ pub fn type_text_focused(text: &str) -> anyhow::Result<()> {
 pub fn type_text_then_key_focused(text: &str, key: &str) -> anyhow::Result<()> {
     let keysym = key_to_keysym(key);
     if is_wayland() && niri::is_session() {
-        niri_keyboard::type_text(text)?;
-        return niri_keyboard::press(&[], &keysym);
+        niri_keyboard::type_text(niri_expected_window(), text)?;
+        return niri_keyboard::press(niri_expected_window(), &[], &keysym);
     }
     let result = wtype_output(&[
         "-k",
@@ -2665,7 +2665,7 @@ pub fn press_key(window_id: u64, key: &str) -> anyhow::Result<()> {
     activate_window_for_input(window_id)?;
     let keysym = key_to_keysym(key);
     if is_wayland() && niri::is_session() {
-        return niri_keyboard::press(&[], &keysym);
+        return niri_keyboard::press(Some(window_id), &[], &keysym);
     }
     // Keep the sacrificial modifier and requested key in one virtual-keyboard
     // lifetime. Starting a second wtype process creates a fresh protocol object,
@@ -2692,7 +2692,7 @@ pub fn press_key_focused(key: &str) -> anyhow::Result<()> {
     }
     let keysym = key_to_keysym(key);
     if is_wayland() && niri::is_session() {
-        return niri_keyboard::press(&[], &keysym);
+        return niri_keyboard::press(niri_expected_window(), &[], &keysym);
     }
     let result = wtype_output(&["-k", "Shift_L", "-k", keysym.as_str()])?;
     match result {
@@ -2716,7 +2716,7 @@ pub fn hotkey(window_id: u64, keys: &[String]) -> anyhow::Result<()> {
     activate_window_for_input(window_id)?;
     let (mods, final_key) = partition_modifiers(keys)?;
     if is_wayland() && niri::is_session() {
-        return niri_keyboard::press(&mods, &chord_keysym(&final_key));
+        return niri_keyboard::press(Some(window_id), &mods, &chord_keysym(&final_key));
     }
     if let Ok(()) = virtual_keyboard::hotkey(&mods, &final_key) {
         return Ok(());
@@ -2759,7 +2759,7 @@ pub fn hotkey_focused(keys: &[String]) -> anyhow::Result<()> {
     }
     let (mods, final_key) = partition_modifiers(keys)?;
     if is_wayland() && niri::is_session() {
-        return niri_keyboard::press(&mods, &chord_keysym(&final_key));
+        return niri_keyboard::press(niri_expected_window(), &mods, &chord_keysym(&final_key));
     }
     if let Ok(()) = virtual_keyboard::hotkey(&mods, &final_key) {
         return Ok(());
@@ -2872,6 +2872,13 @@ fn partition_modifiers(keys: &[String]) -> anyhow::Result<(Vec<String>, String)>
         .cloned()
         .ok_or_else(|| anyhow::anyhow!("hotkey requires at least one non-modifier key"))?;
     Ok((mods, final_key))
+}
+
+/// The niri window focused keyboard input must reach: the target an outer
+/// [`with_target_foreground`] focused, or `None` for desktop-scoped input
+/// into whatever has focus.
+fn niri_expected_window() -> Option<u64> {
+    current_foreground_target().map(|(_, window_id)| window_id)
 }
 
 /// The keysym of a chord's final key. A letter names its key whatever its
@@ -4421,6 +4428,16 @@ mod tests {
             "foreground_unavailable: layout changed"
         );
         assert_eq!(delivered, 0);
+    }
+
+    #[test]
+    fn niri_focused_keyboard_input_expects_the_held_foreground_window() {
+        assert_eq!(super::niri_expected_window(), None);
+        {
+            let _held = super::bind_foreground_target(7, 42);
+            assert_eq!(super::niri_expected_window(), Some(42));
+        }
+        assert_eq!(super::niri_expected_window(), None);
     }
 
     #[test]

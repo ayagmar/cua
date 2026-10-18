@@ -405,14 +405,15 @@ fn plan_key(map: &str, group: u32, modifiers: &[String], name: &str) -> Result<K
 
 // ── Typing ───────────────────────────────────────────────────────────────────
 
-/// Type `text` into the niri window that has keyboard focus now, stopping if
-/// focus leaves it. A stop after some characters went out reports how many,
-/// without the `foreground_unavailable` code that means nothing happened.
-pub(super) fn type_text(text: &str) -> Result<()> {
+/// Type `text` into the niri window that has keyboard focus now, which must
+/// be `expected` when the caller activated one, stopping if focus leaves it.
+/// A stop after some characters went out reports how many, without the
+/// `foreground_unavailable` code that means nothing happened.
+pub(super) fn type_text(expected: Option<u64>, text: &str) -> Result<()> {
     if text.is_empty() {
         return Ok(());
     }
-    let mut session = Session::begin(text.chars().count())?;
+    let mut session = Session::begin(expected, text.chars().count())?;
     let parts = plan_text(session.keyboard.base_text(), session.group, text)?;
     let total: usize = parts.iter().map(|part| part.keys.len()).sum();
     let mut sent = 0;
@@ -422,9 +423,10 @@ pub(super) fn type_text(text: &str) -> Result<()> {
 
 /// Press the key `name` (an X keysym name) with `modifiers` (`ctrl`,
 /// `shift`, `alt`, `logo`) held, into the niri window that has keyboard
-/// focus. The modifiers are held through the keyboard's modifier state.
-pub(super) fn press(modifiers: &[String], name: &str) -> Result<()> {
-    let mut session = Session::begin(1)?;
+/// focus, which must be `expected` when the caller activated one. The
+/// modifiers are held through the keyboard's modifier state.
+pub(super) fn press(expected: Option<u64>, modifiers: &[String], name: &str) -> Result<()> {
+    let mut session = Session::begin(expected, 1)?;
     let key = plan_key(session.keyboard.base_text(), session.group, modifiers, name)?;
     let parts = [Part {
         keys: vec![key],
@@ -448,18 +450,11 @@ struct Session {
 }
 
 impl Session {
-    fn begin(keys: usize) -> Result<Self> {
+    fn begin(expected: Option<u64>, keys: usize) -> Result<Self> {
         let deadline =
             Instant::now() + CALL_BASE + PER_KEY * u32::try_from(keys).unwrap_or(u32::MAX);
-        let target = super::niri::keyboard_focus()
-            .map_err(super::niri::input_unavailable)?
-            .ok_or_else(|| {
-                anyhow!(
-                    "foreground_unavailable: no niri window has keyboard focus (the screen may \
-                     be locked, or the overview, a layer-shell surface or a niri dialog has \
-                     it); nothing was typed"
-                )
-            })?;
+        let focused = super::niri::keyboard_focus().map_err(super::niri::input_unavailable)?;
+        let target = admitted_target(expected, focused)?;
         super::niri::refuse_if_locked().map_err(super::niri::input_unavailable)?;
         let group = super::niri::keyboard_layout().map_err(super::niri::input_unavailable)?;
         let keyboard = Keyboard::bind(deadline).map_err(|error| refused(format!("{error:#}")))?;
@@ -495,6 +490,24 @@ impl Session {
 /// Focus left `target` for `focused`. niri can move focus between its answer
 /// and the next key, so once keys went out the last one may have reached the
 /// window that has focus now; niri offers no check that is atomic with a key.
+/// The window a call types into: the one with keyboard focus, which must be
+/// `expected` when the caller activated a window, since another window may
+/// have taken focus after the activation was confirmed.
+fn admitted_target(expected: Option<u64>, focused: Option<u64>) -> Result<u64> {
+    match (expected, focused) {
+        (_, None) => Err(anyhow!(
+            "foreground_unavailable: no niri window has keyboard focus (the screen may be \
+             locked, or the overview, a layer-shell surface or a niri dialog has it); nothing \
+             was typed"
+        )),
+        (Some(expected), Some(focused)) if focused != expected => Err(anyhow!(
+            "foreground_unavailable: niri keyboard focus is on window {focused}, not window \
+             {expected}; nothing was typed"
+        )),
+        (_, Some(focused)) => Ok(focused),
+    }
+}
+
 fn focus_moved(target: u64, focused: Option<u64>, sent: usize) -> anyhow::Error {
     let now = focused.map_or_else(|| "no window".to_owned(), |id| format!("window {id}"));
     if sent == 0 {
@@ -1061,6 +1074,26 @@ mod tests {
                 .to_string()
                 .ends_with("the last key sent may have reached window 4"),
             "{after}"
+        );
+    }
+
+    #[test]
+    fn a_window_scoped_call_types_only_into_the_window_it_activated() {
+        assert_eq!(admitted_target(Some(5), Some(5)).unwrap(), 5);
+        assert_eq!(admitted_target(None, Some(6)).unwrap(), 6);
+        for (expected, focused) in [(Some(5), Some(6)), (Some(5), None), (None, None)] {
+            let error = admitted_target(expected, focused).unwrap_err();
+            assert_eq!(
+                crate::input::foreground::error_code(&error),
+                Some(crate::input::foreground::CODE_UNAVAILABLE),
+                "{error}"
+            );
+            assert!(error.to_string().ends_with("nothing was typed"), "{error}");
+        }
+        assert_eq!(
+            admitted_target(Some(5), Some(6)).unwrap_err().to_string(),
+            "foreground_unavailable: niri keyboard focus is on window 6, not window 5; \
+             nothing was typed"
         );
     }
 

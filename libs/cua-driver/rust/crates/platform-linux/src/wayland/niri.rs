@@ -1396,11 +1396,25 @@ fn foreground_unavailable(detail: impl std::fmt::Display) -> anyhow::Error {
     anyhow!("foreground_unavailable: {detail}")
 }
 
+/// The refusal for desktop-frame coordinates addressed to window `id`.
+/// Mapping them through the window's current place would aim at the same
+/// desktop pixel even after the window moved under it, and niri does not
+/// say whether it did since the `get_desktop_state` screenshot.
+pub fn desktop_frame_window_refusal(id: u64) -> anyhow::Error {
+    foreground_unavailable(format!(
+        "niri cannot map desktop-frame coordinates into window {id}, because it does not report whether the window moved since the get_desktop_state screenshot; act at desktop scope without pid and window_id, or pass window-local coordinates"
+    ))
+}
+
 /// The next step for a niri input refusal, from the remedy its detail names.
 /// `None` for refusals this module does not word, which keep the generic
 /// suggestion.
 pub fn refusal_suggestion(detail: &str) -> Option<&'static str> {
-    let remedies: [(&[&str], &str); 7] = [
+    let remedies: [(&[&str], &str); 8] = [
+        (
+            &["without pid and window_id"],
+            "Drop pid and window_id to act at desktop scope on the latest get_desktop_state screenshot, or pass window-local coordinates from get_window_state.",
+        ),
         (
             &["float the window"],
             "niri does not report where tiled windows are: call get_desktop_state and act at desktop scope (needs the display grant), or float the window.",

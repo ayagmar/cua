@@ -2599,8 +2599,36 @@ fn desktop_frame_requested(args: &Value) -> bool {
 /// Convert desktop (screen) coordinates to `xid`'s window-local frame so the
 /// rest of the pointer pipeline (which is window-local by contract) is reused.
 fn desktop_to_window_local(xid: u64, x: f64, y: f64) -> anyhow::Result<(f64, f64)> {
+    // A niri window id is no X11 window: never ask XWayland about it.
+    if crate::wayland::is_wayland() && crate::wayland::niri::is_session() {
+        return Err(crate::wayland::niri::desktop_frame_window_refusal(xid));
+    }
     let (ox, oy) = window_local_to_screen(xid, 0.0, 0.0)?;
     Ok((x - ox, y - oy))
+}
+
+/// A failed desktop-to-window mapping; a coded refusal keeps its structure.
+fn desktop_frame_unmapped(xid: u64, error: anyhow::Error) -> ToolResult {
+    if crate::input::foreground::error_code(&error).is_some() {
+        return input_error_result(error);
+    }
+    ToolResult::error(format!(
+        "desktop-frame coordinates could not be mapped into window {xid}: {error}"
+    ))
+}
+
+#[cfg(test)]
+#[test]
+fn a_niri_desktop_frame_window_refusal_is_structured() {
+    let refused =
+        desktop_frame_unmapped(31, crate::wayland::niri::desktop_frame_window_refusal(31));
+    let structured = refused.structured_content.unwrap();
+    assert_eq!(structured["code"], "foreground_unavailable");
+    assert_eq!(structured["effect"], "none");
+    assert!(structured["suggestion"]
+        .as_str()
+        .unwrap()
+        .starts_with("Drop pid and window_id"));
 }
 
 /// Upper bound for one foreground input transaction: focus confirmation plus
@@ -7199,11 +7227,7 @@ impl Tool for ClickTool {
                     x = lx;
                     y = ly;
                 }
-                Ok(Err(e)) => {
-                    return ToolResult::error(format!(
-                        "desktop-frame coordinates could not be mapped into window {xid}: {e}"
-                    ))
-                }
+                Ok(Err(e)) => return desktop_frame_unmapped(xid, e),
                 Err(e) => return ToolResult::error(format!("Task error: {e}")),
             }
         }
@@ -10027,11 +10051,7 @@ impl Tool for ScrollTool {
                 match tokio::task::spawn_blocking(move || desktop_to_window_local(xid, x, y)).await
                 {
                     Ok(Ok(local)) => Some(local),
-                    Ok(Err(e)) => {
-                        return ToolResult::error(format!(
-                            "desktop-frame coordinates could not be mapped into window {xid}: {e}"
-                        ))
-                    }
+                    Ok(Err(e)) => return desktop_frame_unmapped(xid, e),
                     Err(e) => return ToolResult::error(format!("Task error: {e}")),
                 }
             }
@@ -10613,11 +10633,7 @@ impl Tool for DoubleClickTool {
                     x = lx;
                     y = ly;
                 }
-                Ok(Err(e)) => {
-                    return ToolResult::error(format!(
-                        "desktop-frame coordinates could not be mapped into window {xid}: {e}"
-                    ))
-                }
+                Ok(Err(e)) => return desktop_frame_unmapped(xid, e),
                 Err(e) => return ToolResult::error(format!("Task error: {e}")),
             }
         }
@@ -10904,11 +10920,7 @@ impl Tool for RightClickTool {
                     x = lx;
                     y = ly;
                 }
-                Ok(Err(e)) => {
-                    return ToolResult::error(format!(
-                        "desktop-frame coordinates could not be mapped into window {xid}: {e}"
-                    ))
-                }
+                Ok(Err(e)) => return desktop_frame_unmapped(xid, e),
                 Err(e) => return ToolResult::error(format!("Task error: {e}")),
             }
         }
@@ -11250,11 +11262,7 @@ impl Tool for DragTool {
                     to_x = tx;
                     to_y = ty;
                 }
-                Ok(Err(e)) => {
-                    return ToolResult::error(format!(
-                        "desktop-frame coordinates could not be mapped into window {xid}: {e}"
-                    ))
-                }
+                Ok(Err(e)) => return desktop_frame_unmapped(xid, e),
                 Err(e) => return ToolResult::error(format!("Task error: {e}")),
             }
         }
@@ -11844,11 +11852,7 @@ impl Tool for MouseButtonDownTool {
                     x = lx;
                     y = ly;
                 }
-                Ok(Err(e)) => {
-                    return ToolResult::error(format!(
-                        "desktop-frame coordinates could not be mapped into window {xid}: {e}"
-                    ))
-                }
+                Ok(Err(e)) => return desktop_frame_unmapped(xid, e),
                 Err(e) => return ToolResult::error(format!("Task error: {e}")),
             }
         }

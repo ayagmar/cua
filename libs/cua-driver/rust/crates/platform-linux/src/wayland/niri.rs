@@ -579,7 +579,7 @@ impl Rect {
         let (x, y, width, height) = (x.round(), y.round(), width.round(), height.round());
         let in_i32 = |v: f64| (f64::from(i32::MIN)..=f64::from(i32::MAX)).contains(&v);
         (in_i32(x) && in_i32(y) && width >= 1.0 && height >= 1.0 && in_i32(width) && in_i32(height))
-            .then(|| Self {
+            .then_some(Self {
                 x: x as i32,
                 y: y as i32,
                 width: width as u32,

@@ -12721,6 +12721,11 @@ impl Tool for GetDesktopStateTool {
                 } else {
                     None
                 };
+            // niri: the single output's frame, read before the capture and
+            // compared after it.
+            let niri_frame = (crate::wayland::is_wayland() && crate::wayland::niri::is_session())
+                .then(|| crate::wayland::niri::desktop_snapshot().map(|snapshot| snapshot.frame))
+                .transpose()?;
             let (native_png, overlay_capture) =
                 cursor_overlay::capture_exclusion::capture_excluding_overlays(
                     &crate::overlay_capture::OverlayExcluder,
@@ -12796,12 +12801,14 @@ impl Tool for GetDesktopStateTool {
                     "the Hyprland monitor layout changed during get_desktop_state; call it again"
                 );
                 frame.rebase_windows(&mut windows);
-            } else if crate::wayland::is_wayland() && crate::wayland::niri::is_session() {
+            } else if let Some(frame) = &niri_frame {
                 // niri window geometry is in layout coordinates; screenshot
                 // pixel (0, 0) is the single output's logical origin.
-                crate::wayland::niri::desktop_snapshot()?
-                    .frame
-                    .rebase_windows(&mut windows);
+                anyhow::ensure!(
+                    crate::wayland::niri::desktop_snapshot()?.frame == *frame,
+                    "the niri output layout changed during get_desktop_state; call it again"
+                );
+                frame.rebase_windows(&mut windows);
             }
             let capture_id = crate::capture_action_frame::publish_desktop(
                 &capture_service,

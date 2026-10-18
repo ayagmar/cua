@@ -34,9 +34,9 @@ const QUERY_TIMEOUT: Duration = Duration::from_secs(1);
 const REPLY_LIMIT: u64 = 1024 * 1024;
 /// Logical pixels of slack when comparing a fullscreen tile with its output.
 const FULLSCREEN_TOLERANCE: f64 = 1.0;
-/// The oldest sentinel fullscreen report that is still trusted; the
+/// How long a snapshot waits for the sentinel's next fullscreen report; the
 /// sentinel writes one every 100 ms.
-const SENTINEL_REPORT_MAX_AGE: Duration = Duration::from_secs(1);
+const SENTINEL_REPORT_TIMEOUT: Duration = Duration::from_millis(300);
 
 /// Connects without blocking past `timeout`: a wedged compositor stops
 /// accepting, and a full backlog would block a plain connect forever.
@@ -299,8 +299,8 @@ struct Desktop {
     sentinel: Option<Sentinel>,
 }
 
-/// The registered foreground sentinel and the fullscreen state of its latest
-/// recent report, if any.
+/// The registered foreground sentinel and, while it is focused, the
+/// fullscreen state it reported after the window list was read.
 #[derive(Clone, Copy, Debug)]
 struct Sentinel {
     window: TargetWindow,
@@ -319,30 +319,59 @@ pub(super) fn register_sentinel(sentinel: Option<(TargetWindow, PathBuf)>) {
         .unwrap_or_else(|poisoned| poisoned.into_inner()) = sentinel;
 }
 
-fn sentinel() -> Option<Sentinel> {
+/// Milliseconds since the epoch, the sentinel's report clock.
+fn report_clock() -> Duration {
+    let now = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap_or_default();
+    Duration::from_millis(now.as_millis() as u64)
+}
+
+/// The registered sentinel, given the window list read since `since`. Only a
+/// focused sentinel can certify occlusion, so only then does this wait for
+/// its report.
+fn sentinel(windows: &[Window], since: Duration) -> Option<Sentinel> {
     let (window, state) = SENTINEL
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
         .clone()?;
-    let now = SystemTime::now()
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .unwrap_or_default();
-    let fullscreen = std::fs::read_to_string(state)
-        .ok()
-        .and_then(|state| reported_fullscreen(&state, now));
+    let focused = windows
+        .iter()
+        .any(|candidate| candidate.id == window.native_id && candidate.is_focused);
+    let fullscreen = if focused {
+        fullscreen_since(&state, since, SENTINEL_REPORT_TIMEOUT)
+    } else {
+        None
+    };
     Some(Sentinel { window, fullscreen })
 }
 
-/// The fullscreen state the sentinel wrote, `{"at_ms":…,"fullscreen":…}`,
-/// unless it is older than [`SENTINEL_REPORT_MAX_AGE`] at `now` (since the
-/// epoch).
-fn reported_fullscreen(state: &str, now: Duration) -> Option<bool> {
-    let state: serde_json::Value = serde_json::from_str(state).ok()?;
-    let at = Duration::from_millis(state["at_ms"].as_u64()?);
-    if now.saturating_sub(at) > SENTINEL_REPORT_MAX_AGE {
-        return None;
+/// The fullscreen state the sentinel wrote to `state` at or after `since`,
+/// waiting up to `timeout` for that report. An older report says nothing
+/// about the window list read since.
+fn fullscreen_since(state: &Path, since: Duration, timeout: Duration) -> Option<bool> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let report = std::fs::read_to_string(state)
+            .ok()
+            .and_then(|state| fullscreen_report(&state));
+        if let Some((_, fullscreen)) = report.filter(|(at, _)| *at >= since) {
+            return Some(fullscreen);
+        }
+        if Instant::now() >= deadline {
+            return None;
+        }
+        std::thread::sleep(Duration::from_millis(10));
     }
-    state["fullscreen"].as_bool()
+}
+
+/// `{"at_ms":…,"fullscreen":…}` as the sentinel writes it.
+fn fullscreen_report(state: &str) -> Option<(Duration, bool)> {
+    let state: serde_json::Value = serde_json::from_str(state).ok()?;
+    Some((
+        Duration::from_millis(state["at_ms"].as_u64()?),
+        state["fullscreen"].as_bool()?,
+    ))
 }
 
 /// One desktop state from four requests. Each request is its own connection,
@@ -350,16 +379,19 @@ fn reported_fullscreen(state: &str, now: Duration) -> Option<bool> {
 /// changed in between, for example across a workspace switch.
 fn desktop() -> Result<Desktop, ObserverError> {
     for _ in 0..3 {
+        let started = report_clock();
         let windows: Vec<Window> = query("Windows")?;
-        let desktop = Desktop {
-            workspaces: query("Workspaces")?,
-            outputs: query("Outputs")?,
-            overview_open: query::<Overview>("OverviewState")?.is_open,
-            sentinel: sentinel(),
-            windows: query("Windows")?,
-        };
-        if desktop.windows == windows {
-            return Ok(desktop);
+        let workspaces = query("Workspaces")?;
+        let outputs = query("Outputs")?;
+        let overview_open = query::<Overview>("OverviewState")?.is_open;
+        if query::<Vec<Window>>("Windows")? == windows {
+            return Ok(Desktop {
+                sentinel: sentinel(&windows, started),
+                windows,
+                workspaces,
+                outputs,
+                overview_open,
+            });
         }
     }
     Err(ObserverError::new(
@@ -432,7 +464,8 @@ fn sentinel_occludes(sentinel: Option<&Sentinel>, tile: &Window) -> Result<Targe
              floating windows",
         )),
         None => Err(ObserverError::new(format!(
-            "niri sentinel reported no fullscreen state within {SENTINEL_REPORT_MAX_AGE:?}"
+            "niri sentinel sent no fullscreen report within {SENTINEL_REPORT_TIMEOUT:?} \
+             of the window list read"
         ))),
     }
 }
@@ -869,7 +902,7 @@ mod tests {
         assert!(classify(&desktop, target(20, 200))
             .unwrap_err()
             .to_string()
-            .contains("no fullscreen state"));
+            .contains("no fullscreen report"));
     }
 
     #[test]
@@ -897,10 +930,8 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let journal = directory.path().join("sentinel-events.jsonl");
         let state = directory.path().join("sentinel-state.json");
-        let now = SystemTime::now()
-            .duration_since(SystemTime::UNIX_EPOCH)
-            .unwrap()
-            .as_millis();
+        let since = report_clock();
+        let now = since.as_millis();
         std::fs::write(
             &journal,
             format!("{{\"kind\":\"heartbeat\",\"at_ms\":{now}}}\n"),
@@ -913,7 +944,7 @@ mod tests {
             fullscreen(window(10, 100, false, true)),
             window(20, 200, true, false),
         ]);
-        posture.sentinel = sentinel();
+        posture.sentinel = sentinel(&posture.windows, since);
         register_sentinel(None);
         assert_eq!(
             classify(&posture, target(20, 200)).unwrap(),
@@ -922,16 +953,33 @@ mod tests {
     }
 
     #[test]
-    fn sentinel_fullscreen_report_must_be_recent() {
-        let now = Duration::from_millis(10_000);
-        let state = r#"{"at_ms":9900,"fullscreen":true}"#;
-        assert_eq!(reported_fullscreen(state, now), Some(true));
+    fn sentinel_fullscreen_report_must_follow_the_window_list_read() {
+        let directory = tempfile::tempdir().unwrap();
+        let state = directory.path().join("sentinel-state.json");
+        let since = Duration::from_millis(10_000);
+        let timeout = Duration::from_millis(30);
+        // A report from before the read may predate an unfullscreen.
+        std::fs::write(&state, r#"{"at_ms":9999,"fullscreen":true}"#).unwrap();
+        assert_eq!(fullscreen_since(&state, since, timeout), None);
+        std::fs::write(&state, r#"{"at_ms":10000,"fullscreen":false}"#).unwrap();
+        assert_eq!(fullscreen_since(&state, since, timeout), Some(false));
+        std::fs::write(&state, r#"{"at_ms":10000}"#).unwrap();
+        assert_eq!(fullscreen_since(&state, since, timeout), None);
+
+        // The snapshot waits for the next report.
+        std::fs::write(&state, r#"{"at_ms":9999,"fullscreen":false}"#).unwrap();
+        let writer = {
+            let state = state.clone();
+            std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(20));
+                std::fs::write(state, r#"{"at_ms":10100,"fullscreen":true}"#).unwrap();
+            })
+        };
         assert_eq!(
-            reported_fullscreen(state, now + SENTINEL_REPORT_MAX_AGE),
-            None
+            fullscreen_since(&state, since, SENTINEL_REPORT_TIMEOUT),
+            Some(true)
         );
-        assert_eq!(reported_fullscreen(r#"{"at_ms":9900}"#, now), None);
-        assert_eq!(reported_fullscreen("", now), None);
+        writer.join().unwrap();
     }
 
     #[test]

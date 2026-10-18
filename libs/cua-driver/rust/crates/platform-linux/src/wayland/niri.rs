@@ -1377,10 +1377,7 @@ fn logind_session(pid: libc::pid_t) -> Result<Option<String>> {
     }
     let cmdline = std::fs::read(format!("/proc/{pid}/cmdline"))
         .with_context(|| format!("read niri's command line (pid {pid})"))?;
-    let session = if cmdline
-        .split(|&byte| byte == 0)
-        .any(|arg| arg == b"--session")
-    {
+    let session = if session_instance(&cmdline) {
         let environ = std::fs::read(format!("/proc/{pid}/environ"))
             .with_context(|| format!("read niri's environment (pid {pid})"))?;
         Some(session_id(&environ)?)

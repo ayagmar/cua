@@ -748,6 +748,7 @@ pub struct Window {
     pub pid: Option<u32>,
     pub title: String,
     pub app_id: String,
+    pub workspace: Option<u64>,
     pub focused: bool,
     /// Focus recency among all windows, higher is more recent and the
     /// focused window highest. niri reports no stacking order; this is the
@@ -869,6 +870,7 @@ impl Scene {
                     .filter(|pid| *pid > 0),
                 title: window.title.clone().unwrap_or_default(),
                 app_id: window.app_id.clone().unwrap_or_default(),
+                workspace: window.workspace_id,
                 focused: window.is_focused,
                 focus_rank: self
                     .windows
@@ -1382,6 +1384,9 @@ struct LayoutWatch {
     /// A window the driver itself is focusing: the focus events naming it
     /// are expected. Focus moves no window.
     focusing: Option<u64>,
+    /// The focused window's workspace, already active on its output: when
+    /// focus moves there from another output, niri reports it activated.
+    focusing_workspace: Option<u64>,
 }
 
 impl LayoutWatch {
@@ -1389,6 +1394,7 @@ impl LayoutWatch {
         Self {
             layouts: HashMap::new(),
             focusing: None,
+            focusing_workspace: None,
         }
     }
 
@@ -1419,6 +1425,10 @@ impl LayoutWatch {
             "WindowFocusChanged" => {
                 self.focusing.is_none()
                     || body.get("id").and_then(serde_json::Value::as_u64) != self.focusing
+            }
+            "WorkspaceActivated" => {
+                self.focusing_workspace.is_none()
+                    || body.get("id").and_then(serde_json::Value::as_u64) != self.focusing_workspace
             }
             "WorkspaceActiveWindowChanged" => {
                 self.focusing.is_none()
@@ -1603,6 +1613,7 @@ pub fn gate_pointer(window_id: u64, points: &[(i32, i32)], activate: bool) -> Re
     })?;
     if activate {
         quiet.watch.focusing = Some(window_id);
+        quiet.watch.focusing_workspace = window.workspace;
         activate_in(&mut ipc(), window_id, None, FOCUS_CONFIRM_TIMEOUT)
             .map_err(input_unavailable)?;
     }
@@ -2955,6 +2966,11 @@ mod tests {
         assert!(watch.moves(
             &json!({"WorkspaceActiveWindowChanged": {"workspace_id": 1, "active_window_id": 8}})
         ));
+        // Focus moving to the target's (already active) workspace on another
+        // output is expected; another workspace is not.
+        watch.focusing_workspace = Some(4);
+        assert!(!watch.moves(&json!({"WorkspaceActivated": {"id": 4, "focused": true}})));
+        assert!(watch.moves(&json!({"WorkspaceActivated": {"id": 3, "focused": true}})));
     }
 
     #[test]

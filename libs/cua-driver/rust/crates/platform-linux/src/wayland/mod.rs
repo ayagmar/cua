@@ -1416,10 +1416,22 @@ fn is_no_vptr(err: &anyhow::Error) -> bool {
 /// KDE/GNOME input recovery flows.
 fn with_libei_fallback<T>(
     f: impl FnOnce() -> anyhow::Result<T>,
+    fallback: impl FnOnce() -> anyhow::Result<T>,
+) -> anyhow::Result<T> {
+    libei_recovery(is_wayland() && niri::is_session(), f, fallback)
+}
+
+/// [`with_libei_fallback`] for a session known to be (or not be) niri.
+/// libei finds its own EIS socket or portal, which nothing ties to the
+/// attested niri, so under niri the failure is refused instead.
+fn libei_recovery<T>(
+    on_niri: bool,
+    f: impl FnOnce() -> anyhow::Result<T>,
     #[allow(unused_variables)] fallback: impl FnOnce() -> anyhow::Result<T>,
 ) -> anyhow::Result<T> {
     match f() {
         Ok(v) => Ok(v),
+        Err(e) if on_niri && is_no_vptr(&e) => Err(niri_refuses_libei(e.to_string())),
         Err(e) if is_no_vptr(&e) => {
             #[cfg(feature = "portal-input")]
             {
@@ -2831,9 +2843,24 @@ fn key_to_keysym(key: &str) -> String {
 /// virtual-keyboard shell-out failed (`wtype_err`), try the libei `run` on a
 /// portal-input build, otherwise surface the original wtype failure.
 fn with_wtype_libei_fallback(
+    run: impl FnOnce() -> anyhow::Result<()>,
+    wtype_err: Result<String, std::io::Error>,
+) -> anyhow::Result<()> {
+    wtype_recovery(is_wayland() && niri::is_session(), run, wtype_err)
+}
+
+/// [`with_wtype_libei_fallback`] for a session known to be (or not be) niri.
+fn wtype_recovery(
+    on_niri: bool,
     #[allow(unused_variables)] run: impl FnOnce() -> anyhow::Result<()>,
     wtype_err: Result<String, std::io::Error>,
 ) -> anyhow::Result<()> {
+    if on_niri {
+        return Err(niri_refuses_libei(match wtype_err {
+            Ok(stderr) => format!("wtype failed: {stderr}"),
+            Err(e) => format!("wtype unavailable: {e}"),
+        }));
+    }
     #[cfg(feature = "portal-input")]
     {
         match wtype_err {
@@ -2854,6 +2881,15 @@ fn with_wtype_libei_fallback(
             Err(e) => anyhow::bail!("wtype unavailable: {e}"),
         }
     }
+}
+
+/// Under niri, input goes only to the attested compositor: a failed
+/// attested route is refused, keeping its detail, rather than recovered.
+fn niri_refuses_libei(detail: String) -> anyhow::Error {
+    anyhow::anyhow!(
+        "foreground_unavailable: {}; under niri the libei/portal fallback is refused because it is not attested",
+        detail.trim_end()
+    )
 }
 
 // Stubs for the no-feature build: the dispatch seams never call these (the
@@ -4234,6 +4270,31 @@ mod tests {
         assert!(!super::pointer_reaches(0, 0, 1280, 720, 100, 750));
         assert!(!super::pointer_reaches(0, 0, 1280, 720, -1, 10));
         assert!(super::pointer_reaches(-100, 0, 2773, 1080, -100, 0));
+    }
+
+    #[test]
+    fn niri_never_recovers_input_through_libei() {
+        let typed = super::wtype_recovery(
+            true,
+            || panic!("libei must not run under niri"),
+            Ok("failed to connect\n".to_string()),
+        );
+        assert_eq!(
+            typed.unwrap_err().to_string(),
+            "foreground_unavailable: wtype failed: failed to connect; under niri the libei/portal fallback is refused because it is not attested"
+        );
+        let pointed: anyhow::Result<()> = super::libei_recovery(
+            true,
+            || anyhow::bail!("{}: none bound", super::NO_VPTR_MARKER),
+            || panic!("libei must not run under niri"),
+        );
+        assert_eq!(
+            pointed.unwrap_err().to_string(),
+            format!(
+                "foreground_unavailable: {}: none bound; under niri the libei/portal fallback is refused because it is not attested",
+                super::NO_VPTR_MARKER
+            )
+        );
     }
 
     #[test]

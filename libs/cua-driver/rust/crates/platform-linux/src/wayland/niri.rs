@@ -981,16 +981,13 @@ fn input_unavailable(error: anyhow::Error) -> anyhow::Error {
     foreground_unavailable(format!("{error:#}"))
 }
 
-/// Focus exactly `id` and read the focus back. niri answers `Handled` even
-/// for an unknown id, and reports no focused window while the overview, a
-/// layer-shell surface or the lock screen holds focus, so the read-back is
-/// the guarantee.
-fn activate_in<C: FnMut(Instant) -> Result<UnixStream>>(
+/// Check that `id` can take focus for `pid`. Returns the window when it is
+/// not focused yet, `None` when it already is.
+fn focus_target<C: FnMut(Instant) -> Result<UnixStream>>(
     ipc: &mut Ipc<C>,
     id: u64,
     pid: Option<u32>,
-    confirm: Duration,
-) -> Result<()> {
+) -> Result<Option<IpcWindow>> {
     let overview: Overview = ipc.query(Request::OverviewState)?;
     if overview.is_open {
         return Err(foreground_unavailable(
@@ -999,7 +996,7 @@ fn activate_in<C: FnMut(Instant) -> Result<UnixStream>>(
     }
     let windows: Vec<IpcWindow> = ipc.query(Request::Windows)?;
     let target = windows
-        .iter()
+        .into_iter()
         .find(|window| window.id == id)
         .ok_or_else(|| foreground_unavailable(format!("niri window {id} no longer exists")))?;
     let target_pid = target.pid.and_then(|pid| u32::try_from(pid).ok());
@@ -1011,12 +1008,33 @@ fn activate_in<C: FnMut(Instant) -> Result<UnixStream>>(
             )));
         }
     }
-    if target.is_focused {
-        return Ok(());
+    Ok((!target.is_focused).then_some(target))
+}
+
+/// Focus exactly `id` and read the focus back. niri answers `Handled` even
+/// for an unknown id, and reports no focused window while the overview, a
+/// layer-shell surface or the lock screen holds focus, so the read-back is
+/// the guarantee.
+fn activate_in<C: FnMut(Instant) -> Result<UnixStream>>(
+    ipc: &mut Ipc<C>,
+    id: u64,
+    pid: Option<u32>,
+    confirm: Duration,
+) -> Result<()> {
+    match focus_target(ipc, id, pid)? {
+        None => Ok(()),
+        Some(target) => focus_window(ipc, id, target.pid, confirm),
     }
-    let reported_pid = target.pid;
+}
+
+fn focus_window<C: FnMut(Instant) -> Result<UnixStream>>(
+    ipc: &mut Ipc<C>,
+    id: u64,
+    pid: Option<i32>,
+    confirm: Duration,
+) -> Result<()> {
     ipc.action(focus_window_action(id))?;
-    confirm_focus(ipc, id, reported_pid, confirm)
+    confirm_focus(ipc, id, pid, confirm)
 }
 
 fn confirm_focus<C: FnMut(Instant) -> Result<UnixStream>>(
@@ -1051,8 +1069,9 @@ pub fn activate(id: u64, pid: Option<u32>) -> Result<()> {
 
 /// Briefly focus one niri window for `pid`, run `body`, then restore the
 /// previously focused window, or the previously focused workspace when no
-/// window had focus. Focusing a window on another workspace switches to it;
-/// restoring the prior window switches back.
+/// window had focus, and each output's previously active workspace.
+/// Focusing a window on another workspace switches to it; the restore
+/// switches back, also after a focus niri did not confirm.
 pub fn with_focused_window<T>(pid: u32, id: u64, body: impl FnOnce() -> Result<T>) -> Result<T> {
     with_focused_window_in(&mut ipc(), pid, id, FOCUS_CONFIRM_TIMEOUT, body)
 }
@@ -1065,36 +1084,82 @@ fn with_focused_window_in<C: FnMut(Instant) -> Result<UnixStream>, T>(
     body: impl FnOnce() -> Result<T>,
 ) -> Result<T> {
     let prior = ipc.focused_window().map_err(input_unavailable)?;
-    let prior_workspace = if prior.is_none() {
-        let workspaces: Vec<IpcWorkspace> =
-            ipc.query(Request::Workspaces).map_err(input_unavailable)?;
-        workspaces
-            .into_iter()
-            .find(|workspace| workspace.is_focused)
-            .map(|workspace| workspace.id)
-    } else {
-        None
+    let workspaces: Vec<IpcWorkspace> =
+        ipc.query(Request::Workspaces).map_err(input_unavailable)?;
+    let Some(target) = focus_target(ipc, id, Some(pid)).map_err(input_unavailable)? else {
+        return body();
     };
-    activate_in(ipc, id, Some(pid), confirm).map_err(input_unavailable)?;
-    let result = body();
-    let restore = match (&prior, prior_workspace) {
-        (Some(prior), _) if prior.id == id => Ok(()),
-        (Some(prior), _) => ipc
-            .action(focus_window_action(prior.id))
-            .and_then(|()| confirm_focus(ipc, prior.id, prior.pid, confirm))
-            .with_context(|| format!("niri could not restore prior window {}", prior.id)),
-        (None, Some(workspace)) => restore_workspace(ipc, workspace, confirm)
-            .with_context(|| format!("niri could not restore prior workspace {workspace}")),
-        (None, None) => Ok(()),
-    };
+    // Once FocusWindow is sent, focus may have moved even when niri does not
+    // confirm it, so the restore runs either way.
+    let result = focus_window(ipc, id, target.pid, confirm)
+        .map_err(input_unavailable)
+        .and_then(|()| body());
+    let restore = restore_focus(ipc, prior.as_ref(), &workspaces, &target, confirm);
     match (result, restore) {
         (Ok(value), Ok(())) => Ok(value),
         (Err(error), Ok(())) => Err(error),
         (Ok(_), Err(error)) => Err(error),
-        (Err(error), Err(restore)) => Err(error.context(format!(
-            "the prior niri focus also could not be restored: {restore:#}"
-        ))),
+        (Err(error), Err(restore)) => {
+            let note =
+                format!("{error}; the prior niri focus also could not be restored: {restore:#}");
+            Err(error.context(note))
+        }
     }
+}
+
+/// Undo what focusing `target` changed: the active window of its workspace,
+/// the active workspace of every output, then the focused window or
+/// workspace.
+fn restore_focus<C: FnMut(Instant) -> Result<UnixStream>>(
+    ipc: &mut Ipc<C>,
+    prior: Option<&IpcWindow>,
+    before: &[IpcWorkspace],
+    target: &IpcWindow,
+    confirm: Duration,
+) -> Result<()> {
+    let prior_id = prior.map(|prior| prior.id);
+    if let Some(active) = before
+        .iter()
+        .find(|workspace| Some(workspace.id) == target.workspace_id)
+        .and_then(|workspace| workspace.active_window_id)
+        .filter(|active| *active != target.id && Some(*active) != prior_id)
+    {
+        ipc.action(focus_window_action(active))
+            .with_context(|| format!("niri could not restore active window {active}"))?;
+    }
+    let now: Vec<IpcWorkspace> = ipc.query(Request::Workspaces)?;
+    for was in before
+        .iter()
+        .filter(|was| was.is_active && !was.is_focused)
+        .filter(|was| now.iter().any(|w| w.id == was.id && !w.is_active))
+    {
+        ipc.action(focus_workspace_action(was.id))
+            .with_context(|| format!("niri could not restore workspace {}", was.id))?;
+    }
+    match (prior, before.iter().find(|workspace| workspace.is_focused)) {
+        (Some(prior), _) => focus_window(ipc, prior.id, prior.pid, confirm)
+            .with_context(|| format!("niri could not restore prior window {}", prior.id))?,
+        (None, Some(workspace)) => restore_workspace(ipc, workspace.id, confirm)
+            .with_context(|| format!("niri could not restore prior workspace {}", workspace.id))?,
+        (None, None) => {}
+    }
+    let now: Vec<IpcWorkspace> = ipc.query(Request::Workspaces)?;
+    if let Some(was) = before
+        .iter()
+        .filter(|was| was.is_active)
+        .find(|was| now.iter().any(|w| w.id == was.id && !w.is_active))
+    {
+        bail!(
+            "niri did not restore workspace {} on output {}",
+            was.id,
+            was.output.as_deref().unwrap_or("unknown")
+        );
+    }
+    Ok(())
+}
+
+fn focus_workspace_action(id: u64) -> serde_json::Value {
+    serde_json::json!({ "FocusWorkspace": { "reference": { "Id": id } } })
 }
 
 fn restore_workspace<C: FnMut(Instant) -> Result<UnixStream>>(
@@ -1102,7 +1167,7 @@ fn restore_workspace<C: FnMut(Instant) -> Result<UnixStream>>(
     workspace: u64,
     confirm: Duration,
 ) -> Result<()> {
-    ipc.action(serde_json::json!({ "FocusWorkspace": { "reference": { "Id": workspace } } }))?;
+    ipc.action(focus_workspace_action(workspace))?;
     let deadline = Instant::now() + confirm;
     loop {
         let workspaces: Vec<IpcWorkspace> = ipc.query(Request::Workspaces)?;
@@ -1511,6 +1576,9 @@ mod tests {
         ignore_focus: bool,
         /// FocusWindow on these ids changes nothing (a window that closed).
         ignore_focus_on: Vec<u64>,
+        /// FocusWindow on these ids switches their workspace, but keyboard
+        /// focus stays elsewhere (a layer-shell surface took it).
+        focus_taken_on: Vec<u64>,
         requests: Vec<String>,
     }
 
@@ -1530,20 +1598,62 @@ mod tests {
                     let action = &request["Action"];
                     if let Some(id) = action["FocusWindow"]["id"].as_u64() {
                         if !self.ignore_focus && !self.ignore_focus_on.contains(&id) {
-                            for window in &mut self.windows {
-                                window["is_focused"] = json!(window["id"] == id);
+                            let workspace = self
+                                .windows
+                                .iter()
+                                .find(|w| w["id"] == id)
+                                .map(|w| w["workspace_id"].clone());
+                            if let Some(workspace) = workspace.and_then(|w| w.as_u64()) {
+                                self.show_workspace(workspace, Some(id));
+                            }
+                            if self.focus_taken_on.contains(&id) {
+                                for window in &mut self.windows {
+                                    window["is_focused"] = json!(false);
+                                }
                             }
                         }
                     } else if let Some(id) = action["FocusWorkspace"]["reference"]["Id"].as_u64() {
-                        for workspace in &mut self.workspaces {
-                            workspace["is_focused"] = json!(workspace["id"] == id);
-                        }
+                        let active = self
+                            .workspaces
+                            .iter()
+                            .find(|w| w["id"] == id)
+                            .and_then(|w| w["active_window_id"].as_u64());
+                        self.show_workspace(id, active);
                     } else {
                         return json!({"Err": "error parsing request"});
                     }
                     json!({"Ok": "Handled"})
                 }
             }
+        }
+
+        /// niri's focus change: the workspace becomes active on its output
+        /// and focused, and `window` its active, focused window.
+        fn show_workspace(&mut self, id: u64, window: Option<u64>) {
+            let output = self
+                .workspaces
+                .iter()
+                .find(|w| w["id"] == id)
+                .map(|w| w["output"].clone());
+            for workspace in &mut self.workspaces {
+                let this = workspace["id"] == id;
+                if Some(&workspace["output"]) == output.as_ref() {
+                    workspace["is_active"] = json!(this);
+                }
+                workspace["is_focused"] = json!(this);
+                if this && window.is_some() {
+                    workspace["active_window_id"] = json!(window);
+                }
+            }
+            for w in &mut self.windows {
+                w["is_focused"] = json!(window.is_some() && w["id"] == json!(window));
+            }
+        }
+
+        fn active(&self, id: u64) -> bool {
+            self.workspaces
+                .iter()
+                .any(|w| w["id"] == id && w["is_active"] == true)
         }
 
         fn focused(&self) -> Option<u64> {
@@ -2251,10 +2361,62 @@ mod tests {
             || Err::<(), _>(anyhow!("wtype failed")),
         )
         .unwrap_err();
-        assert!(format!("{error:#}").starts_with(
-            "the prior niri focus also could not be restored: niri could not restore prior window 5"
+        assert!(error.to_string().starts_with(
+            "wtype failed; the prior niri focus also could not be restored: niri could not restore prior window 5"
         ));
         assert_eq!(error.root_cause().to_string(), "wtype failed");
+    }
+
+    #[test]
+    fn focus_niri_did_not_confirm_is_still_undone() {
+        let fake = focus_fixture();
+        fake.lock().unwrap().focus_taken_on = vec![7];
+        let error = with_focused_window_in(
+            &mut fake_ipc(&fake),
+            107,
+            7,
+            Duration::from_millis(50),
+            || Ok(()),
+        )
+        .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "foreground_unavailable: niri did not confirm focus on window 7 (focused: none)"
+        );
+        let fake = fake.lock().unwrap();
+        assert!(fake.active(1) && !fake.active(2));
+        assert_eq!(fake.focused(), Some(5));
+    }
+
+    #[test]
+    fn every_output_gets_its_active_workspace_back() {
+        let mut prior = tiled(5, 1, (402.0, 448.0));
+        prior["is_focused"] = json!(true);
+        let fake = Arc::new(Mutex::new(Fake {
+            windows: vec![prior, floating(7, 4, (100.0, 60.0), (300, 200))],
+            workspaces: vec![
+                workspace(1, "left", true, Some(5)),
+                workspace(3, "right", true, None),
+                workspace(4, "right", false, Some(7)),
+            ],
+            ..Fake::default()
+        }));
+        fake.lock().unwrap().workspaces[1]["is_focused"] = json!(false);
+        let seen = with_focused_window_in(
+            &mut fake_ipc(&fake),
+            107,
+            7,
+            Duration::from_millis(100),
+            || {
+                let fake = fake.lock().unwrap();
+                Ok((fake.focused(), fake.active(4)))
+            },
+        )
+        .unwrap();
+        assert_eq!(seen, (Some(7), true));
+        let fake = fake.lock().unwrap();
+        assert!(fake.active(1) && fake.active(3) && !fake.active(4));
+        assert_eq!(fake.focused(), Some(5));
     }
 
     #[test]
@@ -2266,6 +2428,7 @@ mod tests {
             fake.workspaces.push(workspace(3, "winit", false, None));
             for ws in &mut fake.workspaces {
                 ws["is_focused"] = json!(ws["id"] == 3);
+                ws["is_active"] = json!(ws["id"] == 3);
             }
         }
         with_focused_window_in(

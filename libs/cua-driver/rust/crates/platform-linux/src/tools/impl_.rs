@@ -96,6 +96,9 @@ fn topmost_window_at(
 fn pid_fallback_window_resolver() -> cua_driver_core::window_target::PidFallbackWindowResolver {
     Arc::new(|pid| {
         let pid = u32::try_from(pid).ok()?;
+        if crate::wayland::is_wayland() && crate::wayland::niri::is_session() {
+            return crate::wayland::niri::window_in_use(pid);
+        }
         let windows: Vec<crate::x11::WindowInfo> = crate::wayland::list_windows_dispatch(Some(pid))
             .into_iter()
             .filter(|w| w.pid == Some(pid))

@@ -970,6 +970,21 @@ pub fn window_for_pid(pid: u32) -> Option<Window> {
     owned.next().is_none().then_some(first)
 }
 
+/// The window a pid-only keyboard action means: the pid's on-screen window
+/// focused most recently (the focused one first). This is focus recency,
+/// not stacking, so it is used only to pick a keyboard target.
+pub fn window_in_use(pid: u32) -> Option<u64> {
+    pick_window_in_use(&list_windows().ok()?, pid)
+}
+
+fn pick_window_in_use(windows: &[Window], pid: u32) -> Option<u64> {
+    windows
+        .iter()
+        .filter(|window| window.pid == Some(pid) && window.on_screen)
+        .max_by_key(|window| window.focus_rank)
+        .map(|window| window.id)
+}
+
 pub fn version() -> Result<String> {
     ipc().query(Request::Version)
 }
@@ -2252,6 +2267,20 @@ mod tests {
         );
         dialog["is_focused"] = json!(true);
         assert!(rank(vec![main.clone(), dialog.clone()], 7) > rank(vec![main, dialog], 5));
+    }
+
+    #[test]
+    fn a_pid_only_keyboard_action_goes_to_the_window_in_use() {
+        // A main window focused at 805 s and its focused floating dialog.
+        let main = tiled(5, 1, (402.0, 448.0));
+        let mut dialog = floating(7, 1, (100.0, 60.0), (300, 200));
+        dialog["pid"] = json!(105);
+        dialog["is_focused"] = json!(true);
+        let mut scene = one_output(vec![main, dialog]);
+        scene.workspaces[0].active_window_id = Some(5);
+        let windows = scene.windows().unwrap();
+        assert_eq!(pick_window_in_use(&windows, 105), Some(7));
+        assert_eq!(pick_window_in_use(&windows, 999), None);
     }
 
     #[test]

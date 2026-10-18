@@ -3737,7 +3737,8 @@ fn niri_window_info(window: niri::Window) -> WindowInfo {
         app_name: window.app_id,
         title: window.title,
         is_on_screen: window.on_screen,
-        z_index: Some(window.focus_rank),
+        // niri reports no stacking order; focus recency is not one.
+        z_index: None,
         x,
         y,
         width,

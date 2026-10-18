@@ -2138,6 +2138,21 @@ fn event_time_ms() -> u32 {
         .clamp(1, u32::MAX as u128) as u32
 }
 
+/// On niri, run window-addressed input under [`with_target_foreground`], so
+/// the prior focus comes back afterwards as it does for `click` and keys.
+/// Other compositors run `body` as before: their double and right clicks,
+/// scrolls, drags and hotkeys activate the target and leave it focused.
+pub fn restoring_niri_focus<T>(
+    pid: u32,
+    window_id: u64,
+    body: impl FnOnce() -> anyhow::Result<T>,
+) -> anyhow::Result<T> {
+    if is_wayland() && niri::is_session() {
+        return with_target_foreground(pid, window_id, body);
+    }
+    body()
+}
+
 /// Click a native Wayland toplevel identified by its `window_id` (the
 /// foreign-toplevel protocol id from `list_windows`) at output-relative
 /// `(x, y)`, with `button` (1/2/3 = left/middle/right) emitted `count` times.

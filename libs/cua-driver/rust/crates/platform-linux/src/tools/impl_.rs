@@ -9378,7 +9378,10 @@ impl Tool for HotkeyTool {
                     // state-mask path. window_id is irrelevant once focused.
                     let mut combo: Vec<String> = mods_for_wayland.clone();
                     combo.push(key_for_wayland.clone());
-                    return crate::wayland::hotkey(xid, &combo).map(|()| KeyRoute::Synthetic);
+                    return crate::wayland::restoring_niri_focus(pid, xid, || {
+                        crate::wayland::hotkey(xid, &combo)
+                    })
+                    .map(|()| KeyRoute::Synthetic);
                 }
                 let m: Vec<&str> = mods.iter().map(String::as_str).collect();
                 // foreground: activate the target first, then inject the accelerator
@@ -10279,7 +10282,9 @@ impl Tool for ScrollTool {
             };
             let ticks = wheel_ticks(amount, by, crate::wayland::niri::is_session());
             let result = tokio::task::spawn_blocking(move || {
-                crate::wayland::scroll_at(xid, output_point, &direction_for_wayland, ticks)
+                crate::wayland::restoring_niri_focus(pid, xid, || {
+                    crate::wayland::scroll_at(xid, output_point, &direction_for_wayland, ticks)
+                })
             })
             .await;
             return match result {
@@ -10346,7 +10351,9 @@ impl Tool for ScrollTool {
         let amount_u32 = amount as u32;
         let result = tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
             if crate::wayland::wayland_input_enabled() {
-                return crate::wayland::scroll(xid, &direction_for_wayland, amount_u32);
+                return crate::wayland::restoring_niri_focus(pid, xid, || {
+                    crate::wayland::scroll(xid, &direction_for_wayland, amount_u32)
+                });
             }
             // foreground: activate the window, then scroll, then restore — for
             // surfaces that only route wheel events to the active window.
@@ -10559,8 +10566,10 @@ impl Tool for DoubleClickTool {
                             }
                             if crate::wayland::wayland_input_enabled() {
                                 let (output_x, output_y) = wayland_point.unwrap_or((lxi, lyi));
-                                return crate::wayland::click(xid, output_x, output_y, 2, 1)
-                                    .map(|()| PointerRoute::Wayland);
+                                return crate::wayland::restoring_niri_focus(pid, xid, || {
+                                    crate::wayland::click(xid, output_x, output_y, 2, 1)
+                                })
+                                .map(|()| PointerRoute::Wayland);
                             }
                             if delivery.is_foreground() {
                                 return crate::input::with_x11_foreground(xid, 80, || {
@@ -10669,8 +10678,10 @@ impl Tool for DoubleClickTool {
             }
             if crate::wayland::wayland_input_enabled() {
                 let (output_x, output_y) = wayland_output_point.unwrap_or((xi, yi));
-                return crate::wayland::click(xid, output_x, output_y, 2, 1)
-                    .map(|()| PointerRoute::Wayland);
+                return crate::wayland::restoring_niri_focus(pid, xid, || {
+                    crate::wayland::click(xid, output_x, output_y, 2, 1)
+                })
+                .map(|()| PointerRoute::Wayland);
             }
             if delivery.is_foreground() {
                 return crate::input::with_x11_foreground(xid, 80, || {
@@ -10846,8 +10857,10 @@ impl Tool for RightClickTool {
                             }
                             if crate::wayland::wayland_input_enabled() {
                                 let (output_x, output_y) = wayland_point.unwrap_or((lxi, lyi));
-                                return crate::wayland::click(xid, output_x, output_y, 1, 3)
-                                    .map(|()| PointerRoute::Wayland);
+                                return crate::wayland::restoring_niri_focus(pid, xid, || {
+                                    crate::wayland::click(xid, output_x, output_y, 1, 3)
+                                })
+                                .map(|()| PointerRoute::Wayland);
                             }
                             if delivery.is_foreground() {
                                 return crate::input::with_x11_foreground(xid, 80, || {
@@ -10956,8 +10969,10 @@ impl Tool for RightClickTool {
             }
             if crate::wayland::wayland_input_enabled() {
                 let (output_x, output_y) = wayland_output_point.unwrap_or((xi, yi));
-                return crate::wayland::click(xid, output_x, output_y, 1, 3)
-                    .map(|()| PointerRoute::Wayland);
+                return crate::wayland::restoring_niri_focus(pid, xid, || {
+                    crate::wayland::click(xid, output_x, output_y, 1, 3)
+                })
+                .map(|()| PointerRoute::Wayland);
             }
             if delivery.is_foreground() {
                 return crate::input::with_x11_foreground(xid, 80, || {
@@ -11473,14 +11488,16 @@ impl Tool for DragTool {
                     (to_x.round() as i32, to_y.round() as i32),
                 ));
                 tokio::task::spawn_blocking(move || {
-                    crate::wayland::drag(
-                        xid,
-                        (fxi, fyi),
-                        (txi, tyi),
-                        steps_u32,
-                        duration_ms,
-                        button,
-                    )
+                    crate::wayland::restoring_niri_focus(pid, xid, || {
+                        crate::wayland::drag(
+                            xid,
+                            (fxi, fyi),
+                            (txi, tyi),
+                            steps_u32,
+                            duration_ms,
+                            button,
+                        )
+                    })
                 })
             };
             let ((from_output_x, from_output_y), (to_output_x, to_output_y)) = wayland_points

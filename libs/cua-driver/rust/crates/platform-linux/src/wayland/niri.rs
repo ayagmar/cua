@@ -1548,11 +1548,13 @@ impl LayoutWatch {
             | "WorkspaceUrgencyChanged"
             | "KeyboardLayoutsChanged"
             | "KeyboardLayoutSwitched"
-            | "ConfigLoaded"
             | "ScreenshotCaptured"
             | "CastsChanged"
             | "CastStartedOrChanged"
             | "CastStopped" => None,
+            // A reload can move tiled columns (struts, gaps, centering) and
+            // change animation lengths without any other event.
+            "ConfigLoaded" => Some(Change::Moved),
             "WindowFocusChanged" => Some(Change::Focus(id("id"))),
             "WorkspaceActivated" => Some(Change::Activated(id("id"))),
             "WorkspaceActiveWindowChanged" => Some(Change::Active(id("active_window_id"))),
@@ -3687,6 +3689,19 @@ mod tests {
     }
 
     // ── Settling ────────────────────────────────────────────────────────────
+
+    #[test]
+    fn a_config_reload_counts_as_a_layout_change() {
+        // A reload can move tiled columns (struts, gaps, centering) or
+        // lengthen animations past the settle period, with no other event.
+        let mut watch = LayoutWatch::default();
+        for event in [
+            json!({"ConfigLoaded": {"failed": false}}),
+            json!({"ConfigLoaded": {"failed": true}}),
+        ] {
+            assert_eq!(watch.change(&event), Some(Change::Moved), "{event}");
+        }
+    }
 
     #[test]
     fn title_changes_do_not_count_as_layout_changes() {

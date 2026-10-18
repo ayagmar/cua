@@ -10,8 +10,8 @@
 //! (`tile_pos_in_workspace_view`): a tiled window's place depends on the
 //! view's scroll position, which IPC does not report. A tiled window's
 //! screenshot is therefore its whole output, and its window coordinates are
-//! pixels of that screenshot while the layout stays as captured (see
-//! [`OutputFrame`]). IPC positions also omit niri's animation offset, so
+//! pixels of that screenshot while niri reports no layout change, for at
+//! most [`FRAME_MAX_AGE`] (see [`OutputFrame`]). IPC positions also omit niri's animation offset, so
 //! pointer and crop routes wait until the layout has been quiet for a while
 //! (see [`History`]).
 
@@ -50,6 +50,10 @@ const SETTLE_QUIET: Duration = Duration::from_secs(1);
 const SETTLE_LIMIT: Duration = Duration::from_secs(4);
 /// Recent window-local to layout translations kept for the pointer gate.
 const MAX_AIMS: usize = 64;
+/// How long a tiled window's output screenshot stays usable for pointer
+/// input. niri scrolls a view without reporting it (see [`Shown`]), so an
+/// unchanged layout proves less the older the screenshot is.
+pub const FRAME_MAX_AGE: Duration = Duration::from_secs(60);
 
 // ── Session ──────────────────────────────────────────────────────────────────
 
@@ -1984,9 +1988,11 @@ fn pointer_admission(
 
 /// What one output shows, as far as niri reports it: the output, its active
 /// workspace with that workspace's active window and every window's layout,
-/// the focused window and the overview. Besides these, only a scroll the
-/// user makes with a touchpad or mouse gesture moves a tiled window, and
-/// niri reports none until the gesture ends.
+/// the focused window and the overview. niri can also scroll the view and
+/// so move every tiled window without changing any of this or sending any
+/// event: the `center-column`, `center-visible-columns` and `center-window`
+/// actions, and a touchpad or mouse view gesture that ends on the same
+/// column. Nothing in IPC detects those; [`FRAME_MAX_AGE`] bounds them.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Shown {
     output: IpcOutput,
@@ -2027,11 +2033,13 @@ impl Scene {
 
 /// A tiled window's pixel frame. niri does not report where a tiled window
 /// is, so its `get_window_state` screenshot is its whole output and its
-/// window coordinates are that output's logical pixels. They aim where the
-/// screenshot showed them while niri's event stream reports no layout change
-/// after `mark`, taken once the layout had settled before the capture, and
-/// the output still shows what `shown` recorded. That proves the screen is
-/// unchanged, not that a point lies on the window: it can be on another
+/// window coordinates are that output's logical pixels. They are admitted
+/// while niri's event stream reports no layout change after `mark`, taken
+/// once the layout had settled before the capture, the output still shows
+/// what `shown` recorded, and the screenshot is at most [`FRAME_MAX_AGE`]
+/// old. That proves only that niri reported no change: a view scroll niri
+/// does not report (see [`Shown`]) or an animation longer than
+/// [`SETTLE_QUIET`] still moves the pixels, and a point can be on another
 /// tiled window or a layer-shell surface, which IPC does not place. A point
 /// inside a floating window, drawn above every tiled one, refuses.
 #[derive(Clone, Debug, PartialEq)]
@@ -2040,6 +2048,8 @@ pub struct OutputFrame {
     area: Rect,
     shown: Shown,
     mark: Mark,
+    /// When the capture started.
+    taken: Instant,
 }
 
 impl OutputFrame {
@@ -2055,6 +2065,13 @@ impl OutputFrame {
     }
 
     fn holds(&self, scene: &Scene, history: &History) -> Result<()> {
+        if self.taken.elapsed() > FRAME_MAX_AGE {
+            return Err(foreground_unavailable(format!(
+                "the screenshot of tiled niri window {} is over {} s old, and niri does not report every scroll of its view; take a new screenshot",
+                self.window,
+                FRAME_MAX_AGE.as_secs()
+            )));
+        }
         if scene.shown(self.output()).as_ref() != Some(&self.shown) {
             return Err(self.changed(&format!("niri output {} changed", self.output())));
         }
@@ -2375,6 +2392,7 @@ fn capture_window_in(
     pid: Option<u32>,
     capture_display: impl FnOnce() -> Result<DisplayCapture>,
 ) -> Result<WindowCapture, String> {
+    let taken = Instant::now();
     let mut plan_now = || -> Result<CapturePlan, String> {
         Ok(capture_plan_in(
             &scene().map_err(|e| format!("{e:#}"))?,
@@ -2419,6 +2437,7 @@ fn capture_window_in(
         area: plan.area,
         shown,
         mark,
+        taken,
     });
     Ok(WindowCapture {
         png: capture.png,
@@ -4320,6 +4339,27 @@ mod tests {
         frame
             .admit(&unfocused, &window, &[(2500, 400)], false, history)
             .unwrap();
+    }
+
+    #[test]
+    fn a_tiled_frame_expires_because_niri_does_not_report_every_view_scroll() {
+        let history = history();
+        let scene = tiled_scene(Some(5));
+        let frame = tiled_frame(history);
+        let aged = |age: Duration| OutputFrame {
+            taken: Instant::now().checked_sub(age).unwrap(),
+            ..frame.clone()
+        };
+        aged(Duration::from_secs(59))
+            .holds(&scene, history)
+            .unwrap();
+        assert_eq!(
+            aged(Duration::from_secs(61))
+                .holds(&scene, history)
+                .unwrap_err()
+                .to_string(),
+            "foreground_unavailable: the screenshot of tiled niri window 5 is over 60 s old, and niri does not report every scroll of its view; take a new screenshot"
+        );
     }
 
     #[test]

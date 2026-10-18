@@ -1856,10 +1856,13 @@ impl Tool for GetWindowStateTool {
                     let note = format!(
                         "niri does not report where tiled window {xid} is, so this screenshot \
                          is its whole output {output}, and x/y for pointer actions on this window \
-                         are pixels of it. They are accepted only while niri's layout on that \
-                         output stays as captured, and the window stays focused; a point can land \
-                         on another tiled window or a panel shown there. Float the window for a \
-                         window-only screenshot."
+                         are pixels of it. They are accepted for at most {max_age} s, while niri \
+                         reports no layout change on that output and the window stays focused. \
+                         niri does not report every scroll of the view (center-column, \
+                         center-window, view gestures), so a point can still land on another tiled \
+                         window or on a panel shown there. Float the window for a window-only \
+                         screenshot.",
+                        max_age = crate::wayland::niri::FRAME_MAX_AGE.as_secs()
                     );
                     structured["screenshot_scope"] = json!("output");
                     structured["frame_note"] = json!(note);

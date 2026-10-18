@@ -554,7 +554,13 @@ impl Journal {
         let sampler = std::thread::spawn(move || {
             let mut journal = DesktopJournal::default();
             let mut line = Vec::new();
-            while !thread_stop.load(Ordering::Acquire) {
+            // After a stop, keep reading until the socket is quiet: niri may
+            // still be writing events it queued during the action.
+            let mut quiet_deadline = None;
+            loop {
+                if quiet_deadline.is_none() && thread_stop.load(Ordering::Acquire) {
+                    quiet_deadline = Some(Instant::now() + QUERY_TIMEOUT);
+                }
                 // A timed-out read keeps its partial line for the next read.
                 match reader.read_until(b'\n', &mut line) {
                     Ok(0) => return Err(ObserverError::new("niri event stream closed")),
@@ -581,13 +587,22 @@ impl Journal {
                         if matches!(
                             error.kind(),
                             std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
-                        ) => {}
+                        ) =>
+                    {
+                        if quiet_deadline.is_some() && line.is_empty() {
+                            return Ok(journal);
+                        }
+                    }
                     Err(error) => {
                         return Err(ObserverError::new(format!("niri event stream: {error}")))
                     }
                 }
+                if quiet_deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+                    return Err(ObserverError::new(format!(
+                        "niri event stream did not go quiet within {QUERY_TIMEOUT:?}"
+                    )));
+                }
             }
-            Ok(journal)
         });
         Ok(Self {
             stop,
@@ -887,7 +902,6 @@ mod tests {
         write!(niri, r#"{{"WindowFocusChanged":"#).unwrap();
         std::thread::sleep(Duration::from_millis(60));
         writeln!(niri, r#"{{"id":10}}}}"#).unwrap();
-        std::thread::sleep(Duration::from_millis(100));
         let journal = journal.drain().unwrap();
         assert_eq!(
             journal.focus_events,
@@ -932,7 +946,6 @@ mod tests {
         )
         .unwrap();
         writeln!(niri, r#"{{"WindowFocusChanged":{{"id":10}}}}"#).unwrap();
-        std::thread::sleep(Duration::from_millis(100));
         let events = journal.drain().unwrap().focus_events;
         let transitions = events
             .iter()

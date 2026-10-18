@@ -23,6 +23,13 @@ pub struct ForegroundSentinel {
     _user_data: tempfile::TempDir,
 }
 
+#[cfg(target_os = "linux")]
+impl Drop for ForegroundSentinel {
+    fn drop(&mut self) {
+        crate::observer::linux::niri_register_sentinel(None);
+    }
+}
+
 impl ForegroundSentinel {
     pub fn launch(driver: &mut impl Driver) -> Self {
         let mut last_error = None;
@@ -78,6 +85,13 @@ impl ForegroundSentinel {
             .env("CUA_ELECTRON_CDP_PORT", cdp_port.to_string())
             .stdout(Stdio::null())
             .stderr(Stdio::null());
+        // Only the niri observer reads the fullscreen state file, so other
+        // platforms never pay for the sentinel rewriting it every tick.
+        #[cfg(target_os = "linux")]
+        command.env(
+            "CUA_E2E_SENTINEL_STATE",
+            user_data.path().join("sentinel-state.json"),
+        );
         let child = spawn_in_job(&mut command)
             .map_err(|error| format!("launch foreground sentinel: {error}"))?;
         let launched_pid = child.id();
@@ -156,6 +170,11 @@ impl ForegroundSentinel {
         };
         fs::write(&journal_path, "")
             .map_err(|error| format!("reset focused sentinel journal: {error}"))?;
+        #[cfg(target_os = "linux")]
+        crate::observer::linux::niri_register_sentinel(Some((
+            target,
+            user_data.path().join("sentinel-state.json"),
+        )));
 
         Ok(Self {
             cursor_calibrated,
@@ -277,6 +296,8 @@ impl ForegroundSentinel {
         raise_for_focus_canary(driver, background_target)?;
         #[cfg(target_os = "linux")]
         focus_sway_target(driver, background_target)?;
+        #[cfg(target_os = "linux")]
+        focus_niri_target(background_target)?;
         if is_wayland_session() {
             wait_for_native_focus_lost(self.target, background_target)?;
         } else {
@@ -296,6 +317,11 @@ impl ForegroundSentinel {
         #[cfg(target_os = "linux")]
         set_sway_fullscreen(driver, self.target, true)?;
         wait_for_native_focus_stable(self.target);
+        #[cfg(target_os = "linux")]
+        if is_niri_session() {
+            assert_niri_transient_focus_detected(self.target, background_target)?;
+            wait_for_native_focus_stable(self.target);
+        }
         std::thread::sleep(Duration::from_millis(150));
         reset_journal(&self.journal_path)?;
         wait_for_event(&self.journal_path, "heartbeat", Duration::from_secs(2))?;
@@ -571,6 +597,10 @@ fn try_activate_native_foreground(
     focus_sway_target(driver, target).map_err(|error| {
         format!("could not focus foreground sentinel through Sway IPC: {error}")
     })?;
+    #[cfg(target_os = "linux")]
+    focus_niri_target(target).map_err(|error| {
+        format!("could not focus foreground sentinel through niri IPC: {error}")
+    })?;
     #[cfg(target_os = "windows")]
     physically_focus_windows_sentinel(target);
     #[cfg(target_os = "macos")]
@@ -616,6 +646,56 @@ fn focus_sway_target(driver: &mut impl Driver, target: TargetWindow) -> Result<(
 
     let (_, con_id) = sway_tree_and_container_for_target(driver, target)?;
     run_sway_container_command(con_id, &["focus"], "focus canary")
+}
+
+/// niri's focus oracle must see a focus that leaves the sentinel and returns
+/// inside one observation, where both endpoint snapshots agree. Only the
+/// action-time journal can report it.
+#[cfg(target_os = "linux")]
+fn assert_niri_transient_focus_detected(
+    sentinel: TargetWindow,
+    background: TargetWindow,
+) -> Result<(), String> {
+    use crate::observer::linux::{niri_focus, niri_wait_for_focus_transfer};
+
+    let mut observer = DesktopObserver::new(NativeObserver::new(), background);
+    let (moved, delta) = observer
+        .observe(&[OracleKind::Focus], || {
+            niri_focus(background)?;
+            niri_wait_for_focus_transfer(sentinel, background)?;
+            niri_focus(sentinel)?;
+            niri_wait_for_focus_transfer(background, sentinel)
+        })
+        .map_err(|error| error.to_string())?;
+    moved.map_err(|error| format!("niri transient focus canary could not move focus: {error}"))?;
+    if delta.before.foreground != delta.after.foreground
+        || !delta
+            .violations()
+            .iter()
+            .any(|violation| violation.contains("changed transiently"))
+    {
+        return Err(format!(
+            "niri transient focus canary was not detected: {:?}",
+            delta.violations()
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn is_niri_session() -> bool {
+    is_wayland_session()
+        && std::env::var("CUA_E2E_WAYLAND_SESSION").is_ok_and(|session| session == "niri")
+}
+
+/// niri shows a focused floating window above the fullscreen sentinel, so the
+/// niri canary needs no fullscreen toggle, only the compositor's own focus.
+#[cfg(target_os = "linux")]
+fn focus_niri_target(target: TargetWindow) -> Result<(), String> {
+    if !is_niri_session() {
+        return Ok(());
+    }
+    crate::observer::linux::niri_focus(target).map_err(|error| error.to_string())
 }
 
 #[cfg(target_os = "linux")]
@@ -1074,6 +1154,10 @@ fn wait_for_native_focus_lost(
 
     if hyprland::is_session() {
         return hyprland::wait_for_focus_transfer(target, background_target);
+    }
+    if is_niri_session() {
+        return crate::observer::linux::niri_wait_for_focus_transfer(target, background_target)
+            .map_err(|error| error.to_string());
     }
 
     let backend = NativeObserver::new();

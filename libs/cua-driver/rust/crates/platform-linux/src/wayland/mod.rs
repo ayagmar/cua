@@ -395,6 +395,8 @@ struct State {
     // button press at the output centre (over the just-activated window).
     vptr_manager: Option<ZwlrVirtualPointerManagerV1>,
     output: Option<WlOutput>,
+    /// wl_output v4 name of `output`, the output screencopy copies.
+    output_name: Option<String>,
     // Logical (post-transform) output size: virtual-pointer absolute motion
     // maps onto the output's logical box, so rotated outputs swap axes.
     output_w: u32,
@@ -475,12 +477,18 @@ impl Dispatch<WlSeat, ()> for State {
 impl Dispatch<WlOutput, ()> for State {
     fn event(
         state: &mut Self,
-        _: &WlOutput,
+        output: &WlOutput,
         event: wl_output::Event,
         _: &(),
         _: &Connection,
         _: &QueueHandle<Self>,
     ) {
+        if let wl_output::Event::Name { name } = &event {
+            if state.output.as_ref() == Some(output) {
+                state.output_name = Some(name.clone());
+            }
+            return;
+        }
         // Remember the output resolution so `click` can aim at its centre.
         // Modes are reported in the panel's native orientation; the geometry
         // transform turns them into the logical frame input coordinates use.
@@ -770,6 +778,12 @@ fn capture_via_grim() -> anyhow::Result<Vec<u8>> {
 /// request a copy, wait for Ready, swap channels, encode PNG. Returns an error
 /// if any global is missing or the compositor flags the capture as failed.
 fn capture_via_screencopy() -> anyhow::Result<Vec<u8>> {
+    screencopy_first_output().map(|(png, _)| png)
+}
+
+/// [`capture_via_screencopy`], plus the wl_output v4 name of the copied
+/// output when the compositor reports one.
+fn screencopy_first_output() -> anyhow::Result<(Vec<u8>, Option<String>)> {
     let conn = Connection::connect_to_env()?;
     if is_wayland() && niri::is_session() {
         niri::verify_wayland_peer(&conn)?;
@@ -898,7 +912,7 @@ fn capture_via_screencopy() -> anyhow::Result<Vec<u8>> {
     let _ = queue.roundtrip(&mut state);
     cleanup_mmap(mmap_ptr, mmap_len, fd);
 
-    result
+    result.map(|png| (png, state.output_name.take()))
 }
 
 /// Allocate an anonymous shared-memory file of `size` bytes and mmap it RW.
@@ -1150,11 +1164,27 @@ fn screenshot_dispatch_for_pid(xid: u64, pid: Option<u32>) -> anyhow::Result<Vec
     )
 }
 
+/// A niri display capture: only the attested wlroots screencopy, oriented by
+/// the copied output's own transform. grim, ext-image-copy and the portal
+/// are not tied to the attested compositor or orient differently, so niri
+/// never falls back to them.
+fn niri_display_capture() -> anyhow::Result<niri::DisplayCapture> {
+    let (png, output) = screencopy_first_output()?;
+    let output = output.ok_or_else(|| {
+        anyhow::anyhow!("niri capture needs the wl_output name (wl_output v4) of the copied output")
+    })?;
+    let png = orient_png_for_niri_transform(png, niri::output_transform(&output)?)?;
+    let size = image::ImageReader::new(std::io::Cursor::new(&png))
+        .with_guessed_format()?
+        .into_dimensions()?;
+    Ok(niri::DisplayCapture { png, output, size })
+}
+
 /// niri has no per-toplevel capture protocol: crop a settled display capture
 /// to a placed, unoverlapped floating window and scale it to the window's
 /// logical size, the window-local coordinate frame input uses.
 fn niri_window_capture(xid: u64, pid: Option<u32>) -> anyhow::Result<Vec<u8>> {
-    let (png, plan) = niri::capture_window(xid, pid, screenshot_display_dispatch)
+    let (png, plan) = niri::capture_window(xid, pid, niri_display_capture)
         .map_err(|reason| surface_identity_unproven(xid, format!("niri: {reason}")))?;
     let pixels = plan.pixels;
     let crop = crop_png_to_rect(
@@ -1218,6 +1248,9 @@ fn crop_png_to_rect(
 ///    first use per session.
 /// 5. X11: existing root-window path.
 pub fn screenshot_display_dispatch() -> anyhow::Result<Vec<u8>> {
+    if is_wayland() && niri::is_session() {
+        return niri_display_capture().map(|capture| capture.png);
+    }
     if is_wayland() && hyprland::is_session() {
         // The desktop action frame spans every powered output. The cascade
         // below copies only the first output, so a multi-monitor layout is
@@ -1301,13 +1334,10 @@ fn rotate_png_for_output_transform(png: Vec<u8>, transform: u32) -> anyhow::Resu
 }
 
 /// Full-display screencopy returns the output buffer in the panel's native
-/// orientation. On Hyprland and niri, turn it into the logical desktop frame
+/// orientation. On Hyprland, turn it into the logical desktop frame
 /// so the screenshot matches what the user sees and what desktop-scope input
 /// uses.
 fn orient_display_png(png: Vec<u8>) -> anyhow::Result<Vec<u8>> {
-    if niri::is_session() {
-        return orient_png_for_niri_transform(png, niri::single_output_transform()?);
-    }
     if !hyprland::is_session() {
         return Ok(png);
     }

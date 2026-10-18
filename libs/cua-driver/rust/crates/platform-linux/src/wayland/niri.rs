@@ -623,8 +623,12 @@ impl Unplaced {
 /// A floating window's place on screen, from one compositor snapshot.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Placed {
-    /// The window's geometry in the global logical layout.
+    /// The window's geometry in the global logical layout, rounded to whole
+    /// logical pixels.
     pub rect: Rect,
+    /// The exact logical origin niri reports: niri aligns windows to
+    /// physical pixels, so at a fractional scale it is fractional.
+    pub origin: (f64, f64),
     pub output: String,
     /// The output's logical rectangle: niri shows no part of the window
     /// outside it.
@@ -639,9 +643,19 @@ impl Placed {
         self.others.iter().any(|other| other.intersects(&self.rect))
     }
 
+    /// Whether a layout point lies inside the exact, possibly fractional,
+    /// window geometry rather than only inside its rounded rectangle.
+    pub fn covers(&self, x: i32, y: i32) -> bool {
+        let (x, y) = (f64::from(x), f64::from(y));
+        x >= self.origin.0
+            && y >= self.origin.1
+            && x < self.origin.0 + f64::from(self.rect.width)
+            && y < self.origin.1 + f64::from(self.rect.height)
+    }
+
     /// Whether a layout point surely lands on this window.
     pub fn hits(&self, x: i32, y: i32) -> bool {
-        self.rect.contains(x, y) && !self.others.iter().any(|other| other.contains(x, y))
+        self.covers(x, y) && !self.others.iter().any(|other| other.contains(x, y))
     }
 }
 
@@ -697,13 +711,12 @@ impl Scene {
             .ok_or(Unplaced::NotShowing)?;
         let (offset_x, offset_y) = layout.window_offset_in_tile;
         let (width, height) = layout.window_size;
-        let rect = Rect::from_f64(
+        let origin = (
             f64::from(logical.x) + tile_x + offset_x,
             f64::from(logical.y) + tile_y + offset_y,
-            f64::from(width),
-            f64::from(height),
-        )
-        .ok_or(Unplaced::NotShowing)?;
+        );
+        let rect = Rect::from_f64(origin.0, origin.1, f64::from(width), f64::from(height))
+            .ok_or(Unplaced::NotShowing)?;
         let others = self
             .windows
             .iter()
@@ -712,6 +725,7 @@ impl Scene {
             .collect();
         Ok(Placed {
             rect,
+            origin,
             output: workspace.output.clone().unwrap_or_default(),
             area: Rect {
                 x: logical.x,
@@ -808,7 +822,7 @@ impl Scene {
             [(output, logical)] => Ok((*output, logical.checked()?)),
             [] => bail!("niri has no enabled output"),
             outputs => bail!(
-                "niri display capture and desktop input support a single output; this layout has {}",
+                "niri window capture and desktop input support a single output; this layout has {}",
                 outputs.len()
             ),
         }
@@ -895,11 +909,48 @@ fn desktop_snapshot_in(scene: &Scene) -> Result<super::hyprland::DesktopSnapshot
     })
 }
 
-/// The desktop frame plus the monitor list `get_screen_size` reports, in the
+/// Every enabled output's logical rectangle, and their bounding box with the
+/// largest scale, as Hyprland reports its frame. Desktop-scope input still
+/// needs a single output; reporting sizes does not.
+fn screen_frame_in(scene: &Scene) -> Result<super::hyprland::DesktopFrame> {
+    let mut outputs = Vec::new();
+    let mut scale: f64 = 0.0;
+    for (output, logical) in scene.laid_out() {
+        let logical = logical.checked()?;
+        scale = scale.max(logical.scale);
+        outputs.push(super::hyprland::FrameOutput {
+            name: output.name.clone(),
+            x: logical.x,
+            y: logical.y,
+            width: logical.width,
+            height: logical.height,
+        });
+    }
+    let rects: Vec<Rect> = outputs
+        .iter()
+        .map(|output| Rect {
+            x: output.x,
+            y: output.y,
+            width: output.width,
+            height: output.height,
+        })
+        .collect();
+    let (x, y, width, height) = bounding_box(&rects).context("niri has no enabled output")?;
+    Ok(super::hyprland::DesktopFrame {
+        x,
+        y,
+        width,
+        height,
+        scale,
+        outputs,
+    })
+}
+
+/// The output frame plus the monitor list `get_screen_size` reports, in the
 /// shape the Hyprland adapter publishes.
 pub fn screen_report() -> Result<(super::hyprland::DesktopFrame, serde_json::Value)> {
     let scene = ipc().scene()?;
-    let frame = desktop_snapshot_in(&scene)?.frame;
+    let frame = screen_frame_in(&scene)?;
     let monitors = frame
         .outputs
         .iter()
@@ -908,7 +959,10 @@ pub fn screen_report() -> Result<(super::hyprland::DesktopFrame, serde_json::Val
                 "name": output.name,
                 "width": output.width,
                 "height": output.height,
-                "scale": frame.scale,
+                "scale": scene.outputs[&output.name]
+                    .logical
+                    .as_ref()
+                    .map_or(frame.scale, |logical| logical.scale),
                 "powered": true,
                 "frame_x": output.x - frame.x,
                 "frame_y": output.y - frame.y,
@@ -918,10 +972,15 @@ pub fn screen_report() -> Result<(super::hyprland::DesktopFrame, serde_json::Val
     Ok((frame, serde_json::Value::Array(monitors)))
 }
 
-/// wl_output transform of the single output, for orienting a display capture.
-pub fn single_output_transform() -> Result<u32> {
+/// wl_output transform of the named output, for orienting its capture.
+pub fn output_transform(name: &str) -> Result<u32> {
     let scene = ipc().scene()?;
-    transform_code(&scene.single_output()?.1.transform)
+    let logical = scene
+        .outputs
+        .get(name)
+        .and_then(|output| output.logical.as_ref())
+        .with_context(|| format!("niri reports no enabled output {name:?}"))?;
+    transform_code(&logical.transform)
 }
 
 /// Doctor note: `None` without `NIRI_SOCKET`, otherwise whether this process
@@ -961,7 +1020,7 @@ fn describe_health(
     match outputs {
         Ok(1) => format!("niri {version}: IPC attested to WAYLAND_DISPLAY."),
         Ok(count) => format!(
-            "niri {version}: IPC attested to WAYLAND_DISPLAY; display capture and desktop \
+            "niri {version}: IPC attested to WAYLAND_DISPLAY; window capture and desktop \
              input refuse because {count} outputs are enabled (one is supported)."
         ),
         Err(error) => format!(
@@ -1457,7 +1516,7 @@ fn pointer_admission(
                 window.id, placed.rect
             )));
         }
-        if !placed.rect.contains(x, y) {
+        if !placed.covers(x, y) {
             return Err(foreground_unavailable(format!(
                 "point ({x}, {y}) is outside niri window {} at {:?}",
                 window.id, placed.rect
@@ -1480,14 +1539,28 @@ fn pointer_admission(
 
 // ── Window capture ───────────────────────────────────────────────────────────
 
-/// Where a window is in a single-output display capture.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// Where a window is in a single-output display capture, and the output
+/// geometry that mapping depends on.
+#[derive(Clone, Debug, PartialEq)]
 pub struct CapturePlan {
     /// Capture pixels, after the capture is oriented to the logical layout.
     pub pixels: Rect,
     /// The window's logical size, the size of the returned window image.
     pub width: u32,
     pub height: u32,
+    /// The output the capture must come from, its logical rectangle and
+    /// scale, and the oriented capture's size in pixels.
+    pub output: String,
+    pub area: Rect,
+    pub scale: f64,
+    pub image: (u32, u32),
+}
+
+/// An oriented display capture and the output it copied.
+pub struct DisplayCapture {
+    pub png: Vec<u8>,
+    pub output: String,
+    pub size: (u32, u32),
 }
 
 fn capture_plan_in(scene: &Scene, id: u64, pid: Option<u32>) -> Result<CapturePlan, &'static str> {
@@ -1503,26 +1576,27 @@ fn capture_plan_in(scene: &Scene, id: u64, pid: Option<u32>) -> Result<CapturePl
         .map_err(|unplaced| unplaced.reason())?;
     let (output, logical) = scene
         .single_output()
-        .map_err(|_| "niri display capture copies one output, and this layout has several")?;
+        .map_err(|_| "niri window capture supports a single output, and this layout has several")?;
     if placed.output != output.name {
         return Err("the window is not on the captured output");
     }
-    let area = Rect {
-        x: logical.x,
-        y: logical.y,
-        width: logical.width,
-        height: logical.height,
-    };
-    if !placed.rect.inside(&area) {
+    if !placed.rect.inside(&placed.area) {
         return Err("the window extends past its output's edge");
     }
     if placed.overlapped() {
         return Err("another floating window overlaps it, and niri reports no stacking order");
     }
+    let mode = output
+        .current_mode
+        .and_then(|index| output.modes.get(index))
+        .ok_or("niri reports no current mode for the output")?;
+    let transform =
+        transform_code(&logical.transform).map_err(|_| "unknown niri output transform")?;
     let scale = logical.scale;
+    // Round only in pixel space: the fractional origin is what niri drew.
     let pixels = Rect::from_f64(
-        f64::from(placed.rect.x - logical.x) * scale,
-        f64::from(placed.rect.y - logical.y) * scale,
+        (placed.origin.0 - f64::from(logical.x)) * scale,
+        (placed.origin.1 - f64::from(logical.y)) * scale,
         f64::from(placed.rect.width) * scale,
         f64::from(placed.rect.height) * scale,
     )
@@ -1531,28 +1605,66 @@ fn capture_plan_in(scene: &Scene, id: u64, pid: Option<u32>) -> Result<CapturePl
         pixels,
         width: placed.rect.width,
         height: placed.rect.height,
+        output: output.name.clone(),
+        area: placed.area,
+        scale,
+        image: super::logical_output_size((mode.width, mode.height), transform),
     })
 }
 
 /// Capture one floating window by cropping a settled display capture. The
-/// layout must stay quiet through the capture and the window unchanged.
-/// Errors are refusal reasons for `surface_identity_unproven`.
+/// layout must stay quiet through the capture, and the window and its
+/// output unchanged. Errors are refusal reasons for
+/// `surface_identity_unproven`.
 pub fn capture_window(
     id: u64,
     pid: Option<u32>,
-    capture_display: impl FnOnce() -> Result<Vec<u8>>,
+    capture_display: impl FnOnce() -> Result<DisplayCapture>,
 ) -> Result<(Vec<u8>, CapturePlan), String> {
-    let before = capture_plan_in(&ipc().scene().map_err(|e| format!("{e:#}"))?, id, pid)?;
-    let mut quiet = settled().map_err(|e| format!("{e:#}"))?;
-    let plan = capture_plan_in(&ipc().scene().map_err(|e| format!("{e:#}"))?, id, pid)?;
+    capture_window_in(|| ipc().scene(), settled, id, pid, capture_display)
+}
+
+fn capture_window_in(
+    mut scene: impl FnMut() -> Result<Scene>,
+    settle: impl FnOnce() -> Result<Quiet>,
+    id: u64,
+    pid: Option<u32>,
+    capture_display: impl FnOnce() -> Result<DisplayCapture>,
+) -> Result<(Vec<u8>, CapturePlan), String> {
+    let mut plan_now = || -> Result<CapturePlan, String> {
+        Ok(capture_plan_in(
+            &scene().map_err(|e| format!("{e:#}"))?,
+            id,
+            pid,
+        )?)
+    };
+    let before = plan_now()?;
+    let mut quiet = settle().map_err(|e| format!("{e:#}"))?;
+    let plan = plan_now()?;
     if plan != before {
         return Err("the window moved while niri was settling".into());
     }
-    let png = capture_display().map_err(|e| format!("{e:#}"))?;
+    let capture = capture_display().map_err(|e| format!("{e:#}"))?;
     if quiet.changed().map_err(|e| format!("{e:#}"))? {
         return Err("the niri layout changed during capture".into());
     }
-    Ok((png, plan))
+    // niri has no output-change event: compare the output itself.
+    if plan_now()? != plan {
+        return Err("the niri window or its output changed during capture".into());
+    }
+    if capture.output != plan.output {
+        return Err(format!(
+            "the display capture copied output {:?}, not the window's output {:?}",
+            capture.output, plan.output
+        ));
+    }
+    if capture.size != plan.image {
+        return Err(format!(
+            "the capture is {}x{} pixels, but niri reports {}x{} for output {:?}",
+            capture.size.0, capture.size.1, plan.image.0, plan.image.1, plan.output
+        ));
+    }
+    Ok((capture.png, plan))
 }
 
 #[cfg(test)]
@@ -2183,7 +2295,7 @@ mod tests {
         );
         assert_eq!(
             desktop_snapshot_in(&two).unwrap_err().to_string(),
-            "niri display capture and desktop input support a single output; this layout has 2"
+            "niri window capture and desktop input support a single output; this layout has 2"
         );
     }
 
@@ -2208,8 +2320,128 @@ mod tests {
                 },
                 width: 300,
                 height: 200,
+                output: "DP-2".into(),
+                area: Rect {
+                    x: 1000,
+                    y: 40,
+                    width: 1280,
+                    height: 720
+                },
+                scale: 1.5,
+                image: (1920, 1080),
             })
         );
+    }
+
+    #[test]
+    fn crop_keeps_a_pixel_aligned_fractional_origin() {
+        // At scale 1.5 niri places a window on physical x=151, which IPC
+        // reports as logical 100.667; rounding it first would crop from 152.
+        let scene = one_output(vec![floating(7, 1, (151.0 / 1.5, 60.0), (300, 200))]);
+        let plan = capture_plan_in(&scene, 7, None).unwrap();
+        assert_eq!((plan.pixels.x, plan.pixels.width), (151, 450));
+        let placed = placement(&scene, 7).unwrap();
+        assert!(!placed.covers(100, 100), "x=100 is left of 100.667");
+        assert!(placed.covers(101, 100));
+    }
+
+    fn quiet_now() -> Quiet {
+        Quiet::wait(
+            event_stream(vec![]),
+            Duration::from_millis(10),
+            Duration::from_secs(1),
+        )
+        .unwrap()
+    }
+
+    fn display(output: &str, size: (u32, u32)) -> Result<DisplayCapture> {
+        Ok(DisplayCapture {
+            png: vec![1],
+            output: output.into(),
+            size,
+        })
+    }
+
+    #[test]
+    fn capture_refuses_an_output_change_niri_sends_no_event_for() {
+        let window = || floating(7, 1, (100.0, 60.0), (300, 200));
+        let mut calls = 0;
+        let error = capture_window_in(
+            || {
+                calls += 1;
+                // The scale changes during the capture; the layout does not.
+                let scale = if calls <= 2 { 1.5 } else { 1.0 };
+                Ok(scene(
+                    vec![window()],
+                    vec![workspace(1, "winit", true, None)],
+                    vec![output("winit", 0, 0, (1280, 720), scale, "Normal")],
+                    false,
+                ))
+            },
+            || Ok(quiet_now()),
+            7,
+            None,
+            || display("winit", (1280, 720)),
+        )
+        .unwrap_err();
+        assert_eq!(
+            error,
+            "the niri window or its output changed during capture"
+        );
+    }
+
+    #[test]
+    fn capture_refuses_another_output_or_size() {
+        let one = || Ok(one_output(vec![floating(7, 1, (100.0, 60.0), (300, 200))]));
+        assert_eq!(
+            capture_window_in(
+                one,
+                || Ok(quiet_now()),
+                7,
+                None,
+                || display("DP-1", (1280, 720))
+            )
+            .unwrap_err(),
+            "the display capture copied output \"DP-1\", not the window's output \"winit\""
+        );
+        assert_eq!(
+            capture_window_in(
+                one,
+                || Ok(quiet_now()),
+                7,
+                None,
+                || display("winit", (1920, 1080))
+            )
+            .unwrap_err(),
+            "the capture is 1920x1080 pixels, but niri reports 1280x720 for output \"winit\""
+        );
+        assert!(capture_window_in(
+            one,
+            || Ok(quiet_now()),
+            7,
+            None,
+            || display("winit", (1280, 720))
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn screen_size_spans_every_output_with_the_largest_scale() {
+        let two = scene(
+            vec![],
+            vec![],
+            vec![
+                output("DP-1", 0, 0, (1920, 1080), 1.0, "Normal"),
+                output("DP-2", 1920, 0, (2560, 1440), 2.0, "Normal"),
+            ],
+            false,
+        );
+        let frame = screen_frame_in(&two).unwrap();
+        assert_eq!(
+            (frame.x, frame.y, frame.width, frame.height, frame.scale),
+            (0, 0, 3200, 1080, 2.0)
+        );
+        assert_eq!(frame.outputs.len(), 2);
     }
 
     #[test]
@@ -2228,7 +2460,7 @@ mod tests {
         );
         assert_eq!(
             capture_plan_in(&two_outputs, 7, None),
-            Err("niri display capture copies one output, and this layout has several")
+            Err("niri window capture supports a single output, and this layout has several")
         );
         let overlapped = one_output(vec![
             floating(7, 1, (100.0, 60.0), (300, 200)),

@@ -1969,7 +1969,7 @@ pub fn click_desktop(
 }
 
 /// Recheck an admitted niri pointer action right before an event that acts
-/// on the target: the first motion, and the first press or wheel event. niri
+/// on the target: the first motion, the first press, and each wheel tick. niri
 /// sends no event when outputs change, so the pointer space is reread too.
 fn niri_gate_holds(gate: &mut Option<niri::PointerGate>, sess: &VptrSession) -> anyhow::Result<()> {
     let Some(gate) = gate else {
@@ -1995,10 +1995,10 @@ fn pointer_space_holds(
     Ok(())
 }
 
-/// Deliver the `count` events of one gesture (the clicks of a double click,
-/// the ticks of a scroll) as one action: the last recheck runs before the
-/// first event. A refusal after an event had landed would report no effect
-/// while the app already reacted, and a retry would add to it.
+/// Deliver the presses of one click train (at most a triple click) as one
+/// action: the last recheck runs before the first press. A refusal after a
+/// press had landed would report no effect while the app already reacted,
+/// and a retry would add to it.
 fn gated_series<S>(
     sess: &mut S,
     count: u32,
@@ -2007,6 +2007,30 @@ fn gated_series<S>(
 ) -> anyhow::Result<()> {
     recheck(sess)?;
     for i in 0..count.max(1) {
+        deliver(sess, i)?;
+    }
+    Ok(())
+}
+
+/// Deliver the `count` ticks of a scroll, rechecking before each one. A
+/// scroll is a stream of independent events, up to about 1.3 s long, so
+/// stopping partway is safe while sending the rest to whatever is now under
+/// the pointer is not. A refusal after a tick landed says how many did,
+/// without the `foreground_unavailable` prefix that would report no effect.
+fn gated_ticks<S>(
+    sess: &mut S,
+    count: u32,
+    mut recheck: impl FnMut(&S) -> anyhow::Result<()>,
+    mut deliver: impl FnMut(&mut S, u32) -> anyhow::Result<()>,
+) -> anyhow::Result<()> {
+    let count = count.max(1);
+    for i in 0..count {
+        if let Err(refusal) = recheck(sess) {
+            if i == 0 {
+                return Err(refusal);
+            }
+            anyhow::bail!("scroll stopped after {i} of {count} ticks: {refusal}");
+        }
         deliver(sess, i)?;
     }
     Ok(())
@@ -2310,7 +2334,7 @@ fn scroll_vptr(
     // axis_discrete: `value` is logical units (the wayland-rs wrapper
     // converts to wl_fixed internally); `discrete` is the tick count.
     let value: f64 = (sign as f64) * 10.0;
-    gated_series(
+    gated_ticks(
         &mut sess,
         amount,
         |sess| niri_gate_holds(&mut gate, sess),
@@ -4360,6 +4384,53 @@ mod tests {
             "foreground_unavailable: layout changed"
         );
         assert_eq!(delivered, 0);
+    }
+
+    #[test]
+    fn a_scroll_stops_at_the_first_refused_tick_and_reports_the_partial_effect() {
+        // The user switches workspace after two of five ticks: the rest must
+        // not reach whatever is now under the pointer, and the error must not
+        // read as "nothing was delivered".
+        let mut checks = 0;
+        let mut delivered = 0;
+        let stopped = super::gated_ticks(
+            &mut (),
+            5,
+            |_| {
+                checks += 1;
+                anyhow::ensure!(checks <= 2, "foreground_unavailable: layout changed");
+                Ok(())
+            },
+            |_, _| {
+                delivered += 1;
+                Ok(())
+            },
+        )
+        .unwrap_err();
+        assert_eq!(delivered, 2);
+        assert_eq!(
+            stopped.to_string(),
+            "scroll stopped after 2 of 5 ticks: foreground_unavailable: layout changed"
+        );
+        assert_eq!(crate::input::foreground::error_code(&stopped), None);
+
+        // A refusal before the first tick still means no effect.
+        let mut delivered = 0;
+        let refused = super::gated_ticks(
+            &mut (),
+            5,
+            |_| anyhow::bail!("foreground_unavailable: layout changed"),
+            |_, _| {
+                delivered += 1;
+                Ok(())
+            },
+        )
+        .unwrap_err();
+        assert_eq!(delivered, 0);
+        assert_eq!(
+            crate::input::foreground::error_code(&refused),
+            Some(crate::input::foreground::CODE_UNAVAILABLE)
+        );
     }
 
     #[test]

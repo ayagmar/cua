@@ -257,7 +257,11 @@ if [[ ! -x "${ATSPI_LAUNCHER}" ]]; then
   echo "AT-SPI bus launcher is unavailable: ${ATSPI_LAUNCHER:-<not found>}" >&2
   exit 1
 fi
-"${ATSPI_LAUNCHER}" --launch-immediately > "${ATSPI_LOG}" 2>&1 &
+# Inside a systemd user unit, as in any desktop terminal, the launcher prefers
+# dbus-broker, whose service activation goes through the host's systemd user
+# manager instead of this private bus.
+ATSPI_DBUS_IMPLEMENTATION=dbus-daemon \
+  "${ATSPI_LAUNCHER}" --launch-immediately > "${ATSPI_LOG}" 2>&1 &
 ATSPI_PID=$!
 deadline=$((SECONDS + 15))
 while ((SECONDS < deadline)); do

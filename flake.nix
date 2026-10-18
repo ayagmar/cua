@@ -63,21 +63,16 @@
           # nixpkgs builds the AT-SPI launcher for NixOS's system profile.
           # The E2E shell also runs on non-NixOS hosts such as GitHub's Ubuntu
           # image, so point its private accessibility bus at store binaries.
-          # Prefer dbus-daemon: inside a systemd user unit (any desktop
-          # terminal) the launcher would otherwise pick dbus-broker, whose
-          # service activation goes through the host's systemd user manager.
           hostAtSpi = pkgs.at-spi2-core.overrideAttrs (old: {
-            mesonFlags =
-              map (
-                flag:
-                if pkgs.lib.hasPrefix "-Ddbus_daemon=" flag then
-                  "-Ddbus_daemon=${pkgs.dbus}/bin/dbus-daemon"
-                else if pkgs.lib.hasPrefix "-Ddbus_broker=" flag then
-                  "-Ddbus_broker=${pkgs.dbus-broker}/bin/dbus-broker-launch"
-                else
-                  flag
-              ) old.mesonFlags
-              ++ [ "-Ddefault_bus=dbus-daemon" ];
+            mesonFlags = map (
+              flag:
+              if pkgs.lib.hasPrefix "-Ddbus_daemon=" flag then
+                "-Ddbus_daemon=${pkgs.dbus}/bin/dbus-daemon"
+              else if pkgs.lib.hasPrefix "-Ddbus_broker=" flag then
+                "-Ddbus_broker=${pkgs.dbus-broker}/bin/dbus-broker-launch"
+              else
+                flag
+            ) old.mesonFlags;
           });
 
           waylandE2eLibraries = with pkgs; [

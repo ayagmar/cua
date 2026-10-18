@@ -357,9 +357,12 @@ Every Wayland mode unsets inherited `WAYLAND_SOCKET`, `NIRI_SOCKET`,
 `SWAYSOCK`, `I3SOCK`, `HYPRLAND_INSTANCE_SIGNATURE`,
 `DBUS_SESSION_BUS_ADDRESS`, and `AT_SPI_BUS_ADDRESS` before it starts its
 compositor, then starts its own session bus, AT-SPI bus, and Secret Service
-with keyrings under its runtime directory. A run from a desktop session
-therefore never reaches the host compositor, keyring, accessibility bus, or
-portals.
+with keyrings under its runtime directory. It asks the AT-SPI launcher for
+dbus-daemon through `ATSPI_DBUS_IMPLEMENTATION`, because inside a systemd user
+unit a launcher built to prefer dbus-broker would activate services through
+the host's systemd user manager. at-spi2-core 2.60.1 in the Nix shells honours
+it. A launcher from another source that ignores the variable can still reach
+the host's activation, so run the wrapper from the Nix shells.
 
 Run the nested compositor wrapper through
 `nix develop .#cua-driver-inject-e2e`. This environment is experimental and

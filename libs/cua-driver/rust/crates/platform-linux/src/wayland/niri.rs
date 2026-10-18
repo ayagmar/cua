@@ -59,6 +59,11 @@ pub const FRAME_MAX_AGE: Duration = Duration::from_secs(60);
 
 /// The compositor process recognised as niri for this driver process.
 static RECOGNIZED: OnceLock<libc::pid_t> = OnceLock::new();
+/// Why the recognised niri is too old for the adapter, if it is.
+static UNSUPPORTED: OnceLock<String> = OnceLock::new();
+/// The oldest niri release the adapter supports: 25.08 reports the window
+/// layout that geometry needs, and serves several requests per connection.
+const MIN_RELEASE: (u32, u32) = (25, 8);
 
 #[derive(Debug, PartialEq, Eq)]
 enum Attestation {
@@ -179,9 +184,26 @@ pub fn is_session() -> bool {
     {
         return false;
     }
-    let (attestation, _, lasting) = probe(None, QUERY_TIMEOUT);
+    let (attestation, connection, lasting) = probe(None, QUERY_TIMEOUT);
     match attestation {
         Attestation::Attested(pid) => {
+            // A niri too old for the adapter is still niri: it is recognised,
+            // and every route refuses with the reason.
+            let version = connection
+                .context("niri IPC connection unavailable")
+                .and_then(release_of);
+            match version {
+                Ok(version) => {
+                    if let Err(reason) = release_supported(&version) {
+                        tracing::warn!("{reason}");
+                        let _ = UNSUPPORTED.set(reason);
+                    }
+                }
+                Err(error) => {
+                    tracing::warn!("niri did not report its version: {error:#}");
+                    return false;
+                }
+            }
             let pinned = *RECOGNIZED.get_or_init(|| pid);
             tracing::info!(pid = pinned, "niri session recognised");
             true
@@ -221,11 +243,62 @@ fn session_check(adapter_on: bool, recognized: bool, socket_set: bool) -> Sessio
     }
 }
 
-/// A connection to the recognised niri process, re-attested each time.
-fn attested_connection(deadline: Instant) -> Result<UnixStream> {
+/// The `Version` reply on a newly attested connection, which carries only
+/// this request: niri before 25.05 serves one request per connection.
+fn release_of(connection: UnixStream) -> Result<String> {
+    let mut connection = Some(connection);
+    Ipc {
+        connect: move |_| {
+            connection
+                .take()
+                .context("niri IPC connection already used")
+        },
+        per_attempt: QUERY_TIMEOUT,
+        total: QUERY_TOTAL_TIMEOUT,
+        backoff: QUERY_RETRY_BACKOFF,
+        lines: None,
+    }
+    .query(Request::Version)
+}
+
+/// Whether the adapter supports niri `version`, such as `26.04 (8ed0da4)`.
+fn release_supported(version: &str) -> Result<(), String> {
+    let release = version
+        .split_once(" (")
+        .map_or(version, |(release, _)| release);
+    let mut numbers = release.split('.').map(str::parse::<u32>);
+    match (numbers.next(), numbers.next()) {
+        (Some(Ok(year)), Some(Ok(month))) if numbers.all(|number| number.is_ok()) => {
+            if (year, month) >= MIN_RELEASE {
+                Ok(())
+            } else {
+                Err(format!(
+                    "niri {release} is not supported: the niri adapter needs niri {}.{:02} or later",
+                    MIN_RELEASE.0, MIN_RELEASE.1
+                ))
+            }
+        }
+        _ => Err(format!(
+            "niri reports version {version:?}, which the niri adapter cannot read; it needs niri {}.{:02} or later",
+            MIN_RELEASE.0, MIN_RELEASE.1
+        )),
+    }
+}
+
+/// The recognised niri process, when the adapter supports it.
+fn pinned() -> Result<libc::pid_t> {
     let pinned = *RECOGNIZED
         .get()
         .context("niri session has not been recognised")?;
+    if let Some(reason) = UNSUPPORTED.get() {
+        bail!("{reason}");
+    }
+    Ok(pinned)
+}
+
+/// A connection to the recognised niri process, re-attested each time.
+fn attested_connection(deadline: Instant) -> Result<UnixStream> {
+    let pinned = pinned()?;
     match probe(Some(pinned), time_remaining(deadline)?) {
         (Attestation::Attested(_), Some(ipc), _) => Ok(ipc),
         (Attestation::Unrelated(reason) | Attestation::Refused(reason), ..) => bail!("{reason}"),
@@ -236,9 +309,7 @@ fn attested_connection(deadline: Instant) -> Result<UnixStream> {
 /// Bind a Wayland connection used for capture or input to the recognised
 /// niri process.
 pub(super) fn verify_wayland_peer(connection: &wayland_client::Connection) -> Result<()> {
-    let pinned = *RECOGNIZED
-        .get()
-        .context("niri session has not been recognised")?;
+    let pinned = pinned()?;
     let peer = peer_pid(connection.backend().poll_fd().as_raw_fd())?;
     if peer != pinned {
         bail!("WAYLAND_DISPLAY is served by pid {peer}, not the recognised niri pid {pinned}");
@@ -249,9 +320,7 @@ pub(super) fn verify_wayland_peer(connection: &wayland_client::Connection) -> Re
 /// A Wayland client socket proven to reach the recognised niri process, for
 /// a keyboard helper that must not rediscover the display on its own.
 pub(super) fn attested_wayland_socket() -> Result<UnixStream> {
-    let pinned = *RECOGNIZED
-        .get()
-        .context("niri session has not been recognised")?;
+    let pinned = pinned()?;
     let socket = super::compositor_peer::wayland_socket_with_timeout(QUERY_TIMEOUT)?;
     let peer = peer_pid(socket.as_raw_fd())?;
     if peer != pinned {
@@ -1178,6 +1247,11 @@ pub fn health_note() -> Option<String> {
             Attestation::Attested(_) => HealthSession::Inactive,
         };
         return Some(describe_health(session, Ok(1)));
+    }
+    if let Some(reason) = UNSUPPORTED.get() {
+        return Some(format!(
+            "niri: {reason}; niri window ids, focus and geometry refuse."
+        ));
     }
     let scene = ipc().scene();
     Some(describe_health(
@@ -2807,6 +2881,33 @@ mod tests {
         assert_eq!(session_check(true, false, false), SessionCheck::NotNiri);
         assert_eq!(session_check(true, false, true), SessionCheck::Probe);
         assert_eq!(session_check(false, true, true), SessionCheck::NotNiri);
+    }
+
+    #[test]
+    fn niri_older_than_25_08_is_refused_at_recognition() {
+        for version in [
+            "25.08 (6a1b2c3)",
+            "25.11.1 (abc)",
+            "26.04 (8ed0da4)",
+            "26.04",
+        ] {
+            assert_eq!(release_supported(version), Ok(()), "{version}");
+        }
+        // 25.05 still reads one request per connection; 25.08 added the
+        // window layout every geometry route needs.
+        assert_eq!(
+            release_supported("25.05.1 (abc)"),
+            Err("niri 25.05.1 is not supported: the niri adapter needs niri 25.08 or later".into())
+        );
+        assert!(release_supported("25.02").is_err());
+        for version in ["", "unknown (abc)", "25", "25.x"] {
+            assert_eq!(
+                release_supported(version),
+                Err(format!(
+                    "niri reports version {version:?}, which the niri adapter cannot read; it needs niri 25.08 or later"
+                )),
+            );
+        }
     }
 
     #[test]

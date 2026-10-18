@@ -933,11 +933,7 @@ impl Scene {
     /// Absolute virtual-pointer motion from an unbound pointer maps over the
     /// bounding box of every output's pointer rectangle.
     fn pointer_space(&self) -> Result<(i32, i32, u32, u32)> {
-        let mut rects = Vec::new();
-        for output in self.outputs.values() {
-            rects.extend(output.pointer_rect()?);
-        }
-        bounding_box(&rects).context("niri has no enabled output")
+        pointer_space_of(&self.outputs)
     }
 
     /// The one laid-out output. Display capture copies a single output, so
@@ -952,6 +948,14 @@ impl Scene {
             ),
         }
     }
+}
+
+fn pointer_space_of(outputs: &BTreeMap<String, IpcOutput>) -> Result<(i32, i32, u32, u32)> {
+    let mut rects = Vec::new();
+    for output in outputs.values() {
+        rects.extend(output.pointer_rect()?);
+    }
+    bounding_box(&rects).context("niri has no enabled output")
 }
 
 fn floating_tile(logical: &IpcLogical, layout: &IpcLayout) -> Option<Exact> {
@@ -1022,8 +1026,9 @@ pub fn version() -> Result<String> {
 }
 
 /// Pointer space for `motion_absolute`: `(origin_x, origin_y, width, height)`.
+/// Only outputs are queried: the gate rechecks this inside a double click.
 pub fn pointer_space() -> Result<(i32, i32, u32, u32)> {
-    ipc().scene()?.pointer_space()
+    pointer_space_of(&ipc().query(Request::Outputs)?)
 }
 
 /// The desktop frame (the single output's logical rectangle) and the pointer

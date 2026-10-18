@@ -1969,7 +1969,7 @@ pub fn click_desktop(
 }
 
 /// Recheck an admitted niri pointer action right before an event that acts
-/// on the target: the first motion, and every press or wheel event. niri
+/// on the target: the first motion, and the first press or wheel event. niri
 /// sends no event when outputs change, so the pointer space is reread too.
 fn niri_gate_holds(gate: &mut Option<niri::PointerGate>, sess: &VptrSession) -> anyhow::Result<()> {
     let Some(gate) = gate else {
@@ -1992,6 +1992,23 @@ fn pointer_space_holds(
         session == current,
         "foreground_unavailable: the niri pointer space changed from {session:?} to {current:?}; take a new screenshot"
     );
+    Ok(())
+}
+
+/// Deliver the `count` events of one gesture (the clicks of a double click,
+/// the ticks of a scroll) as one action: the last recheck runs before the
+/// first event. A refusal after an event had landed would report no effect
+/// while the app already reacted, and a retry would add to it.
+fn gated_series<S>(
+    sess: &mut S,
+    count: u32,
+    recheck: impl FnOnce(&S) -> anyhow::Result<()>,
+    mut deliver: impl FnMut(&mut S, u32) -> anyhow::Result<()>,
+) -> anyhow::Result<()> {
+    recheck(sess)?;
+    for i in 0..count.max(1) {
+        deliver(sess, i)?;
+    }
     Ok(())
 }
 
@@ -2068,28 +2085,31 @@ fn click_vptr(
     let mut gate = niri_pointer_gate(window_id, &sess, &[aimed])?;
     let btn = evdev_pointer_button(button);
     niri_gate_holds(&mut gate, &sess)?;
-    for i in 0..count.max(1) {
-        if i > 0 {
-            std::thread::sleep(std::time::Duration::from_millis(80));
-        }
-        if i == 0 {
-            sess.point_at(px, py)?;
-        } else {
-            sess.vptr.motion_absolute(event_time_ms(), px, py, w, h);
+    sess.point_at(px, py)?;
+    std::thread::sleep(std::time::Duration::from_millis(15));
+    gated_series(
+        &mut sess,
+        count,
+        |sess| niri_gate_holds(&mut gate, sess),
+        |sess, i| {
+            if i > 0 {
+                std::thread::sleep(std::time::Duration::from_millis(80));
+                sess.vptr.motion_absolute(event_time_ms(), px, py, w, h);
+                sess.vptr.frame();
+                sess.queue.roundtrip(&mut sess.state)?;
+                std::thread::sleep(std::time::Duration::from_millis(15));
+            }
+            sess.vptr.button(event_time_ms(), btn, ButtonState::Pressed);
             sess.vptr.frame();
             sess.queue.roundtrip(&mut sess.state)?;
-        }
-        std::thread::sleep(std::time::Duration::from_millis(15));
-        niri_gate_holds(&mut gate, &sess)?;
-        sess.vptr.button(event_time_ms(), btn, ButtonState::Pressed);
-        sess.vptr.frame();
-        sess.queue.roundtrip(&mut sess.state)?;
-        std::thread::sleep(std::time::Duration::from_millis(20));
-        sess.vptr
-            .button(event_time_ms(), btn, ButtonState::Released);
-        sess.vptr.frame();
-        sess.queue.roundtrip(&mut sess.state)?;
-    }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            sess.vptr
+                .button(event_time_ms(), btn, ButtonState::Released);
+            sess.vptr.frame();
+            sess.queue.roundtrip(&mut sess.state)?;
+            Ok(())
+        },
+    )?;
     // Keep the synthetic-cursor registry in sync with the warp we just
     // performed so a subsequent `get_cursor_position` reflects reality.
     record_synth_cursor(sess.origin_x + px as i32, sess.origin_y + py as i32);
@@ -2290,16 +2310,21 @@ fn scroll_vptr(
     // axis_discrete: `value` is logical units (the wayland-rs wrapper
     // converts to wl_fixed internally); `discrete` is the tick count.
     let value: f64 = (sign as f64) * 10.0;
-    for i in 0..amount.max(1) {
-        if i > 0 {
-            std::thread::sleep(std::time::Duration::from_millis(25));
-        }
-        niri_gate_holds(&mut gate, &sess)?;
-        sess.vptr.axis_source(AxisSource::Wheel);
-        sess.vptr.axis_discrete(event_time_ms(), axis, value, sign);
-        sess.vptr.frame();
-        sess.queue.roundtrip(&mut sess.state)?;
-    }
+    gated_series(
+        &mut sess,
+        amount,
+        |sess| niri_gate_holds(&mut gate, sess),
+        |sess, i| {
+            if i > 0 {
+                std::thread::sleep(std::time::Duration::from_millis(25));
+            }
+            sess.vptr.axis_source(AxisSource::Wheel);
+            sess.vptr.axis_discrete(event_time_ms(), axis, value, sign);
+            sess.vptr.frame();
+            sess.queue.roundtrip(&mut sess.state)?;
+            Ok(())
+        },
+    )?;
     sess.vptr.destroy();
     sess.queue.roundtrip(&mut sess.state)?;
     Ok(())
@@ -4295,6 +4320,46 @@ mod tests {
                 super::NO_VPTR_MARKER
             )
         );
+    }
+
+    #[test]
+    fn a_gesture_refuses_only_before_its_first_event() {
+        // The first click opens a window over the point, so every later
+        // recheck would refuse. A refusal must mean nothing was delivered:
+        // the double click goes through as one action.
+        let mut delivered = 0;
+        let mut checks = 0;
+        super::gated_series(
+            &mut (),
+            2,
+            |_| {
+                checks += 1;
+                anyhow::ensure!(checks == 1, "foreground_unavailable: layout changed");
+                Ok(())
+            },
+            |_, _| {
+                delivered += 1;
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(delivered, 2);
+
+        let mut delivered = 0;
+        let refused = super::gated_series(
+            &mut (),
+            3,
+            |_| anyhow::bail!("foreground_unavailable: layout changed"),
+            |_, _| {
+                delivered += 1;
+                Ok(())
+            },
+        );
+        assert_eq!(
+            refused.unwrap_err().to_string(),
+            "foreground_unavailable: layout changed"
+        );
+        assert_eq!(delivered, 0);
     }
 
     #[test]

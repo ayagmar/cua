@@ -1143,6 +1143,13 @@ pub mod linux {
         super::niri::focus(target)
     }
 
+    pub(crate) fn niri_wait_for_focus_transfer(
+        from: TargetWindow,
+        to: TargetWindow,
+    ) -> Result<(), ObserverError> {
+        super::niri::wait_for_focus_transfer(from, to, Duration::from_secs(3))
+    }
+
     pub(crate) fn hyprland_monitor_regions() -> Result<Vec<(f64, f64, f64, f64)>, ObserverError> {
         super::hyprland::monitor_regions()
     }

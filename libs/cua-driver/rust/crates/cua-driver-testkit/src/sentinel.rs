@@ -624,13 +624,17 @@ fn focus_sway_target(driver: &mut impl Driver, target: TargetWindow) -> Result<(
     run_sway_container_command(con_id, &["focus"], "focus canary")
 }
 
+#[cfg(target_os = "linux")]
+fn is_niri_session() -> bool {
+    is_wayland_session()
+        && std::env::var("CUA_E2E_WAYLAND_SESSION").is_ok_and(|session| session == "niri")
+}
+
 /// niri shows a focused floating window above the fullscreen sentinel, so the
 /// niri canary needs no fullscreen toggle, only the compositor's own focus.
 #[cfg(target_os = "linux")]
 fn focus_niri_target(target: TargetWindow) -> Result<(), String> {
-    let is_niri = is_wayland_session()
-        && std::env::var("CUA_E2E_WAYLAND_SESSION").is_ok_and(|session| session == "niri");
-    if !is_niri {
+    if !is_niri_session() {
         return Ok(());
     }
     crate::observer::linux::niri_focus(target).map_err(|error| error.to_string())
@@ -1092,6 +1096,10 @@ fn wait_for_native_focus_lost(
 
     if hyprland::is_session() {
         return hyprland::wait_for_focus_transfer(target, background_target);
+    }
+    if is_niri_session() {
+        return crate::observer::linux::niri_wait_for_focus_transfer(target, background_target)
+            .map_err(|error| error.to_string());
     }
 
     let backend = NativeObserver::new();

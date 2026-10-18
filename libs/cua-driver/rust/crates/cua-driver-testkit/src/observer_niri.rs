@@ -257,6 +257,51 @@ pub(super) fn focus_identity() -> Result<Option<u64>, ObserverError> {
     Ok(focused(&query::<Vec<Window>>("Windows")?)?.map(|window| window.id))
 }
 
+/// Whether focus left `from` for `to`, both resolved by exact identity. This
+/// does not use z-order: the tiled sentinel has no IPC position, so its own
+/// z-order is ambiguous once a floating window holds focus.
+fn focus_transferred(
+    windows: &[Window],
+    from: TargetWindow,
+    to: TargetWindow,
+) -> Result<bool, ObserverError> {
+    let resolve = |target| {
+        select(windows, target)?
+            .map(|window| window.id)
+            .ok_or_else(|| ObserverError::new("niri focus-transfer window not found"))
+    };
+    let (from, to) = (resolve(from)?, resolve(to)?);
+    if from == to {
+        return Err(ObserverError::new(
+            "niri focus transfer requires two distinct windows",
+        ));
+    }
+    Ok(focused(windows)?.map(|window| window.id) == Some(to))
+}
+
+pub(super) fn wait_for_focus_transfer(
+    from: TargetWindow,
+    to: TargetWindow,
+    timeout: Duration,
+) -> Result<(), ObserverError> {
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        let windows: Vec<Window> = query("Windows")?;
+        if focus_transferred(&windows, from, to)? {
+            return Ok(());
+        }
+        if std::time::Instant::now() >= deadline {
+            return Err(ObserverError::new(format!(
+                "niri focus did not move from window {} to window {} within {timeout:?}; focused: {:?}",
+                from.native_id,
+                to.native_id,
+                focused(&windows)?.map(|window| window.id)
+            )));
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
+}
+
 /// Focuses the target through niri's own action, for test setup only.
 pub(super) fn focus(target: TargetWindow) -> Result<(), ObserverError> {
     let id = select(&query::<Vec<Window>>("Windows")?, target)?
@@ -412,6 +457,27 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("native_id required"));
+    }
+
+    #[test]
+    fn focus_canary_sees_the_floating_target_take_focus_from_the_sentinel() {
+        let sentinel = target(10, 100);
+        let harness = target(20, 200);
+        let before = desktop(vec![
+            fullscreen(window(10, 100, false, true)),
+            window(20, 200, true, false),
+        ]);
+        assert!(!focus_transferred(&before.windows, sentinel, harness).unwrap());
+
+        let after = desktop(vec![
+            fullscreen(window(10, 100, false, false)),
+            window(20, 200, true, true),
+        ]);
+        assert!(focus_transferred(&after.windows, sentinel, harness).unwrap());
+        // The unfocused tiled sentinel has no IPC position, so z-order cannot
+        // decide this canary.
+        assert!(classify(&after, sentinel).is_err());
+        assert!(focus_transferred(&after.windows, sentinel, sentinel).is_err());
     }
 
     #[test]

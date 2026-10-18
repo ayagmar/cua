@@ -6949,7 +6949,9 @@ impl Tool for ClickTool {
             // X11 event for toolkits that accept it.
             let cursor_id_for_fallback = cursor_id.clone();
             let result = tokio::task::spawn_blocking(move || -> anyhow::Result<PointerRoute> {
-                let (xid2, lx, ly) = checked_element_local_coords(pid, idx, xid_hint)?;
+                // Refuse before resolving coordinates: the refusal does not
+                // depend on where the element is, and a window without
+                // compositor geometry must not turn it into a lookup error.
                 let modifier_refs: Vec<&str> = modifiers.iter().map(String::as_str).collect();
                 if crate::wayland::wayland_input_enabled() && !modifier_refs.is_empty() {
                     anyhow::bail!(
@@ -6957,6 +6959,7 @@ impl Tool for ClickTool {
                          the pointer route cannot carry keyboard modifier state"
                     );
                 }
+                let (xid2, lx, ly) = checked_element_local_coords(pid, idx, xid_hint)?;
                 // An explicit X11 foreground request needs the real XTest path
                 // even for a plain click. Some native widgets (notably GTK
                 // selectable rows) expose bounds but no AT-SPI Action and

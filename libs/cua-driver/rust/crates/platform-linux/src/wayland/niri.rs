@@ -418,9 +418,18 @@ struct IpcWindow {
     pid: Option<i32>,
     workspace_id: Option<u64>,
     is_focused: bool,
+    /// When the window last had focus; absent on older releases.
+    #[serde(default)]
+    focus_timestamp: Option<IpcTimestamp>,
     /// Added in niri 25.08; absent on older releases.
     #[serde(default)]
     layout: Option<IpcLayout>,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+struct IpcTimestamp {
+    secs: u64,
+    nanos: u32,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq)]
@@ -666,6 +675,10 @@ pub struct Window {
     pub title: String,
     pub app_id: String,
     pub focused: bool,
+    /// Focus recency among all windows, higher is more recent and the
+    /// focused window highest. niri reports no stacking order; this is the
+    /// best available "which of a process's windows is in use".
+    pub focus_rank: usize,
     /// niri shows it: a placed floating window, or the active tiled window of
     /// an active workspace while the overview is closed.
     pub on_screen: bool,
@@ -783,6 +796,14 @@ impl Scene {
                 title: window.title.clone().unwrap_or_default(),
                 app_id: window.app_id.clone().unwrap_or_default(),
                 focused: window.is_focused,
+                focus_rank: self
+                    .windows
+                    .iter()
+                    .filter(|other| {
+                        (other.is_focused, other.focus_timestamp)
+                            < (window.is_focused, window.focus_timestamp)
+                    })
+                    .count(),
                 on_screen: self.on_screen(window, &placement),
                 placement,
             });
@@ -2070,6 +2091,20 @@ mod tests {
     }
 
     // ── Placement ───────────────────────────────────────────────────────────
+
+    #[test]
+    fn the_focused_then_most_recently_focused_window_ranks_highest() {
+        // A main window focused at 805 s and its floating dialog at 804 s.
+        let main = tiled(5, 1, (402.0, 448.0));
+        let mut dialog = floating(7, 1, (100.0, 60.0), (300, 200));
+        let rank = |windows: Vec<Value>, id| one_output(windows).window(id).unwrap().focus_rank;
+        assert!(
+            rank(vec![main.clone(), dialog.clone()], 5)
+                > rank(vec![main.clone(), dialog.clone()], 7)
+        );
+        dialog["is_focused"] = json!(true);
+        assert!(rank(vec![main.clone(), dialog.clone()], 7) > rank(vec![main, dialog], 5));
+    }
 
     #[test]
     fn floating_window_geometry_adds_output_origin_tile_and_offset() {

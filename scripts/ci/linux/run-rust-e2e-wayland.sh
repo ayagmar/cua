@@ -91,7 +91,10 @@ fi
 # fullscreen sentinel; the testkit observer relies on that. CUA_E2E_NIRI_SCALE
 # sets the output scale for a focused fractional-scale smoke. Harness sizes are
 # logical, so divide them by the scale: the windows keep Sway's 940x780
-# physical pixels and stay inside the smaller logical output.
+# physical pixels and stay inside the smaller logical output. prefer-no-csd
+# matches Sway's server-side decorations: with client-side ones a GTK 3 or
+# Chromium accessible frame includes shadow margins that niri does not report,
+# and the driver then publishes no element frames for that window.
 NIRI_SCALE="${CUA_E2E_NIRI_SCALE:-1}"
 NIRI_HARNESS_WIDTH="$(awk -v scale="${NIRI_SCALE}" 'BEGIN { printf "%d", 940 / scale }')"
 NIRI_HARNESS_HEIGHT="$(awk -v scale="${NIRI_SCALE}" 'BEGIN { printf "%d", 780 / scale }')"
@@ -99,6 +102,7 @@ cat > "${NIRI_CONFIG}" <<EOF
 hotkey-overlay {
     skip-at-startup
 }
+prefer-no-csd
 xwayland-satellite {
     off
 }

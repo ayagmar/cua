@@ -1200,12 +1200,16 @@ fn restore_workspace<C: FnMut(Instant) -> Result<UnixStream>>(
 /// only changes a title or similar metadata does not.
 struct LayoutWatch {
     layouts: HashMap<u64, serde_json::Value>,
+    /// A window the driver itself is focusing: the focus events naming it
+    /// are expected. Focus moves no window.
+    focusing: Option<u64>,
 }
 
 impl LayoutWatch {
     fn new() -> Self {
         Self {
             layouts: HashMap::new(),
+            focusing: None,
         }
     }
 
@@ -1233,6 +1237,17 @@ impl LayoutWatch {
             | "CastsChanged"
             | "CastStartedOrChanged"
             | "CastStopped" => false,
+            "WindowFocusChanged" => {
+                self.focusing.is_none()
+                    || body.get("id").and_then(serde_json::Value::as_u64) != self.focusing
+            }
+            "WorkspaceActiveWindowChanged" => {
+                self.focusing.is_none()
+                    || body
+                        .get("active_window_id")
+                        .and_then(serde_json::Value::as_u64)
+                        != self.focusing
+            }
             "WindowsChanged" => {
                 self.layouts = body
                     .get("windows")
@@ -1377,17 +1392,42 @@ fn aimed_rect(window: u64, point: (i32, i32)) -> Option<Rect> {
         .map(|aim| aim.rect)
 }
 
+/// A window-addressed pointer action admitted on a quiet layout. The event
+/// stream stays open until the input is sent, so a change in between refuses.
+pub struct PointerGate(Quiet);
+
+impl PointerGate {
+    /// Refuse when the layout changed after admission. Call right before the
+    /// first motion or button event.
+    pub fn confirm(mut self) -> Result<()> {
+        if self.0.changed().map_err(input_unavailable)? {
+            return Err(foreground_unavailable(
+                "the niri layout changed after the pointer target was checked; take a new screenshot",
+            ));
+        }
+        Ok(())
+    }
+}
+
 /// Gate window-addressed pointer input: wait until the layout is quiet,
 /// then require the target to be placed where its coordinates were computed
 /// and every point to land on it rather than on another floating window.
-pub fn settle_pointer(window_id: u64, points: &[(i32, i32)]) -> Result<()> {
+/// With `activate`, focus the window only once all of that holds, so a
+/// refused action leaves focus alone.
+pub fn gate_pointer(window_id: u64, points: &[(i32, i32)], activate: bool) -> Result<PointerGate> {
     let before = window_for_id(window_id).map_err(input_unavailable)?;
     let before = placed_or_refuse(&before)?.rect;
-    let _quiet = settled().map_err(input_unavailable)?;
+    let mut quiet = settled().map_err(input_unavailable)?;
     let window = window_for_id(window_id).map_err(input_unavailable)?;
     pointer_admission(&window, before, points, |point| {
         aimed_rect(window_id, point)
-    })
+    })?;
+    if activate {
+        quiet.watch.focusing = Some(window_id);
+        activate_in(&mut ipc(), window_id, None, FOCUS_CONFIRM_TIMEOUT)
+            .map_err(input_unavailable)?;
+    }
+    Ok(PointerGate(quiet))
 }
 
 fn pointer_admission(
@@ -2496,6 +2536,40 @@ mod tests {
         assert!(!watch.moves(&json!({"WindowFocusTimestampChanged": {"id": 7}})));
         assert!(watch.moves(&json!({"WorkspaceActivated": {"id": 2, "focused": true}})));
         assert!(watch.moves(&json!({"SomethingFromALaterNiri": {}})));
+    }
+
+    #[test]
+    fn only_the_drivers_own_focus_change_is_expected() {
+        let mut watch = LayoutWatch::new();
+        assert!(watch.moves(&json!({"WindowFocusChanged": {"id": 7}})));
+        watch.focusing = Some(7);
+        assert!(!watch.moves(&json!({"WindowFocusChanged": {"id": 7}})));
+        assert!(!watch.moves(
+            &json!({"WorkspaceActiveWindowChanged": {"workspace_id": 1, "active_window_id": 7}})
+        ));
+        assert!(watch.moves(&json!({"WindowFocusChanged": {"id": 8}})));
+        assert!(watch.moves(&json!({"WindowFocusChanged": {"id": null}})));
+        assert!(watch.moves(
+            &json!({"WorkspaceActiveWindowChanged": {"workspace_id": 1, "active_window_id": 8}})
+        ));
+    }
+
+    #[test]
+    fn a_layout_change_after_admission_refuses_the_pointer_input() {
+        let quiet = Quiet::wait(
+            event_stream(vec![(
+                Duration::from_millis(250),
+                json!({"WindowLayoutsChanged": {"changes": []}}),
+            )]),
+            Duration::from_millis(100),
+            Duration::from_secs(1),
+        )
+        .unwrap();
+        std::thread::sleep(Duration::from_millis(300));
+        assert_eq!(
+            PointerGate(quiet).confirm().unwrap_err().to_string(),
+            "foreground_unavailable: the niri layout changed after the pointer target was checked; take a new screenshot"
+        );
     }
 
     fn event_stream(events: Vec<(Duration, Value)>) -> UnixStream {

@@ -1582,11 +1582,9 @@ fn open_vptr_session_in(
     activate_window_id: Option<u64>,
     snapshot: Option<&hyprland::DesktopSnapshot>,
 ) -> anyhow::Result<VptrSession> {
+    // A niri window is activated by the pointer gate, once the action is
+    // admitted; its id never reaches the foreign-toplevel match below.
     let niri = is_wayland() && niri::is_session();
-    if let (true, Some(id)) = (niri, activate_window_id) {
-        // A niri id never reaches the foreign-toplevel title match below.
-        niri::activate(id, None)?;
-    }
     let conn = Connection::connect_to_env()?;
     if niri {
         niri::verify_wayland_peer(&conn)?;
@@ -1913,17 +1911,18 @@ pub fn click_desktop(
     )
 }
 
-/// On niri, window-addressed pointer input waits for the layout to settle and
-/// proves each layout point lands on the target window (see
-/// [`niri::settle_pointer`]). Desktop-scope input names no window: its points
-/// are desktop-frame pixels and need no window geometry.
+/// On niri, window-addressed pointer input waits for the layout to settle,
+/// proves each layout point lands on the target window and then activates it
+/// (see [`niri::gate_pointer`]). Desktop-scope input names no window: its
+/// points are desktop-frame pixels and need no window geometry. Confirm the
+/// returned gate right before sending the first event.
 fn niri_pointer_gate(
     window_id: Option<u64>,
     sess: &VptrSession,
     points: &[(i32, i32)],
-) -> anyhow::Result<()> {
+) -> anyhow::Result<Option<niri::PointerGate>> {
     if !(is_wayland() && niri::is_session()) {
-        return Ok(());
+        return Ok(None);
     }
     // `motion_absolute` clamps into the pointer space: a point it would move
     // lands somewhere other than where it was aimed.
@@ -1941,10 +1940,14 @@ fn niri_pointer_gate(
             );
         }
     }
-    match window_id.or_else(|| current_foreground_target().map(|(_, id)| id)) {
-        Some(id) => niri::settle_pointer(id, points),
-        None => Ok(()),
-    }
+    let gate = match window_id {
+        Some(id) => niri::gate_pointer(id, points, true)?,
+        None => match current_foreground_target() {
+            Some((_, id)) => niri::gate_pointer(id, points, false)?,
+            None => return Ok(None),
+        },
+    };
+    Ok(Some(gate))
 }
 
 /// wlroots virtual-pointer implementation of [`click`]. Falls back to libei via
@@ -1971,8 +1974,9 @@ fn click_vptr(
     } else {
         (x, y)
     };
-    niri_pointer_gate(window_id, &sess, &[aimed])?;
+    let gate = niri_pointer_gate(window_id, &sess, &[aimed])?;
     let btn = evdev_pointer_button(button);
+    gate.map_or(Ok(()), niri::PointerGate::confirm)?;
     for i in 0..count.max(1) {
         if i > 0 {
             std::thread::sleep(std::time::Duration::from_millis(80));
@@ -2177,7 +2181,8 @@ fn scroll_vptr(
     let mut sess = open_vptr_session_in(window_id, snapshot)?;
     if let Some((x, y)) = point {
         let (px, py) = sess.abs(x, y);
-        niri_pointer_gate(window_id, &sess, &[(x, y)])?;
+        let gate = niri_pointer_gate(window_id, &sess, &[(x, y)])?;
+        gate.map_or(Ok(()), niri::PointerGate::confirm)?;
         sess.point_at(px, py)?;
         record_synth_cursor(sess.origin_x + px as i32, sess.origin_y + py as i32);
         std::thread::sleep(std::time::Duration::from_millis(15));
@@ -2276,7 +2281,8 @@ fn move_cursor_absolute_vptr(
     let mut sess = open_vptr_session_in(window_id, snapshot)?;
     let (w, h) = (sess.output_w, sess.output_h);
     let (px, py) = sess.abs(x, y);
-    niri_pointer_gate(window_id, &sess, &[(x, y)])?;
+    let gate = niri_pointer_gate(window_id, &sess, &[(x, y)])?;
+    gate.map_or(Ok(()), niri::PointerGate::confirm)?;
     sess.vptr.motion_absolute(event_time_ms(), px, py, w, h);
     sess.vptr.frame();
     sess.queue.roundtrip(&mut sess.state)?;
@@ -2374,7 +2380,8 @@ fn drag_vptr(
     let clamp_xy = |x: i32, y: i32| pointer_abs(origin_x, origin_y, w, h, x, y);
     let (fx, fy) = clamp_xy(from_x, from_y);
     let (tx, ty) = clamp_xy(to_x, to_y);
-    niri_pointer_gate(window_id, &sess, &[(from_x, from_y), (to_x, to_y)])?;
+    let gate = niri_pointer_gate(window_id, &sess, &[(from_x, from_y), (to_x, to_y)])?;
+    gate.map_or(Ok(()), niri::PointerGate::confirm)?;
     sess.vptr.motion_absolute(event_time_ms(), fx, fy, w, h);
     sess.vptr.frame();
     sess.queue.roundtrip(&mut sess.state)?;

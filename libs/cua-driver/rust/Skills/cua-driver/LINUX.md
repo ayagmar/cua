@@ -365,6 +365,38 @@ packaging and lifecycle validation require separate evidence. Physical Omarchy
 parity requires separate acceptance; it is not a gate for publishing a validated
 Fleet image.
 
+### niri
+
+niri 25.08 or later is recognised when `NIRI_SOCKET` and `WAYLAND_DISPLAY`
+belong to the same niri process; window ids are niri's own. niri has no
+RemoteDesktop or libei, so input is foreground only and the libei/portal
+recovery refuses. Refusals carry `foreground_unavailable` and a `suggestion`
+that names the remedy.
+
+- Floating windows get window capture, cropped from the output, and
+  window-coordinate pointer input from niri's floating geometry. A point under
+  another floating window refuses, because niri reports no stacking order.
+- Tiled windows, niri's default layout, refuse window capture and
+  window-coordinate pointer input: niri does not report where they are.
+  `get_window_state` still returns their accessibility tree, and element
+  actions work. For pixels, call `get_desktop_state` and act at desktop scope
+  (no `pid` or `window_id`), or float the window.
+- Desktop-scope pointer input takes pixels of the latest `get_desktop_state`
+  screenshot. It refuses before there is one, when `capture_id` names an older
+  one, after 60 s, past the output edge, and once niri reports a layout or
+  focus change; take a new screenshot then. A click that focuses another
+  window is such a change for the next call.
+- `coordinate_frame:"desktop"` with a window target refuses.
+- Foreground actions activate the target, act, and give focus back to the
+  window that had it. Text and keys use niri's own keymap, and focus is checked
+  before every key.
+- `list_windows` gives tiled windows 0x0 bounds, and a tiled window reads
+  `is_on_screen:true` only while it is the active window of a shown workspace.
+  With a floating window active, visible tiled windows read `false`, so do not
+  filter niri windows on `is_on_screen`.
+- With more than one output, window capture, `get_desktop_state`, and
+  desktop-scope input refuse.
+
 ## Quick triage
 
 If a tool call surprises you on Linux:

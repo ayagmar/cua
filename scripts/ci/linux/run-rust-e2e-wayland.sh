@@ -54,6 +54,9 @@ fi
 
 unset DISPLAY
 unset WAYLAND_DISPLAY
+# A runner started from a desktop inherits that session's sockets. Export only
+# this session's own so no test can reach the host compositor.
+unset WAYLAND_SOCKET NIRI_SOCKET SWAYSOCK I3SOCK HYPRLAND_INSTANCE_SIGNATURE
 export XDG_RUNTIME_DIR="${RUNTIME_DIR}"
 export XDG_SESSION_TYPE=wayland
 export XDG_CURRENT_DESKTOP=sway

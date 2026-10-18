@@ -6036,6 +6036,32 @@ fn capture_admission_error(error: anyhow::Error) -> ToolResult {
 }
 static CLICK_DEF: std::sync::OnceLock<ToolDef> = std::sync::OnceLock::new();
 
+/// Wheel detents for a compositor scroll: one per line, and a page as the
+/// same detent approximation the Hyprland route documents.
+fn wheel_ticks(amount: usize, by: cua_driver_contract::ScrollBy) -> u32 {
+    let detents = match by {
+        cua_driver_contract::ScrollBy::Line => amount,
+        cua_driver_contract::ScrollBy::Page => {
+            amount * crate::wayland::hyprland_input::PAGE_WHEEL_DETENTS
+        }
+    };
+    detents as u32
+}
+
+#[cfg(test)]
+#[test]
+fn a_page_scroll_sends_more_than_one_detent_per_page() {
+    // `by: "page"` used to send `amount` detents, the same as lines: two
+    // pages moved a WebKitGTK scroller 80 px under niri, less than its
+    // 128 px viewport.
+    use cua_driver_contract::ScrollBy;
+    assert_eq!(wheel_ticks(2, ScrollBy::Line), 2);
+    assert_eq!(
+        wheel_ticks(2, ScrollBy::Page),
+        2 * crate::wayland::hyprland_input::PAGE_WHEEL_DETENTS as u32
+    );
+}
+
 /// Presses in one click train: 1 to 3, as the contract states. A niri click
 /// train is one gated action, so a larger count would mean seconds of
 /// presses no recheck covers.
@@ -10167,13 +10193,14 @@ impl Tool for ScrollTool {
                 Ok(point) => point,
                 Err(error) => return input_error_result(error),
             };
+            let ticks = wheel_ticks(amount, by);
             let result = tokio::task::spawn_blocking(move || {
-                crate::wayland::scroll_at(xid, output_point, &direction_for_wayland, amount as u32)
+                crate::wayland::scroll_at(xid, output_point, &direction_for_wayland, ticks)
             })
             .await;
             return match result {
                 Ok(Ok(())) => ToolResult::text(format!(
-                    "Scrolled {direction} {amount} ticks (delivery_mode=foreground)."
+                    "Scrolled {direction} {ticks} ticks (delivery_mode=foreground)."
                 ))
                 .with_structured(json!({ "verified": false, "delivery_mode": "foreground" })),
                 Ok(Err(error)) => ToolResult::error(error.to_string()),

@@ -1504,7 +1504,15 @@ fn open_vptr_session_in(
     activate_window_id: Option<u64>,
     snapshot: Option<&hyprland::DesktopSnapshot>,
 ) -> anyhow::Result<VptrSession> {
+    let niri = is_wayland() && niri::is_session();
+    if let (true, Some(id)) = (niri, activate_window_id) {
+        // A niri id never reaches the foreign-toplevel title match below.
+        niri::activate(id, None)?;
+    }
     let conn = Connection::connect_to_env()?;
+    if niri {
+        niri::verify_wayland_peer(&conn)?;
+    }
     let mut queue = conn.new_event_queue::<State>();
     let qh = queue.handle();
     conn.display().get_registry(&qh, ());
@@ -1547,7 +1555,7 @@ fn open_vptr_session_in(
 
     // foreign-toplevel is only needed to activate a specific window before
     // synthesising input; require it only when a caller actually asks for that.
-    if activate_window_id.is_some() && state.manager.is_none() {
+    if activate_window_id.is_some() && !niri && state.manager.is_none() {
         anyhow::bail!("compositor does not expose zwlr_foreign_toplevel_manager_v1");
     }
 
@@ -1555,7 +1563,7 @@ fn open_vptr_session_in(
         anyhow::anyhow!("compositor exposed no wl_seat for virtual-pointer input")
     })?;
 
-    if let Some(id) = activate_window_id {
+    if let Some(id) = activate_window_id.filter(|_| !niri) {
         let handle = matching_handle(&state, id)
             .ok_or_else(|| anyhow::anyhow!("no native Wayland toplevel for window_id {id}"))?;
         handle.activate(&seat);
@@ -1610,6 +1618,11 @@ pub fn activate_window_for_input_target(
             return Ok(());
         }
         anyhow::bail!("foreground_unavailable: exact-address Hyprland activation is not implemented; refusing title-based activation");
+    }
+    if is_wayland() && niri::is_session() {
+        // A niri id never enters the foreign-toplevel title route: focus the
+        // exact window and read the focus back.
+        return niri::activate(window_id, target_pid);
     }
     if is_inject_mode() {
         let pid = target_pid.ok_or_else(|| {
@@ -1679,6 +1692,9 @@ pub fn with_target_foreground<T>(
     body: impl FnOnce() -> anyhow::Result<T>,
 ) -> anyhow::Result<T> {
     let _target_guard = bind_foreground_target(pid, window_id);
+    if is_wayland() && niri::is_session() {
+        return niri::with_focused_window(pid, window_id, body);
+    }
     if let Some(window) = sway_ipc::window_for_id(window_id) {
         if window.pid != pid {
             anyhow::bail!(

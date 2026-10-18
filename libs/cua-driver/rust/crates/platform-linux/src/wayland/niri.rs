@@ -166,6 +166,19 @@ fn attested_connection(deadline: Instant) -> Result<UnixStream> {
     }
 }
 
+/// Bind a Wayland connection used for capture or input to the recognised
+/// niri process.
+pub(super) fn verify_wayland_peer(connection: &wayland_client::Connection) -> Result<()> {
+    let pinned = *RECOGNIZED
+        .get()
+        .context("niri session has not been recognised")?;
+    let peer = peer_pid(connection.backend().poll_fd().as_raw_fd())?;
+    if peer != pinned {
+        bail!("WAYLAND_DISPLAY is served by pid {peer}, not the recognised niri pid {pinned}");
+    }
+    Ok(())
+}
+
 fn ipc() -> Ipc<impl FnMut(Instant) -> Result<UnixStream>> {
     Ipc {
         connect: attested_connection,

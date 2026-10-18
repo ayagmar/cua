@@ -1163,6 +1163,12 @@ pub mod linux {
         }
     }
 
+    /// Lets the niri observer certify occlusion behind this sentinel window
+    /// while its journal reports fullscreen; `None` clears it.
+    pub(crate) fn niri_register_sentinel(sentinel: Option<(TargetWindow, std::path::PathBuf)>) {
+        super::niri::register_sentinel(sentinel);
+    }
+
     pub(crate) fn niri_focus(target: TargetWindow) -> Result<(), ObserverError> {
         super::niri::focus(target)
     }

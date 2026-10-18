@@ -157,7 +157,11 @@ function createWindow() {
                     mainWindow.webContents.send('cua-e2e-sentinel-arm-setup-click', request.token);
                   }
                 }
-                mainWindow.webContents.send('cua-e2e-sentinel-heartbeat-probe');
+                // Fullscreen as the compositor's last configure set it; niri's
+                // IPC cannot tell a fullscreen tile from a maximized one.
+                mainWindow.webContents.send('cua-e2e-sentinel-heartbeat-probe', {
+                  fullscreen: mainWindow.isFullScreen(),
+                });
               }
             }, 100);
             sentinelHeartbeatTimer.unref();

@@ -23,6 +23,13 @@ pub struct ForegroundSentinel {
     _user_data: tempfile::TempDir,
 }
 
+#[cfg(target_os = "linux")]
+impl Drop for ForegroundSentinel {
+    fn drop(&mut self) {
+        crate::observer::linux::niri_register_sentinel(None);
+    }
+}
+
 impl ForegroundSentinel {
     pub fn launch(driver: &mut impl Driver) -> Self {
         let mut last_error = None;
@@ -156,6 +163,8 @@ impl ForegroundSentinel {
         };
         fs::write(&journal_path, "")
             .map_err(|error| format!("reset focused sentinel journal: {error}"))?;
+        #[cfg(target_os = "linux")]
+        crate::observer::linux::niri_register_sentinel(Some((target, journal_path.clone())));
 
         Ok(Self {
             cursor_calibrated,

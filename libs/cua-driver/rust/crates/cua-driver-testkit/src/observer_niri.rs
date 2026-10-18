@@ -5,11 +5,15 @@
 //! occlusion is classified only where niri's own rendering rule decides it:
 //! floating windows are not drawn while a tiled window in a fullscreen column
 //! holds focus on the same workspace (`Workspace::is_floating_visible`). That
-//! rule needs a static view, focus that does not follow the mouse, and a
-//! fullscreen (not maximized) column, which IPC cannot tell apart by size. The
-//! canonical niri lane (`CUA_E2E_WAYLAND_SESSION=niri`) guarantees all three,
-//! so the rule is trusted only there. Every other overlap is reported as
-//! ambiguous instead of guessed.
+//! rule needs a fullscreen column, and IPC cannot tell one from a maximized
+//! column of the same size: a client's `xdg_toplevel.set_maximized` or the
+//! maximize-to-edges action fills the output while floating windows stay
+//! drawn. So the rule certifies occlusion only behind the foreground sentinel,
+//! by exact id, while the sentinel itself reports fullscreen from niri's last
+//! configure (`ForegroundSentinel` registers it). The rule also needs a static
+//! view and focus that does not follow the mouse, which the canonical niri
+//! lane's config provides (animations and focus-follows-mouse off). Every
+//! other overlap is reported as ambiguous instead of guessed.
 
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Read, Write};
@@ -17,9 +21,9 @@ use std::os::fd::{AsRawFd, FromRawFd};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::thread::JoinHandle;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use serde::de::DeserializeOwned;
 use serde::Deserialize;
@@ -30,6 +34,9 @@ const QUERY_TIMEOUT: Duration = Duration::from_secs(1);
 const REPLY_LIMIT: u64 = 1024 * 1024;
 /// Logical pixels of slack when comparing a fullscreen tile with its output.
 const FULLSCREEN_TOLERANCE: f64 = 1.0;
+/// The oldest sentinel heartbeat whose fullscreen report is still trusted;
+/// the sentinel sends one every 100 ms.
+const SENTINEL_REPORT_MAX_AGE: Duration = Duration::from_secs(1);
 
 /// Connects without blocking past `timeout`: a wedged compositor stops
 /// accepting, and a full backlog would block a plain connect forever.
@@ -289,11 +296,56 @@ struct Desktop {
     workspaces: Vec<Workspace>,
     outputs: HashMap<String, Output>,
     overview_open: bool,
-    /// The canonical niri lane's config: animations and focus-follows-mouse
-    /// off, and gaps keep every non-fullscreen column smaller than the output,
-    /// so only the sentinel's fullscreen column covers it. IPC cannot tell
-    /// fullscreen from maximize-to-edges, which nothing in the lane requests.
-    lane_config: bool,
+    sentinel: Option<Sentinel>,
+}
+
+/// The registered foreground sentinel and the fullscreen state its latest
+/// recent heartbeat reported, if any.
+#[derive(Clone, Copy, Debug)]
+struct Sentinel {
+    window: TargetWindow,
+    fullscreen: Option<bool>,
+}
+
+/// The foreground sentinel's window and event journal.
+static SENTINEL: Mutex<Option<(TargetWindow, PathBuf)>> = Mutex::new(None);
+
+/// Registers the foreground sentinel whose fullscreen reports may certify
+/// occlusion, or clears it with `None`.
+pub(super) fn register_sentinel(sentinel: Option<(TargetWindow, PathBuf)>) {
+    *SENTINEL
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = sentinel;
+}
+
+fn sentinel() -> Option<Sentinel> {
+    let (window, journal) = SENTINEL
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone()?;
+    let now = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap_or_default();
+    let fullscreen = std::fs::read_to_string(journal)
+        .ok()
+        .and_then(|journal| reported_fullscreen(&journal, now));
+    Some(Sentinel { window, fullscreen })
+}
+
+/// The fullscreen state of the sentinel's latest complete heartbeat, unless
+/// it is older than [`SENTINEL_REPORT_MAX_AGE`] at `now` (since the epoch).
+fn reported_fullscreen(journal: &str, now: Duration) -> Option<bool> {
+    let heartbeat = journal
+        .split_inclusive('\n')
+        .filter(|line| line.ends_with('\n'))
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .filter(|event| event["kind"] == "heartbeat")
+        .last()?;
+    let at = Duration::from_millis(heartbeat["at_ms"].as_u64()?);
+    if now.saturating_sub(at) > SENTINEL_REPORT_MAX_AGE {
+        return None;
+    }
+    heartbeat["fullscreen"].as_bool()
 }
 
 /// One desktop state from four requests. Each request is its own connection,
@@ -306,7 +358,7 @@ fn desktop() -> Result<Desktop, ObserverError> {
             workspaces: query("Workspaces")?,
             outputs: query("Outputs")?,
             overview_open: query::<Overview>("OverviewState")?.is_open,
-            lane_config: std::env::var("CUA_E2E_WAYLAND_SESSION").as_deref() == Ok("niri"),
+            sentinel: sentinel(),
             windows: query("Windows")?,
         };
         if desktop.windows == windows {
@@ -365,6 +417,29 @@ fn floating_overlap(a: &Window, b: &Window) -> Option<bool> {
     Some(ax < bx + bw && bx < ax + aw && ay < by + bh && by < ay + ah)
 }
 
+/// Whether the focused output-sized `tile` hides floating windows: only when
+/// it is the sentinel and the sentinel reports fullscreen.
+fn sentinel_occludes(sentinel: Option<&Sentinel>, tile: &Window) -> Result<TargetZ, ObserverError> {
+    let Some(sentinel) = sentinel.filter(|sentinel| {
+        sentinel.window.native_id == tile.id && tile.pid == Some(i64::from(sentinel.window.pid))
+    }) else {
+        return Err(ObserverError::new(
+            "niri focused output-sized tile is not the foreground sentinel; \
+             fullscreen and occlusion are unproven",
+        ));
+    };
+    match sentinel.fullscreen {
+        Some(true) => Ok(TargetZ::BackgroundOccluded),
+        Some(false) => Err(ObserverError::new(
+            "niri sentinel reports it is not fullscreen; a maximized tile does not hide \
+             floating windows",
+        )),
+        None => Err(ObserverError::new(format!(
+            "niri sentinel reported no fullscreen state within {SENTINEL_REPORT_MAX_AGE:?}"
+        ))),
+    }
+}
+
 fn classify(desktop: &Desktop, target: TargetWindow) -> Result<TargetZ, ObserverError> {
     let Some(target) = select(&desktop.windows, target)? else {
         return Ok(TargetZ::NotFound);
@@ -399,17 +474,12 @@ fn classify(desktop: &Desktop, target: TargetWindow) -> Result<TargetZ, Observer
         ));
     }
     let focused = focused(&desktop.windows)?;
-    if focused.is_some_and(|focused| {
+    if let Some(tile) = focused.filter(|focused| {
         !focused.is_floating
             && focused.workspace_id == Some(workspace.id)
             && covers_output(focused, output)
     }) {
-        if !desktop.lane_config {
-            return Err(ObserverError::new(
-                "niri fullscreen occlusion is only certified under the niri lane config",
-            ));
-        }
-        return Ok(TargetZ::BackgroundOccluded);
+        return sentinel_occludes(desktop.sentinel.as_ref(), tile);
     }
     for other in &desktop.windows {
         if other.id == target.id || !other.is_floating || other.workspace_id != target.workspace_id
@@ -758,7 +828,10 @@ mod tests {
             }))
             .unwrap(),
             overview_open: false,
-            lane_config: true,
+            sentinel: Some(Sentinel {
+                window: target(10, 100),
+                fullscreen: Some(true),
+            }),
         }
     }
 
@@ -783,31 +856,67 @@ mod tests {
     }
 
     #[test]
-    fn fullscreen_sized_tile_outside_the_lane_config_is_ambiguous() {
-        // A maximized column, focus-follows-mouse or a moving view leaves
-        // floating windows visible over a tile of the same size.
+    fn client_maximized_sentinel_does_not_certify_occlusion() {
+        // A client maximize fills the output like fullscreen, but floating
+        // windows stay drawn above it. Only the sentinel's report differs.
         let mut desktop = desktop(vec![
             fullscreen(window(10, 100, false, true)),
             window(20, 200, true, false),
         ]);
-        desktop.lane_config = false;
+        desktop.sentinel.as_mut().unwrap().fullscreen = Some(false);
         assert!(classify(&desktop, target(20, 200))
             .unwrap_err()
             .to_string()
-            .contains("only certified under the niri lane config"));
+            .contains("not fullscreen"));
+        desktop.sentinel.as_mut().unwrap().fullscreen = None;
+        assert!(classify(&desktop, target(20, 200))
+            .unwrap_err()
+            .to_string()
+            .contains("no fullscreen state"));
     }
 
     #[test]
-    fn maximized_column_under_the_lane_config_does_not_occlude() {
-        // The lane keeps niri's 16 px gaps, so a maximized column is smaller
-        // than the output and floating windows stay drawn above it.
-        let mut maximized = window(10, 100, false, true);
-        maximized["layout"]["tile_size"] = json!([1888.0, 1048.0]);
-        let desktop = desktop(vec![maximized, window(20, 200, true, false)]);
-        assert_eq!(
-            classify(&desktop, target(20, 200)).unwrap(),
-            TargetZ::BackgroundVisible
+    fn output_sized_tile_other_than_the_sentinel_is_ambiguous() {
+        let mut desktop = desktop(vec![
+            fullscreen(window(10, 100, false, true)),
+            window(20, 200, true, false),
+        ]);
+        for sentinel in [None, Some(target(11, 100)), Some(target(10, 101))] {
+            desktop.sentinel = sentinel.map(|window| Sentinel {
+                window,
+                fullscreen: Some(true),
+            });
+            assert!(classify(&desktop, target(20, 200))
+                .unwrap_err()
+                .to_string()
+                .contains("not the foreground sentinel"));
+        }
+    }
+
+    #[test]
+    fn sentinel_fullscreen_comes_from_its_latest_recent_heartbeat() {
+        let now = Duration::from_millis(10_000);
+        let journal = concat!(
+            r#"{"kind":"heartbeat","at_ms":9800,"fullscreen":false}"#,
+            "\n",
+            r#"{"kind":"focus","at_ms":9850}"#,
+            "\n",
+            r#"{"kind":"heartbeat","at_ms":9900,"fullscreen":true}"#,
+            "\n",
         );
+        assert_eq!(reported_fullscreen(journal, now), Some(true));
+        // A line still being written is not a report.
+        let partial = format!(r#"{journal}{{"kind":"heartbeat","at_ms":9950,"fullscr"#);
+        assert_eq!(reported_fullscreen(&partial, now), Some(true));
+        assert_eq!(
+            reported_fullscreen(journal, now + SENTINEL_REPORT_MAX_AGE),
+            None
+        );
+        assert_eq!(
+            reported_fullscreen("{\"kind\":\"heartbeat\",\"at_ms\":9900}\n", now),
+            None
+        );
+        assert_eq!(reported_fullscreen("", now), None);
     }
 
     #[test]

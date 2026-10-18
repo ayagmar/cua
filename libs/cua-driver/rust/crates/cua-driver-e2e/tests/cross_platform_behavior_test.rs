@@ -386,7 +386,7 @@ fn launch_host_with_evidence(spec: &HostSpec, scenario: &str, evidence: &mut Evi
                     let ax_deadline = Instant::now() + ax_timeout;
                     let mut last_tree = String::new();
                     while Instant::now() < ax_deadline {
-                        let state = snapshot(&mut fixture);
+                        let state = window_state(&mut fixture);
                         last_tree.clear();
                         last_tree.push_str(state.tree_text());
                         if last_tree.contains("WEB_HARNESS_MARKER_v1")
@@ -408,16 +408,34 @@ fn launch_host_with_evidence(spec: &HostSpec, scenario: &str, evidence: &mut Evi
     panic!("{} fixture window did not appear", spec.name);
 }
 
-fn snapshot(fixture: &mut Fixture) -> ToolResponse {
+fn window_state(fixture: &mut Fixture) -> ToolResponse {
     let state = fixture.driver.call(
         "get_window_state",
         serde_json::json!({
             "pid": fixture.pid as i64,
             "window_id": fixture.wid,
-            "capture_mode": "ax"
+            "capture_mode": "ax",
+            "timeout_ms": 10_000
         }),
     );
     refresh_wayland_window_geometry(fixture);
+    state
+}
+
+/// A ready fixture's accessibility tree. A walk cut short at its deadline
+/// lacks elements a row then reads as missing, so it gets room on a slow
+/// runner and fails as truncated if that is not enough.
+fn snapshot(fixture: &mut Fixture) -> ToolResponse {
+    let state = window_state(fixture);
+    let structured = state.structured();
+    assert!(
+        structured["truncated"].as_bool() != Some(true),
+        "the accessibility walk of window {} was truncated ({}), so its tree is incomplete",
+        fixture.wid,
+        structured["truncation_reason"]
+            .as_str()
+            .unwrap_or("no reason given")
+    );
     state
 }
 

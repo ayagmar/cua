@@ -1956,6 +1956,12 @@ pub fn click_desktop(
     )
 }
 
+/// Recheck an admitted niri pointer action right before an event that acts
+/// on the target: the first motion, and every press or wheel event.
+fn niri_gate_holds(gate: &mut Option<niri::PointerGate>) -> anyhow::Result<()> {
+    gate.as_mut().map_or(Ok(()), niri::PointerGate::confirm)
+}
+
 /// The legacy wlroots route sends a click at `(0, 0)` to the output centre.
 /// On Hyprland and niri callers address the global layout, where `(0, 0)` is
 /// a real point (a window or bar at the top-left corner).
@@ -2026,9 +2032,9 @@ fn click_vptr(
     } else {
         (x, y)
     };
-    let gate = niri_pointer_gate(window_id, &sess, &[aimed])?;
+    let mut gate = niri_pointer_gate(window_id, &sess, &[aimed])?;
     let btn = evdev_pointer_button(button);
-    gate.map_or(Ok(()), niri::PointerGate::confirm)?;
+    niri_gate_holds(&mut gate)?;
     for i in 0..count.max(1) {
         if i > 0 {
             std::thread::sleep(std::time::Duration::from_millis(80));
@@ -2041,6 +2047,7 @@ fn click_vptr(
             sess.queue.roundtrip(&mut sess.state)?;
         }
         std::thread::sleep(std::time::Duration::from_millis(15));
+        niri_gate_holds(&mut gate)?;
         sess.vptr.button(event_time_ms(), btn, ButtonState::Pressed);
         sess.vptr.frame();
         sess.queue.roundtrip(&mut sess.state)?;
@@ -2231,10 +2238,11 @@ fn scroll_vptr(
         (point, _) => point,
     };
     let mut sess = open_vptr_session_in(window_id, snapshot)?;
+    let mut gate = None;
     if let Some((x, y)) = point {
         let (px, py) = sess.abs(x, y);
-        let gate = niri_pointer_gate(window_id, &sess, &[(x, y)])?;
-        gate.map_or(Ok(()), niri::PointerGate::confirm)?;
+        gate = niri_pointer_gate(window_id, &sess, &[(x, y)])?;
+        niri_gate_holds(&mut gate)?;
         sess.point_at(px, py)?;
         record_synth_cursor(sess.origin_x + px as i32, sess.origin_y + py as i32);
         std::thread::sleep(std::time::Duration::from_millis(15));
@@ -2253,6 +2261,7 @@ fn scroll_vptr(
         if i > 0 {
             std::thread::sleep(std::time::Duration::from_millis(25));
         }
+        niri_gate_holds(&mut gate)?;
         sess.vptr.axis_source(AxisSource::Wheel);
         sess.vptr.axis_discrete(event_time_ms(), axis, value, sign);
         sess.vptr.frame();
@@ -2333,8 +2342,8 @@ fn move_cursor_absolute_vptr(
     let mut sess = open_vptr_session_in(window_id, snapshot)?;
     let (w, h) = (sess.output_w, sess.output_h);
     let (px, py) = sess.abs(x, y);
-    let gate = niri_pointer_gate(window_id, &sess, &[(x, y)])?;
-    gate.map_or(Ok(()), niri::PointerGate::confirm)?;
+    let mut gate = niri_pointer_gate(window_id, &sess, &[(x, y)])?;
+    niri_gate_holds(&mut gate)?;
     sess.vptr.motion_absolute(event_time_ms(), px, py, w, h);
     sess.vptr.frame();
     sess.queue.roundtrip(&mut sess.state)?;
@@ -2432,12 +2441,14 @@ fn drag_vptr(
     let clamp_xy = |x: i32, y: i32| pointer_abs(origin_x, origin_y, w, h, x, y);
     let (fx, fy) = clamp_xy(from_x, from_y);
     let (tx, ty) = clamp_xy(to_x, to_y);
-    let gate = niri_pointer_gate(window_id, &sess, &[(from_x, from_y), (to_x, to_y)])?;
-    gate.map_or(Ok(()), niri::PointerGate::confirm)?;
+    let mut gate = niri_pointer_gate(window_id, &sess, &[(from_x, from_y), (to_x, to_y)])?;
+    niri_gate_holds(&mut gate)?;
     sess.vptr.motion_absolute(event_time_ms(), fx, fy, w, h);
     sess.vptr.frame();
     sess.queue.roundtrip(&mut sess.state)?;
     std::thread::sleep(std::time::Duration::from_millis(15));
+    // The last check: refusing after the press would leave the button held.
+    niri_gate_holds(&mut gate)?;
     sess.vptr.button(event_time_ms(), btn, ButtonState::Pressed);
     sess.vptr.frame();
     sess.queue.roundtrip(&mut sess.state)?;

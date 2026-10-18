@@ -1669,8 +1669,8 @@ pub struct PointerGate(Quiet);
 
 impl PointerGate {
     /// Refuse when the layout changed after admission. Call right before the
-    /// first motion or button event.
-    pub fn confirm(mut self) -> Result<()> {
+    /// first motion and again right before every press or wheel event.
+    pub fn confirm(&mut self) -> Result<()> {
         if self.0.changed().map_err(input_unavailable)? {
             return Err(foreground_unavailable(
                 "the niri layout changed after the pointer target was checked; take a new screenshot",
@@ -1688,18 +1688,22 @@ impl PointerGate {
 pub fn gate_pointer(window_id: u64, points: &[(i32, i32)], activate: bool) -> Result<PointerGate> {
     let before = window_for_id(window_id).map_err(input_unavailable)?;
     let before = placed_or_refuse(&before)?.rect;
-    let mut quiet = settled().map_err(input_unavailable)?;
+    let quiet = settled().map_err(input_unavailable)?;
     let window = window_for_id(window_id).map_err(input_unavailable)?;
     pointer_admission(&window, before, points, |point| {
         aimed_rect(window_id, point)
     })?;
+    // Changes queued while the admission scene was read refuse here, before
+    // focus moves.
+    let mut gate = PointerGate(quiet);
+    gate.confirm()?;
     if activate {
-        quiet.watch.focusing = Some(window_id);
-        quiet.watch.focusing_workspace = window.workspace;
+        gate.0.watch.focusing = Some(window_id);
+        gate.0.watch.focusing_workspace = window.workspace;
         activate_in(&mut ipc(), window_id, None, FOCUS_CONFIRM_TIMEOUT)
             .map_err(input_unavailable)?;
     }
-    Ok(PointerGate(quiet))
+    Ok(gate)
 }
 
 fn pointer_admission(
@@ -3189,7 +3193,7 @@ mod tests {
     }
 
     #[test]
-    fn a_layout_change_after_admission_refuses_the_pointer_input() {
+    fn a_layout_change_after_positioning_refuses_the_press() {
         let quiet = Quiet::wait(
             event_stream(vec![(
                 Duration::from_millis(250),
@@ -3199,9 +3203,13 @@ mod tests {
             Duration::from_secs(1),
         )
         .unwrap();
+        let mut gate = PointerGate(quiet);
+        // Still quiet before the first motion; a window moves over the point
+        // while the pointer is positioned, so the press must refuse.
+        gate.confirm().unwrap();
         std::thread::sleep(Duration::from_millis(300));
         assert_eq!(
-            PointerGate(quiet).confirm().unwrap_err().to_string(),
+            gate.confirm().unwrap_err().to_string(),
             "foreground_unavailable: the niri layout changed after the pointer target was checked; take a new screenshot"
         );
     }

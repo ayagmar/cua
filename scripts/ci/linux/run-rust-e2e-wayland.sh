@@ -1,11 +1,15 @@
 #!/usr/bin/env bash
-# Start one native, headless Sway session and run the complete Rust E2E matrix.
+# Start one native, headless Wayland session and run the complete Rust E2E
+# matrix. CUA_E2E_WAYLAND_SESSION selects sway (default), sway-xwayland,
+# cua-compositor, or niri. niri has no headless backend, so the niri session
+# runs niri's winit backend inside a headless cage.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/../../.." && pwd)"
 RUNTIME_DIR="$(mktemp -d)"
 SWAY_CONFIG="$(mktemp)"
+NIRI_CONFIG="$(mktemp)"
 SESSION_KIND="${CUA_E2E_WAYLAND_SESSION:-sway}"
 export CUA_E2E_WAYLAND_SESSION="${SESSION_KIND}"
 if [[ "${SESSION_KIND}" == sway-xwayland ]]; then
@@ -16,6 +20,11 @@ if [[ "${SESSION_KIND}" == sway-xwayland ]]; then
 fi
 COMPOSITOR_LOG="${REPO_ROOT}/artifacts/cua-driver/linux/${SESSION_KIND}.log"
 ATSPI_LOG="${REPO_ROOT}/artifacts/cua-driver/linux/at-spi-bus.log"
+# cage serves only niri's winit window. Its private runtime directory keeps its
+# Wayland socket out of the directory the tests search and inherit.
+CAGE_RUNTIME_DIR="${RUNTIME_DIR}/cage"
+CAGE_LOG="${REPO_ROOT}/artifacts/cua-driver/linux/cage.log"
+CAGE_PID=""
 COMPOSITOR_PID=""
 DBUS_PID=""
 ATSPI_PID=""
@@ -25,6 +34,13 @@ cleanup() {
     kill "${COMPOSITOR_PID}" 2>/dev/null || true
     wait "${COMPOSITOR_PID}" 2>/dev/null || true
   fi
+  if [[ -n "${CAGE_PID}" ]]; then
+    # cage exits once its client does, and a SIGTERM exit removes the X11
+    # socket and lock it binds in /tmp.
+    pkill -TERM -P "${CAGE_PID}" 2>/dev/null || true
+    kill "${CAGE_PID}" 2>/dev/null || true
+    wait "${CAGE_PID}" 2>/dev/null || true
+  fi
   if [[ -n "${DBUS_PID}" ]]; then
     kill "${DBUS_PID}" 2>/dev/null || true
   fi
@@ -32,7 +48,7 @@ cleanup() {
     kill "${ATSPI_PID}" 2>/dev/null || true
     wait "${ATSPI_PID}" 2>/dev/null || true
   fi
-  rm -f "${SWAY_CONFIG}"
+  rm -f "${SWAY_CONFIG}" "${NIRI_CONFIG}"
 }
 trap cleanup EXIT
 
@@ -51,6 +67,50 @@ EOF
 if [[ "${SESSION_KIND}" == sway-xwayland ]]; then
   sed -i 's/^xwayland disable$/xwayland force/' "${SWAY_CONFIG}"
 fi
+# The niri rules mirror the Sway ones: harness windows float at the top-left
+# at 940x780 and the sentinel opens fullscreen. Animations stay off because
+# niri's IPC reports destination geometry, not the animated position. Focus
+# does not follow the mouse, so floating windows stay hidden behind the focused
+# fullscreen sentinel; the testkit observer relies on that. CUA_E2E_NIRI_SCALE
+# sets the output scale for a focused fractional-scale smoke.
+cat > "${NIRI_CONFIG}" <<EOF
+hotkey-overlay {
+    skip-at-startup
+}
+xwayland-satellite {
+    off
+}
+animations {
+    off
+}
+output "winit" {
+    scale ${CUA_E2E_NIRI_SCALE:-1}
+}
+layout {
+    focus-ring {
+        off
+    }
+    border {
+        off
+    }
+}
+window-rule {
+    match title="^CuaTestHarness"
+    exclude title="^CuaTestHarness Sentinel"
+    open-floating true
+    default-floating-position x=0 y=0 relative-to="top-left"
+    default-column-width {
+        fixed 940
+    }
+    default-window-height {
+        fixed 780
+    }
+}
+window-rule {
+    match title="^CuaTestHarness Sentinel"
+    open-fullscreen true
+}
+EOF
 
 unset DISPLAY
 unset WAYLAND_DISPLAY
@@ -59,8 +119,13 @@ unset WAYLAND_DISPLAY
 unset WAYLAND_SOCKET NIRI_SOCKET SWAYSOCK I3SOCK HYPRLAND_INSTANCE_SIGNATURE
 export XDG_RUNTIME_DIR="${RUNTIME_DIR}"
 export XDG_SESSION_TYPE=wayland
-export XDG_CURRENT_DESKTOP=sway
-export XDG_SESSION_DESKTOP=sway
+if [[ "${SESSION_KIND}" == niri ]]; then
+  export XDG_CURRENT_DESKTOP=niri
+  export XDG_SESSION_DESKTOP=niri
+else
+  export XDG_CURRENT_DESKTOP=sway
+  export XDG_SESSION_DESKTOP=sway
+fi
 export WLR_BACKENDS=headless
 export WLR_RENDERER=pixman
 export WLR_RENDERER_ALLOW_SOFTWARE=1
@@ -72,6 +137,9 @@ if [[ "${SESSION_KIND}" == cua-compositor ]]; then
   export CUA_E2E_INPUT_BACKENDS=atspi,cua-compositor-inject
   export CUA_E2E_HARNESS_FILTER=electron
   export CUA_INJECT_SOCKET="${XDG_RUNTIME_DIR}/cua-inject.sock"
+elif [[ "${SESSION_KIND}" == niri ]]; then
+  export CUA_E2E_COMPOSITOR=niri
+  export CUA_E2E_INPUT_BACKENDS=atspi,wlr-virtual-pointer
 else
   export CUA_E2E_COMPOSITOR=sway
   export CUA_E2E_INPUT_BACKENDS=atspi,wlr-virtual-pointer
@@ -79,7 +147,11 @@ else
     export CUA_E2E_WAYLAND_XWAYLAND_REGRESSION=1
   fi
 fi
-export CUA_WAYLAND_RECORDING_OUTPUT=HEADLESS-1
+if [[ "${SESSION_KIND}" == niri ]]; then
+  export CUA_WAYLAND_RECORDING_OUTPUT=winit
+else
+  export CUA_WAYLAND_RECORDING_OUTPUT=HEADLESS-1
+fi
 export ELECTRON_OZONE_PLATFORM_HINT=wayland
 export GDK_BACKEND=wayland
 export QT_QPA_PLATFORM=wayland
@@ -211,6 +283,35 @@ if [[ "${SESSION_KIND}" == cua-compositor ]]; then
     exit 1
   }
   cua-compositor > "${COMPOSITOR_LOG}" 2>&1 &
+elif [[ "${SESSION_KIND}" == niri ]]; then
+  for tool in cage niri wlr-randr; do
+    command -v "${tool}" >/dev/null || {
+      echo "${tool} is required for the nested niri lane; use nix develop .#cua-driver-niri-e2e" >&2
+      exit 1
+    }
+  done
+  if ! niri validate --config "${NIRI_CONFIG}" > "${COMPOSITOR_LOG}" 2>&1; then
+    cat "${COMPOSITOR_LOG}" >&2
+    exit 1
+  fi
+  mkdir -m 700 "${CAGE_RUNTIME_DIR}"
+  XDG_RUNTIME_DIR="${CAGE_RUNTIME_DIR}" cage -d -- sleep infinity > "${CAGE_LOG}" 2>&1 &
+  CAGE_PID=$!
+  deadline=$((SECONDS + 20))
+  while [[ ! -S "${CAGE_RUNTIME_DIR}/wayland-0" ]] && ((SECONDS < deadline)) \
+      && kill -0 "${CAGE_PID}" 2>/dev/null; do
+    sleep 0.2
+  done
+  # niri's winit output takes the size of cage's headless output.
+  if [[ ! -S "${CAGE_RUNTIME_DIR}/wayland-0" ]] \
+      || ! XDG_RUNTIME_DIR="${CAGE_RUNTIME_DIR}" WAYLAND_DISPLAY=wayland-0 \
+        wlr-randr --output HEADLESS-1 --custom-mode 1920x1080 >> "${CAGE_LOG}" 2>&1; then
+    echo "cage did not provide a 1920x1080 headless output for niri" >&2
+    cat "${CAGE_LOG}" >&2
+    exit 1
+  fi
+  WAYLAND_DISPLAY="${CAGE_RUNTIME_DIR}/wayland-0" niri --config "${NIRI_CONFIG}" \
+    >> "${COMPOSITOR_LOG}" 2>&1 &
 else
   sway --unsupported-gpu --config "${SWAY_CONFIG}" > "${COMPOSITOR_LOG}" 2>&1 &
 fi
@@ -237,7 +338,57 @@ if [[ -z "${WAYLAND_DISPLAY:-}" ]]; then
   exit 1
 fi
 
-if [[ "${SESSION_KIND}" == cua-compositor ]]; then
+if [[ "${SESSION_KIND}" == niri ]]; then
+  # niri names its IPC socket niri.<wayland display>.<pid>.sock. Accept only
+  # the socket of the niri this runner started, for the display found above.
+  export NIRI_SOCKET="${XDG_RUNTIME_DIR}/niri.${WAYLAND_DISPLAY}.${COMPOSITOR_PID}.sock"
+  deadline=$((SECONDS + 10))
+  while [[ ! -S "${NIRI_SOCKET}" ]] && ((SECONDS < deadline)); do
+    sleep 0.2
+  done
+  if [[ ! -S "${NIRI_SOCKET}" ]]; then
+    echo "niri did not expose its IPC socket ${NIRI_SOCKET}" >&2
+    cat "${COMPOSITOR_LOG}" >&2
+    exit 1
+  fi
+  # Both sockets must be served by this niri, and niri must drive only its
+  # nested winit output: a host niri would list real outputs.
+  socket_peers="$(python3 -I - "${XDG_RUNTIME_DIR}/${WAYLAND_DISPLAY}" "${NIRI_SOCKET}" <<'PY'
+import socket
+import struct
+import sys
+
+for path in sys.argv[1:]:
+    with socket.socket(socket.AF_UNIX) as connection:
+        connection.connect(path)
+        credentials = connection.getsockopt(
+            socket.SOL_SOCKET, socket.SO_PEERCRED, struct.calcsize("3i")
+        )
+        print(struct.unpack("3i", credentials)[0])
+PY
+)"
+  if [[ "$(sort -u <<< "${socket_peers}")" != "${COMPOSITOR_PID}" ]]; then
+    echo "niri sockets are not served by niri pid ${COMPOSITOR_PID}: ${socket_peers//$'\n'/ }" >&2
+    exit 1
+  fi
+  niri_outputs="$(niri msg --json outputs)"
+  if [[ "$(jq -c 'keys' <<< "${niri_outputs}")" != '["winit"]' ]] \
+      || [[ "$(jq -c '.winit.logical | [.width, .height]' <<< "${niri_outputs}")" \
+        != "$(jq -nc --argjson scale "${CUA_E2E_NIRI_SCALE:-1}" '[1920, 1080] | map(. / $scale | floor)')" ]]; then
+    echo "nested niri must drive only its 1920x1080 winit output: ${niri_outputs}" >&2
+    exit 1
+  fi
+  jq -n \
+    --arg source_sha "${CUA_E2E_SOURCE_SHA:-unknown}" \
+    --arg session_type "${XDG_SESSION_TYPE}" \
+    --arg compositor "${CUA_E2E_COMPOSITOR}" \
+    --arg wayland_display "${WAYLAND_DISPLAY}" \
+    --arg cage "$(cage -v 2>&1)" \
+    --argjson niri "$(niri msg --json version)" \
+    --argjson outputs "${niri_outputs}" \
+    '{source_sha:$source_sha,session_type:$session_type,compositor:$compositor,wayland_display:$wayland_display,cage:$cage,niri:$niri,outputs:$outputs}' \
+    > "${REPO_ROOT}/artifacts/cua-driver/linux/niri-preflight.json"
+elif [[ "${SESSION_KIND}" == cua-compositor ]]; then
   deadline=$((SECONDS + 10))
   while [[ ! -S "${CUA_INJECT_SOCKET}" ]] && ((SECONDS < deadline)); do
     sleep 0.2
@@ -293,5 +444,11 @@ status=$?
 set -e
 if [[ "${status}" != 0 && "${SESSION_KIND}" == sway* ]]; then
   swaymsg -t get_tree > "${REPO_ROOT}/artifacts/cua-driver/linux/sway-tree.json" 2>/dev/null || true
+fi
+if [[ "${status}" != 0 && "${SESSION_KIND}" == niri ]]; then
+  for request in windows workspaces outputs; do
+    niri msg --json "${request}" \
+      > "${REPO_ROOT}/artifacts/cua-driver/linux/niri-${request}.json" 2>/dev/null || true
+  done
 fi
 exit "${status}"

@@ -122,7 +122,7 @@ never certify.
 | `libs/cua-driver/tests/runners/macos-lume/run-all.sh` | Logged-in, TCC-authorized Lume worker; every complete run includes the standalone-browser matrix | Canonical: macOS |
 | `scripts/ci/macos/run-rust-e2e.sh` | Called by the Lume wrapper and the hosted macOS script | Matrix implementation behind the macOS rows; refuses to run without the wrapper's unrestricted daemon |
 | `scripts/ci/run-rust-standalone-browser-e2e.sh`, `scripts/ci/windows/run-rust-standalone-browser-e2e.ps1` | `e2e-rust-standalone-browsers.yml`; the macOS Lume wrapper runs it as well | Scoped gate: installed Chrome and Edge, required for browser-facing changes |
-| `scripts/ci/linux/run-rust-e2e-wayland.sh`, `run-rust-e2e-inject.sh` | `e2e-rust-linux-wayland.yml` (`sway`, `sway-xwayland`, `cua-compositor`) | Scoped gate: native Wayland compositor lanes, kept separate from X11 |
+| `scripts/ci/linux/run-rust-e2e-wayland.sh`, `run-rust-e2e-inject.sh` | `e2e-rust-linux-wayland.yml` (`sway`, `sway-xwayland`, `cua-compositor`, `niri`) | Scoped gate: native Wayland compositor lanes, kept separate from X11 |
 | `run-rust-e2e.sh` in a native Hyprland desktop, plus the allowlisted `hyprland_*` rows | Maintainer's prepared native Hyprland desktop | Scoped gate: native Hyprland; no automated lane |
 | `scripts/ci/macos/run-hosted-rust-e2e.sh` | `e2e-rust-macos.yml` with `mode=hosted` | Supporting: supplemental hosted macOS matrix; does not replace Lume |
 | `scripts/ci/linux/run-rust-e2e-desktop.sh` | Representative GNOME or KDE maintainer desktop | Supporting: environment coverage |
@@ -258,7 +258,7 @@ with each measurement.
 | Runner                          | Session                                                            | Canonical command |
 | ------------------------------- | ------------------------------------------------------------------ | ----------------- |
 | `linux/run-rust-e2e.sh`         | Existing Linux X11 or Wayland desktop                              | no selector       |
-| `linux/run-rust-e2e-wayland.sh` | Headless native Sway session                                       | no selector       |
+| `linux/run-rust-e2e-wayland.sh` | Headless native Sway, or nested niri with `CUA_E2E_WAYLAND_SESSION=niri` | no selector |
 | `linux/run-rust-e2e-inject.sh`  | Nested `cua-compositor` session                                    | no selector       |
 | `linux/run-rust-e2e-desktop.sh` | Existing representative Linux desktop                              | no selector       |
 | `windows/run-rust-e2e.ps1`      | Windows console/RDP user session                                   | `-RequireGui`     |
@@ -338,6 +338,23 @@ active output, and requires `get_window_state` to return
 `surface_identity_unproven` without screenshot bytes or a file. Sway IPC and
 the fixture accessibility state are external focus, workspace, and mutation
 oracles for that targeted regression.
+
+Run the niri lane with `CUA_E2E_WAYLAND_SESSION=niri` through
+`nix develop .#cua-driver-niri-e2e`. niri has no headless backend, so the
+wrapper starts a headless `cage` in a private runtime directory, sizes its
+output to 1920x1080 with `wlr-randr`, and runs niri's winit backend inside it.
+Before delegating to `run-rust-e2e.sh` it requires that niri drives only its
+`winit` output and that one niri process serves both the exported
+`WAYLAND_DISPLAY` and `NIRI_SOCKET`, and it writes `niri-preflight.json` with
+the niri and cage versions. Harness windows float, the sentinel opens
+fullscreen, and animations are off. `CUA_E2E_NIRI_SCALE` changes the output
+scale for focused fractional-scale checks. The shell patches `wf-recorder`
+0.6.0, which otherwise binds `linux-dmabuf` version 4 that a GPU-less niri does
+not offer.
+
+Every Wayland mode unsets inherited `WAYLAND_SOCKET`, `NIRI_SOCKET`,
+`SWAYSOCK`, `I3SOCK`, and `HYPRLAND_INSTANCE_SIGNATURE` before it starts its
+compositor, so a run from a desktop session never reaches the host compositor.
 
 Run the nested compositor wrapper through
 `nix develop .#cua-driver-inject-e2e`. This environment is experimental and

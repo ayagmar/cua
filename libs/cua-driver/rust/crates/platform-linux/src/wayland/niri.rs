@@ -1917,7 +1917,7 @@ pub fn gate_pointer(window_id: u64, points: &[(i32, i32)], activate: bool) -> Re
     let window = scene.window(window_id).map_err(input_unavailable)?;
     if matches!(window.placement, Err(Unplaced::Tiled)) {
         let frame = adopted
-            .map(|(frame, _)| frame)
+            .and_then(|record| record.frame)
             .ok_or_else(|| no_frame(window_id))?;
         frame.admit(&scene, &window, points, activate, &HISTORY)?;
         return Ok(PointerGate {
@@ -2172,10 +2172,25 @@ impl OutputFrame {
     }
 }
 
-/// A tiled window's frame, from its latest `get_window_state` screenshot,
-/// and the capture id that screenshot was published as.
-type Adopted = (OutputFrame, Option<String>);
+/// The capture registry keeps at most 32 captures in all by default, so an
+/// output capture id older than this many of its window's is no longer live.
+const MAX_OUTPUT_CAPTURES: usize = 32;
 
+/// The `get_window_state` screenshots of a window that has been tiled.
+#[derive(Clone)]
+struct Adopted {
+    window: u64,
+    /// The latest screenshot's frame; `None` once it shows only the window.
+    frame: Option<OutputFrame>,
+    /// The capture id the latest screenshot was published as.
+    capture: Option<String>,
+    /// The capture ids of its output screenshots, newest last.
+    outputs: VecDeque<String>,
+}
+
+/// Records of windows that have been tiled, least recently adopted first. A
+/// record is evicted only after [`MAX_AIMS`] - 1 later screenshots of other
+/// windows, more than the capture registry keeps, so its ids are gone too.
 fn frames() -> &'static Mutex<Vec<Adopted>> {
     static FRAMES: OnceLock<Mutex<Vec<Adopted>>> = OnceLock::new();
     FRAMES.get_or_init(|| Mutex::new(Vec::new()))
@@ -2183,18 +2198,34 @@ fn frames() -> &'static Mutex<Vec<Adopted>> {
 
 /// Record a window's latest `get_window_state` screenshot: a tiled window's
 /// output `frame`, published as `capture_id`, or `None` for a window whose
-/// screenshot shows only itself, which drops any earlier frame.
+/// screenshot shows only itself, which drops any earlier frame but keeps
+/// refusing the ids of its output screenshots.
 pub fn adopt_frame(window: u64, frame: Option<OutputFrame>, capture_id: Option<&str>) {
     let Ok(mut frames) = frames().lock() else {
         return;
     };
-    frames.retain(|(frame, _)| frame.window != window);
-    if let Some(frame) = frame {
-        if frames.len() >= MAX_AIMS {
-            frames.remove(0);
+    let mut record = match frames.iter().position(|record| record.window == window) {
+        Some(index) => frames.remove(index),
+        None if frame.is_some() => Adopted {
+            window,
+            frame: None,
+            capture: None,
+            outputs: VecDeque::new(),
+        },
+        None => return,
+    };
+    if let (Some(_), Some(capture_id)) = (&frame, capture_id) {
+        record.outputs.push_back(capture_id.to_owned());
+        if record.outputs.len() > MAX_OUTPUT_CAPTURES {
+            record.outputs.pop_front();
         }
-        frames.push((frame, capture_id.map(str::to_owned)));
     }
+    record.frame = frame;
+    record.capture = capture_id.map(str::to_owned);
+    if frames.len() >= MAX_AIMS {
+        frames.remove(0);
+    }
+    frames.push(record);
 }
 
 fn adopted(window: u64) -> Option<Adopted> {
@@ -2202,13 +2233,13 @@ fn adopted(window: u64) -> Option<Adopted> {
         .lock()
         .ok()?
         .iter()
-        .find(|(frame, _)| frame.window == window)
+        .find(|record| record.window == window)
         .cloned()
 }
 
 fn adopted_frame(window: u64) -> Result<OutputFrame> {
     adopted(window)
-        .map(|(frame, _)| frame)
+        .and_then(|record| record.frame)
         .ok_or_else(|| no_frame(window))
 }
 
@@ -2252,13 +2283,21 @@ pub fn frame_admits_capture(window: u64, capture_id: &str) -> Result<()> {
 }
 
 fn admits_capture(adopted: Option<&Adopted>, window: u64, capture_id: &str) -> Result<()> {
-    match adopted {
-        Some((_, adopted)) if adopted.as_deref() != Some(capture_id) => {
-            Err(foreground_unavailable(format!(
-                "capture {capture_id} is not the latest screenshot of tiled niri window {window}, and only that one's pixels are checked against niri's layout; use the latest get_window_state screenshot"
-            )))
-        }
-        _ => Ok(()),
+    let Some(record) = adopted else {
+        return Ok(());
+    };
+    if record.capture.as_deref() == Some(capture_id) {
+        Ok(())
+    } else if record.frame.is_some() {
+        Err(foreground_unavailable(format!(
+            "capture {capture_id} is not the latest screenshot of tiled niri window {window}, and only that one's pixels are checked against niri's layout; use the latest get_window_state screenshot"
+        )))
+    } else if record.outputs.iter().any(|output| output == capture_id) {
+        Err(foreground_unavailable(format!(
+            "capture {capture_id} is not the latest screenshot of niri window {window}, and it shows the whole output rather than the window; use the latest get_window_state screenshot"
+        )))
+    } else {
+        Ok(())
     }
 }
 
@@ -4473,7 +4512,25 @@ mod tests {
         // Its latest screenshot shows only the window (it was floated).
         adopt_frame(9001, None, Some("c3"));
         assert!(adopted_frame(9001).is_err());
-        frame_admits_capture(9001, "c1").unwrap();
+    }
+
+    #[test]
+    fn an_output_capture_stays_refused_after_its_window_floats() {
+        let frame = OutputFrame {
+            window: 9003,
+            ..tiled_frame(history())
+        };
+        adopt_frame(9003, Some(frame), Some("c1"));
+        // Floated: its latest screenshot shows only the window.
+        adopt_frame(9003, None, Some("c2"));
+        assert_eq!(
+            frame_admits_capture(9003, "c1").unwrap_err().to_string(),
+            "foreground_unavailable: capture c1 is not the latest screenshot of niri window 9003, and it shows the whole output rather than the window; use the latest get_window_state screenshot"
+        );
+        frame_admits_capture(9003, "c2").unwrap();
+        // A window-only capture other than the latest is the floating
+        // window's own business: its pixels are window-local.
+        frame_admits_capture(9003, "c0").unwrap();
     }
 
     #[test]

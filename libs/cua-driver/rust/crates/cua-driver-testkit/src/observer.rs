@@ -1154,8 +1154,8 @@ pub mod linux {
 
     /// `None` unless `NIRI_SOCKET` belongs to this session's compositor, so an
     /// unrelated inherited socket leaves the session to the other observers.
+    /// Once niri was recognised, losing it is an error, not another session.
     fn niri_session() -> Option<Result<(), ObserverError>> {
-        std::env::var_os("NIRI_SOCKET")?;
         match super::niri::attest() {
             Ok(false) => None,
             Ok(true) => Some(super::niri::probe()),

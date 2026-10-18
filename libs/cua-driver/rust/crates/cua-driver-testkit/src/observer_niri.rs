@@ -123,45 +123,71 @@ fn wayland_socket() -> Option<PathBuf> {
     Some(PathBuf::from(std::env::var_os("XDG_RUNTIME_DIR")?).join(display))
 }
 
-/// The niri pid this process attested first. A later niri, for example a
+/// The niri pid this process recognised first. A later niri, for example a
 /// restarted compositor, is a different session and is refused.
 static ATTESTED: OnceLock<i32> = OnceLock::new();
 
-/// Whether `NIRI_SOCKET` belongs to the compositor serving `WAYLAND_DISPLAY`.
-/// `Ok(false)` means an unrelated or stale socket, inherited for example by a
-/// nested session started from a niri desktop, so other observers may claim
-/// the session. A pid that differs from the attested one is an error.
-pub(super) fn attest() -> Result<bool, ObserverError> {
-    let (Some(niri), Some(wayland)) = (niri_socket(), wayland_socket()) else {
-        return Ok(false);
+/// The pids serving `NIRI_SOCKET` and `WAYLAND_DISPLAY`.
+fn peers() -> Result<(i32, i32), String> {
+    let niri = niri_socket().ok_or("NIRI_SOCKET is unset")?;
+    let wayland = wayland_socket().ok_or("WAYLAND_DISPLAY is unset")?;
+    let peer = |path: &Path| {
+        socket_peer(path).map_err(|error| format!("{} is unreachable: {error}", path.display()))
     };
-    let (Ok(niri), Ok(wayland)) = (socket_peer(&niri), socket_peer(&wayland)) else {
-        return Ok(false);
-    };
-    if niri != wayland {
-        return Ok(false);
+    Ok((peer(&niri)?, peer(&wayland)?))
+}
+
+/// Before niri is recognised, `Ok(None)` leaves the session to the other
+/// observers: `NIRI_SOCKET` is missing, stale or served by an unrelated
+/// compositor, as when a nested session inherits it from a niri desktop.
+/// `Ok(Some(pid))` recognises the niri serving both sockets. Once niri was
+/// recognised, losing either socket or a different peer is an error.
+fn attestation(
+    recognised: Option<i32>,
+    peers: Result<(i32, i32), String>,
+) -> Result<Option<i32>, ObserverError> {
+    match (recognised, peers) {
+        (None, Ok((niri, wayland))) if niri == wayland => Ok(Some(niri)),
+        (None, _) => Ok(None),
+        (Some(pid), Ok((niri, wayland))) if niri == pid && wayland == pid => Ok(Some(pid)),
+        (Some(pid), Ok((niri, wayland))) => Err(ObserverError::new(format!(
+            "niri {pid} was recognised, but NIRI_SOCKET is now served by {niri} and \
+             WAYLAND_DISPLAY by {wayland}"
+        ))),
+        (Some(pid), Err(error)) => Err(ObserverError::new(format!(
+            "niri {pid} was recognised, but {error}"
+        ))),
     }
-    let attested = *ATTESTED.get_or_init(|| niri);
-    if attested != niri {
+}
+
+/// Whether `NIRI_SOCKET` belongs to the compositor serving `WAYLAND_DISPLAY`;
+/// see [`attestation`].
+pub(super) fn attest() -> Result<bool, ObserverError> {
+    let Some(pid) = attestation(ATTESTED.get().copied(), peers())? else {
+        return Ok(false);
+    };
+    let attested = *ATTESTED.get_or_init(|| pid);
+    if attested != pid {
         return Err(ObserverError::new(format!(
-            "niri pid changed from {attested} to {niri}; refusing a new compositor"
+            "niri pid changed from {attested} to {pid}; refusing a new compositor"
         )));
     }
     Ok(true)
 }
 
-/// A connection to the attested niri, with read and write deadlines.
+/// A connection to the attested niri, with read and write deadlines. Both
+/// sockets are attested again first, so a replaced compositor is refused.
 fn attested_connection(purpose: &str) -> Result<UnixStream, ObserverError> {
+    if !attest()? {
+        return Err(ObserverError::new(
+            "NIRI_SOCKET is not served by the WAYLAND_DISPLAY compositor",
+        ));
+    }
     let socket =
         niri_socket().ok_or_else(|| ObserverError::new("niri observer requires NIRI_SOCKET"))?;
     let error = |operation: &str, error: std::io::Error| {
         ObserverError::new(format!("niri IPC {operation} {purpose}: {error}"))
     };
-    if ATTESTED.get().is_none() && !attest()? {
-        return Err(ObserverError::new(
-            "NIRI_SOCKET is not served by the WAYLAND_DISPLAY compositor",
-        ));
-    }
     let stream = connect(&socket, QUERY_TIMEOUT).map_err(|e| error("connect", e))?;
     let peer = peer_pid(&stream).map_err(|e| error("read peer of", e))?;
     if Some(&peer) != ATTESTED.get() {
@@ -989,6 +1015,25 @@ mod tests {
         let _listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
         assert_eq!(socket_peer(&path).unwrap() as u32, std::process::id());
         assert!(socket_peer(&directory.path().join("missing.sock")).is_err());
+    }
+
+    #[test]
+    fn attestation_falls_through_until_niri_is_recognised_then_fails_closed() {
+        let lost = || Err("NIRI_SOCKET is unreachable".to_owned());
+        assert_eq!(attestation(None, Ok((7, 7))).unwrap(), Some(7));
+        assert_eq!(attestation(None, Ok((7, 8))).unwrap(), None);
+        assert_eq!(attestation(None, lost()).unwrap(), None);
+        assert_eq!(attestation(Some(7), Ok((7, 7))).unwrap(), Some(7));
+        assert!(attestation(Some(7), lost())
+            .unwrap_err()
+            .to_string()
+            .contains("unreachable"));
+        for peers in [(8, 8), (7, 8), (8, 7)] {
+            assert!(attestation(Some(7), Ok(peers))
+                .unwrap_err()
+                .to_string()
+                .contains("now served by"));
+        }
     }
 
     #[test]

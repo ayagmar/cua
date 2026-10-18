@@ -60,6 +60,9 @@ const FRAME_MAX_AGE: Duration = Duration::from_secs(60);
 
 /// The compositor process recognised as niri for this driver process.
 static RECOGNIZED: OnceLock<libc::pid_t> = OnceLock::new();
+/// Why the latest probe before recognition could not tell whether
+/// `NIRI_SOCKET` is this session's niri; routes refuse with it meanwhile.
+static UNKNOWN: Mutex<Option<String>> = Mutex::new(None);
 /// Whether the adapter supports the recognised niri's release: `None` until
 /// niri answers a `Version` request, and every route refuses meanwhile.
 static RELEASE: Mutex<Option<Result<(), String>>> = Mutex::new(None);
@@ -162,7 +165,8 @@ fn probe(
 /// True when this process drives a niri session: `NIRI_SOCKET` and
 /// `WAYLAND_DISPLAY` were attested to be the same niri process, now or
 /// earlier in this process. Recognition is remembered, so a later socket
-/// loss refuses instead of turning this off.
+/// loss refuses instead of turning this off. Also true while a probe cannot
+/// tell (see [`Probed::Unknown`]), so niri's routes refuse.
 pub fn is_session() -> bool {
     match session_check(
         !super::is_inject_mode() && super::is_wayland(),
@@ -187,8 +191,8 @@ pub fn is_session() -> bool {
         return false;
     }
     let (attestation, connection, lasting) = probe(None, QUERY_TIMEOUT);
-    match attestation {
-        Attestation::Attested(pid) => {
+    match probed(attestation, lasting) {
+        Probed::Niri(pid) => {
             // A proven niri stays niri even when it is too old for the
             // adapter or its version is not read yet: routes refuse with the
             // reason instead of falling back to generic Wayland discovery.
@@ -203,18 +207,71 @@ pub fn is_session() -> bool {
             tracing::info!(pid = pinned, "niri session recognised");
             true
         }
-        Attestation::Unrelated(reason) | Attestation::Refused(reason) => {
+        Probed::Unknown(reason) => {
+            tracing::warn!("niri session probe failed, refusing until one passes: {reason}");
+            *UNKNOWN
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(reason);
+            true
+        }
+        Probed::NotNiri(reason) => {
             static LOGGED: std::sync::atomic::AtomicBool =
                 std::sync::atomic::AtomicBool::new(false);
             if !LOGGED.swap(true, std::sync::atomic::Ordering::Relaxed) {
                 tracing::warn!("NIRI_SOCKET is not this Wayland session's niri: {reason}");
             }
-            if let (true, Ok(mut unrelated)) = (lasting, UNRELATED.lock()) {
+            if let Ok(mut unrelated) = UNRELATED.lock() {
                 *unrelated = Some(environment);
             }
             false
         }
     }
+}
+
+#[derive(Debug, PartialEq)]
+enum Probed {
+    Niri(libc::pid_t),
+    /// A failure that may pass, such as a timeout or a failed peer read:
+    /// the session may be niri. Its routes refuse until a later probe
+    /// recognises niri, instead of the generic Wayland routes the adapter
+    /// replaces running on a niri session.
+    Unknown(String),
+    /// Another session's socket, or none listening: lasting, so remembered.
+    NotNiri(String),
+}
+
+/// What a probe before recognition decides; `lasting` as [`probe`] reports.
+fn probed(attestation: Attestation, lasting: bool) -> Probed {
+    match attestation {
+        Attestation::Attested(pid) => Probed::Niri(pid),
+        Attestation::Unrelated(reason) | Attestation::Refused(reason) if lasting => {
+            Probed::NotNiri(reason)
+        }
+        Attestation::Unrelated(reason) | Attestation::Refused(reason) => Probed::Unknown(reason),
+    }
+}
+
+/// The refusal while niri is not recognised, with the reason a probe could
+/// not tell when there is one.
+fn not_recognised(unknown: Option<&str>) -> anyhow::Error {
+    match unknown {
+        Some(reason) => anyhow!(
+            "niri session has not been recognised: the session probe failed ({reason}); try again once niri answers"
+        ),
+        None => anyhow!("niri session has not been recognised"),
+    }
+}
+
+/// The recognised niri process, or the refusal while there is none.
+fn recognised() -> Result<libc::pid_t> {
+    RECOGNIZED.get().copied().ok_or_else(|| {
+        not_recognised(
+            UNKNOWN
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .as_deref(),
+        )
+    })
 }
 
 #[derive(Debug, PartialEq)]
@@ -317,9 +374,7 @@ fn release_check(
 /// The recognised niri process, when the adapter supports it. Until niri's
 /// release is known, each call asks a newly attested connection.
 fn pinned() -> Result<libc::pid_t> {
-    let pinned = *RECOGNIZED
-        .get()
-        .context("niri session has not been recognised")?;
+    let pinned = recognised()?;
     release_check(&RELEASE, || match probe(Some(pinned), QUERY_TIMEOUT) {
         (Attestation::Attested(_), Some(ipc), _) => release_of(ipc),
         (Attestation::Unrelated(reason) | Attestation::Refused(reason), ..) => bail!("{reason}"),
@@ -1478,9 +1533,7 @@ const LOGIND_CONNECT_TIMEOUT: Duration = Duration::from_secs(1);
 /// and passes. Keyboard input does not rely on it:
 /// a locked niri reports no focused window (see [`keyboard_focus`]).
 pub fn refuse_if_locked() -> Result<()> {
-    let pid = *RECOGNIZED
-        .get()
-        .context("niri session has not been recognised")?;
+    let pid = recognised()?;
     lock_refusal(logind_session(pid).and_then(|session| match session {
         Some(session) => locked_hint(&session),
         None => Ok(false),
@@ -3097,6 +3150,25 @@ mod tests {
             Attestation::Unrelated(_)
         ));
         assert_eq!(attest(None, Ok(20), Ok(20)), Attestation::Attested(20));
+    }
+
+    #[test]
+    fn a_probe_that_may_pass_leaves_the_session_unknown_and_refusing() {
+        let timed_out = "niri IPC or WAYLAND_DISPLAY peer is unavailable (IPC: niri IPC timed out, Wayland: not checked)";
+        assert_eq!(
+            probed(Attestation::Unrelated(timed_out.into()), false),
+            Probed::Unknown(timed_out.into())
+        );
+        assert_eq!(
+            not_recognised(Some(timed_out)).to_string(),
+            format!("niri session has not been recognised: the session probe failed ({timed_out}); try again once niri answers")
+        );
+        // Nothing listening, or another session's niri: not niri.
+        assert_eq!(
+            probed(Attestation::Unrelated("refused".into()), true),
+            Probed::NotNiri("refused".into())
+        );
+        assert_eq!(probed(Attestation::Attested(20), true), Probed::Niri(20));
     }
 
     #[test]

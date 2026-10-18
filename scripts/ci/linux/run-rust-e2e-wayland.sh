@@ -356,7 +356,8 @@ if [[ "${SESSION_KIND}" == niri ]]; then
     exit 1
   fi
   # Both sockets must be served by this niri, and niri must drive only its
-  # nested winit output: a host niri would list real outputs.
+  # nested winit output: a host niri would list real outputs. Every niri msg
+  # has a deadline because a wedged niri accepts connections without replying.
   socket_peers="$(python3 -I - "${XDG_RUNTIME_DIR}/${WAYLAND_DISPLAY}" "${NIRI_SOCKET}" <<'PY'
 import socket
 import struct
@@ -375,7 +376,7 @@ PY
     echo "niri sockets are not served by niri pid ${COMPOSITOR_PID}: ${socket_peers//$'\n'/ }" >&2
     exit 1
   fi
-  niri_outputs="$(niri msg --json outputs)"
+  niri_outputs="$(timeout 5 niri msg --json outputs)"
   if [[ "$(jq -c 'keys' <<< "${niri_outputs}")" != '["winit"]' ]] \
       || [[ "$(jq -c '.winit.logical | [.width, .height]' <<< "${niri_outputs}")" \
         != "$(jq -nc --argjson scale "${CUA_E2E_NIRI_SCALE:-1}" '[1920, 1080] | map(. / $scale | floor)')" ]]; then
@@ -388,7 +389,7 @@ PY
     --arg compositor "${CUA_E2E_COMPOSITOR}" \
     --arg wayland_display "${WAYLAND_DISPLAY}" \
     --arg cage "$(cage -v 2>&1)" \
-    --argjson niri "$(niri msg --json version)" \
+    --argjson niri "$(timeout 5 niri msg --json version)" \
     --argjson outputs "${niri_outputs}" \
     '{source_sha:$source_sha,session_type:$session_type,compositor:$compositor,wayland_display:$wayland_display,cage:$cage,niri:$niri,outputs:$outputs}' \
     > "${REPO_ROOT}/artifacts/cua-driver/linux/niri-preflight.json"
@@ -451,7 +452,7 @@ if [[ "${status}" != 0 && "${SESSION_KIND}" == sway* ]]; then
 fi
 if [[ "${status}" != 0 && "${SESSION_KIND}" == niri ]]; then
   for request in windows workspaces outputs; do
-    niri msg --json "${request}" \
+    timeout 5 niri msg --json "${request}" \
       > "${REPO_ROOT}/artifacts/cua-driver/linux/niri-${request}.json" 2>/dev/null || true
   done
 fi

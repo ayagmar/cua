@@ -479,12 +479,9 @@ impl Session {
             self.group,
             self.deadline,
             sent,
-            || match super::niri::keyboard_focus() {
+            |sent| match super::niri::keyboard_focus() {
                 Ok(Some(focused)) if focused == target => Ok(()),
-                Ok(focused) => Err(anyhow!(
-                    "foreground_unavailable: niri keyboard focus moved from window {target} to {}",
-                    focused.map_or_else(|| "no window".to_owned(), |id| format!("window {id}"))
-                )),
+                Ok(focused) => Err(focus_moved(target, focused, sent)),
                 Err(error) => Err(super::niri::input_unavailable(error)),
             },
         )
@@ -493,6 +490,22 @@ impl Session {
     fn finish(self) -> Result<()> {
         self.keyboard.finish(self.group)
     }
+}
+
+/// Focus left `target` for `focused`. niri can move focus between its answer
+/// and the next key, so once keys went out the last one may have reached the
+/// window that has focus now; niri offers no check that is atomic with a key.
+fn focus_moved(target: u64, focused: Option<u64>, sent: usize) -> anyhow::Error {
+    let now = focused.map_or_else(|| "no window".to_owned(), |id| format!("window {id}"));
+    if sent == 0 {
+        return anyhow!(
+            "foreground_unavailable: niri keyboard focus moved from window {target} to {now}"
+        );
+    }
+    anyhow!(
+        "foreground_unavailable: niri keyboard focus moved from window {target} to {now}; \
+         the last key sent may have reached {now}"
+    )
 }
 
 /// A stop before any key keeps its refusal; a stop after some keys went out
@@ -519,22 +532,22 @@ trait Strokes {
 }
 
 /// Send each key of `parts`, uploading a part's extended keymap before its
-/// first key, once `still_focused` admits the key and the deadline has not
-/// passed. `sent` counts the keys that went out.
+/// first key, once `still_focused` (told how many keys went out) admits the
+/// key and the deadline has not passed. `sent` counts the keys that went out.
 fn type_parts(
     keyboard: &mut impl Strokes,
     parts: &[Part],
     group: u32,
     deadline: Instant,
     sent: &mut usize,
-    mut still_focused: impl FnMut() -> Result<()>,
+    mut still_focused: impl FnMut(usize) -> Result<()>,
 ) -> Result<()> {
     for part in parts {
         for (index, key) in part.keys.iter().enumerate() {
             if Instant::now() >= deadline {
                 bail!("foreground_unavailable: niri text input ran out of time");
             }
-            still_focused()?;
+            still_focused(*sent)?;
             if let (0, Some(map)) = (index, &part.extended) {
                 keyboard.upload(map)?;
             }
@@ -997,7 +1010,7 @@ mod tests {
         let parts = plan_text(US_DE, 0, "a→").unwrap();
         let mut recorder = Recorder::default();
         let mut sent = 0;
-        type_parts(&mut recorder, &parts, 0, later(), &mut sent, || Ok(())).unwrap();
+        type_parts(&mut recorder, &parts, 0, later(), &mut sent, |_| Ok(())).unwrap();
         assert_eq!(recorder.events[0], "keymap");
         assert_eq!(recorder.events.len(), 3);
         assert_eq!(sent, 2);
@@ -1009,7 +1022,7 @@ mod tests {
         let mut recorder = Recorder::default();
         let mut sent = 0;
         let mut checks = 0;
-        let typed = type_parts(&mut recorder, &parts, 0, later(), &mut sent, || {
+        let typed = type_parts(&mut recorder, &parts, 0, later(), &mut sent, |_| {
             checks += 1;
             anyhow::ensure!(
                 checks <= 2,
@@ -1028,7 +1041,7 @@ mod tests {
 
         // Focus gone before the first key: nothing went out.
         let mut sent = 0;
-        let typed = type_parts(&mut recorder, &parts, 0, later(), &mut sent, || {
+        let typed = type_parts(&mut recorder, &parts, 0, later(), &mut sent, |_| {
             anyhow::bail!("foreground_unavailable: niri keyboard focus moved")
         });
         let refused = outcome(sent, 5, typed, Ok(())).unwrap_err();
@@ -1039,11 +1052,24 @@ mod tests {
     }
 
     #[test]
+    fn a_focus_move_after_some_keys_says_the_last_may_have_reached_the_new_window() {
+        let before = focus_moved(3, Some(4), 0).to_string();
+        assert!(!before.contains("may have reached"), "{before}");
+        let after = outcome(7, 400, Err(focus_moved(3, Some(4), 7)), Ok(())).unwrap_err();
+        assert!(
+            after
+                .to_string()
+                .ends_with("the last key sent may have reached window 4"),
+            "{after}"
+        );
+    }
+
+    #[test]
     fn typing_stops_at_the_deadline() {
         let parts = plan_text(US_DE, 0, "hello").unwrap();
         let mut recorder = Recorder::default();
         let mut sent = 0;
-        let typed = type_parts(&mut recorder, &parts, 0, Instant::now(), &mut sent, || {
+        let typed = type_parts(&mut recorder, &parts, 0, Instant::now(), &mut sent, |_| {
             Ok(())
         });
         assert!(recorder.events.is_empty());

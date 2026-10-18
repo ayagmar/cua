@@ -2747,10 +2747,10 @@ fn input_error_result(e: anyhow::Error) -> ToolResult {
             "effect": "none",
             "suggestion": if code == crate::input::foreground::CODE_TIMEOUT {
                 "Take a screenshot (get_desktop_state) to confirm the desktop is responsive, then retry once."
-            } else if let Some(suggestion) = crate::wayland::niri::refusal_suggestion(&text) {
-                suggestion
             } else {
-                "Call bring_to_front on the window (or its modal dialog), confirm with get_window_state, then retry."
+                crate::wayland::niri::refusal_suggestion(&text).unwrap_or(
+                    "Call bring_to_front on the window (or its modal dialog), confirm with get_window_state, then retry.",
+                )
             },
         })),
         None => linux_input_error(e),

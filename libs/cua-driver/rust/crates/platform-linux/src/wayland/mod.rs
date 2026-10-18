@@ -453,14 +453,14 @@ trait Syncs {
 /// (at most [`NIRI_ROUNDTRIP_TIMEOUT`] away) passes. `EventQueue::roundtrip`
 /// blocks until the compositor answers, so a stalled niri would hang the
 /// call and leave a pressed button held.
-fn bounded_roundtrip<D: Syncs + 'static>(
+fn bounded_roundtrip<D>(
     connection: &Connection,
     queue: &mut wayland_client::EventQueue<D>,
     state: &mut D,
     deadline: std::time::Instant,
 ) -> anyhow::Result<()>
 where
-    D: Dispatch<wayland_client::protocol::wl_callback::WlCallback, ()>,
+    D: Syncs + Dispatch<wayland_client::protocol::wl_callback::WlCallback, ()> + 'static,
 {
     use anyhow::Context as _;
     use std::os::fd::AsRawFd as _;

@@ -28,6 +28,7 @@ CAGE_PID=""
 COMPOSITOR_PID=""
 DBUS_PID=""
 ATSPI_PID=""
+KEYRING_PID=""
 
 cleanup() {
   if [[ -n "${COMPOSITOR_PID}" ]]; then
@@ -41,6 +42,9 @@ cleanup() {
     kill "${CAGE_PID}" 2>/dev/null || true
     wait "${CAGE_PID}" 2>/dev/null || true
   fi
+  if [[ -n "${KEYRING_PID}" ]]; then
+    kill "${KEYRING_PID}" 2>/dev/null || true
+  fi
   if [[ -n "${DBUS_PID}" ]]; then
     kill "${DBUS_PID}" 2>/dev/null || true
   fi
@@ -49,6 +53,7 @@ cleanup() {
     wait "${ATSPI_PID}" 2>/dev/null || true
   fi
   rm -f "${SWAY_CONFIG}" "${NIRI_CONFIG}"
+  rm -rf "${RUNTIME_DIR}"
 }
 trap cleanup EXIT
 
@@ -194,11 +199,14 @@ if [[ "${CUA_E2E_INTERNAL_LANE:-all}" == "shared" \
     echo "gnome-keyring-daemon is required for the shared Wayland history gate" >&2
     exit 1
   fi
-  # gnome-keyring keeps its keyrings under XDG_DATA_HOME; keep the disposable
-  # test keyring out of the user's home.
+  # The history gate purges the cua-driver-local credential from whichever
+  # Secret Service it reaches. Give the daemon its own home and data
+  # directories so the disposable keyring never touches the user's.
+  mkdir -m 700 "${RUNTIME_DIR}/keyring-home"
   keyring_environment="$(
     printf 'test-password' \
-      | XDG_DATA_HOME="${RUNTIME_DIR}/keyring-data" \
+      | HOME="${RUNTIME_DIR}/keyring-home" \
+        XDG_DATA_HOME="${RUNTIME_DIR}/keyring-home/.local/share" \
         gnome-keyring-daemon --unlock --components=secrets
   )"
   eval "${keyring_environment}"
@@ -219,6 +227,14 @@ if [[ "${CUA_E2E_INTERNAL_LANE:-all}" == "shared" \
     echo "Secret Service did not become ready on the private Wayland session bus" >&2
     exit 1
   fi
+  # The daemon detaches from this shell; stop it by the bus name it owns.
+  KEYRING_PID="$(
+    gdbus call --session \
+      --dest org.freedesktop.DBus \
+      --object-path /org/freedesktop/DBus \
+      --method org.freedesktop.DBus.GetConnectionUnixProcessID org.freedesktop.secrets \
+      | sed -n 's/^(uint32 \([0-9]*\),)$/\1/p'
+  )"
 fi
 
 # A private session bus does not activate the desktop accessibility stack by

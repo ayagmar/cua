@@ -1199,7 +1199,7 @@ fn foreground_unavailable(detail: impl std::fmt::Display) -> anyhow::Error {
 
 /// An IPC failure on an input route, with its whole cause chain. A refusal
 /// that already carries the code is kept as it is.
-fn input_unavailable(error: anyhow::Error) -> anyhow::Error {
+pub(crate) fn input_unavailable(error: anyhow::Error) -> anyhow::Error {
     if error.to_string().starts_with("foreground_unavailable") {
         return error;
     }

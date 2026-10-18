@@ -155,7 +155,7 @@ fn handle_press(
     let (px, py) = sess.abs(x, y);
     let mut gate = super::niri_pointer_gate(Some(window_id), &sess, &[(x, y)])?;
     let btn = evdev_pointer_button(button);
-    super::niri_gate_holds(&mut gate)?;
+    super::niri_gate_holds(&mut gate, &sess)?;
 
     sess.vptr.motion_absolute(0, px, py, w, h);
     sess.vptr.frame();

@@ -1957,9 +1957,30 @@ pub fn click_desktop(
 }
 
 /// Recheck an admitted niri pointer action right before an event that acts
-/// on the target: the first motion, and every press or wheel event.
-fn niri_gate_holds(gate: &mut Option<niri::PointerGate>) -> anyhow::Result<()> {
-    gate.as_mut().map_or(Ok(()), niri::PointerGate::confirm)
+/// on the target: the first motion, and every press or wheel event. niri
+/// sends no event when outputs change, so the pointer space is reread too.
+fn niri_gate_holds(gate: &mut Option<niri::PointerGate>, sess: &VptrSession) -> anyhow::Result<()> {
+    let Some(gate) = gate else {
+        return Ok(());
+    };
+    gate.confirm()?;
+    let space = (sess.origin_x, sess.origin_y, sess.output_w, sess.output_h);
+    let current = niri::pointer_space().map_err(niri::input_unavailable)?;
+    pointer_space_holds(space, current)
+}
+
+/// Refuse when the compositor's pointer space no longer matches the extent
+/// the session scales `motion_absolute` by: every motion would land elsewhere.
+fn pointer_space_holds(
+    session: (i32, i32, u32, u32),
+    current: (i32, i32, u32, u32),
+) -> anyhow::Result<()> {
+    let current = select_virtual_pointer_space((1, 1), Some(current));
+    anyhow::ensure!(
+        session == current,
+        "foreground_unavailable: the niri pointer space changed from {session:?} to {current:?}; take a new screenshot"
+    );
+    Ok(())
 }
 
 /// The legacy wlroots route sends a click at `(0, 0)` to the output centre.
@@ -2034,7 +2055,7 @@ fn click_vptr(
     };
     let mut gate = niri_pointer_gate(window_id, &sess, &[aimed])?;
     let btn = evdev_pointer_button(button);
-    niri_gate_holds(&mut gate)?;
+    niri_gate_holds(&mut gate, &sess)?;
     for i in 0..count.max(1) {
         if i > 0 {
             std::thread::sleep(std::time::Duration::from_millis(80));
@@ -2047,7 +2068,7 @@ fn click_vptr(
             sess.queue.roundtrip(&mut sess.state)?;
         }
         std::thread::sleep(std::time::Duration::from_millis(15));
-        niri_gate_holds(&mut gate)?;
+        niri_gate_holds(&mut gate, &sess)?;
         sess.vptr.button(event_time_ms(), btn, ButtonState::Pressed);
         sess.vptr.frame();
         sess.queue.roundtrip(&mut sess.state)?;
@@ -2242,7 +2263,7 @@ fn scroll_vptr(
     if let Some((x, y)) = point {
         let (px, py) = sess.abs(x, y);
         gate = niri_pointer_gate(window_id, &sess, &[(x, y)])?;
-        niri_gate_holds(&mut gate)?;
+        niri_gate_holds(&mut gate, &sess)?;
         sess.point_at(px, py)?;
         record_synth_cursor(sess.origin_x + px as i32, sess.origin_y + py as i32);
         std::thread::sleep(std::time::Duration::from_millis(15));
@@ -2261,7 +2282,7 @@ fn scroll_vptr(
         if i > 0 {
             std::thread::sleep(std::time::Duration::from_millis(25));
         }
-        niri_gate_holds(&mut gate)?;
+        niri_gate_holds(&mut gate, &sess)?;
         sess.vptr.axis_source(AxisSource::Wheel);
         sess.vptr.axis_discrete(event_time_ms(), axis, value, sign);
         sess.vptr.frame();
@@ -2343,7 +2364,7 @@ fn move_cursor_absolute_vptr(
     let (w, h) = (sess.output_w, sess.output_h);
     let (px, py) = sess.abs(x, y);
     let mut gate = niri_pointer_gate(window_id, &sess, &[(x, y)])?;
-    niri_gate_holds(&mut gate)?;
+    niri_gate_holds(&mut gate, &sess)?;
     sess.vptr.motion_absolute(event_time_ms(), px, py, w, h);
     sess.vptr.frame();
     sess.queue.roundtrip(&mut sess.state)?;
@@ -2442,13 +2463,13 @@ fn drag_vptr(
     let (fx, fy) = clamp_xy(from_x, from_y);
     let (tx, ty) = clamp_xy(to_x, to_y);
     let mut gate = niri_pointer_gate(window_id, &sess, &[(from_x, from_y), (to_x, to_y)])?;
-    niri_gate_holds(&mut gate)?;
+    niri_gate_holds(&mut gate, &sess)?;
     sess.vptr.motion_absolute(event_time_ms(), fx, fy, w, h);
     sess.vptr.frame();
     sess.queue.roundtrip(&mut sess.state)?;
     std::thread::sleep(std::time::Duration::from_millis(15));
     // The last check: refusing after the press would leave the button held.
-    niri_gate_holds(&mut gate)?;
+    niri_gate_holds(&mut gate, &sess)?;
     sess.vptr.button(event_time_ms(), btn, ButtonState::Pressed);
     sess.vptr.frame();
     sess.queue.roundtrip(&mut sess.state)?;
@@ -4213,6 +4234,19 @@ mod tests {
         assert!(!super::pointer_reaches(0, 0, 1280, 720, 100, 750));
         assert!(!super::pointer_reaches(0, 0, 1280, 720, -1, 10));
         assert!(super::pointer_reaches(-100, 0, 2773, 1080, -100, 0));
+    }
+
+    #[test]
+    fn an_output_added_while_settling_refuses_the_pointer_input() {
+        super::pointer_space_holds((0, 0, 854, 480), (0, 0, 854, 480)).unwrap();
+        // The session scaled for one output; a second one doubles the extent,
+        // so (350, 80) would land near (700, 80).
+        assert_eq!(
+            super::pointer_space_holds((0, 0, 854, 480), (0, 0, 1707, 480))
+                .unwrap_err()
+                .to_string(),
+            "foreground_unavailable: the niri pointer space changed from (0, 0, 854, 480) to (0, 0, 1707, 480); take a new screenshot"
+        );
     }
 
     /// The pointer always moves before a desktop click or scroll, even when

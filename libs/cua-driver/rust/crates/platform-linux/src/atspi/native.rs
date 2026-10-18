@@ -5855,16 +5855,24 @@ fn screen_answer_overrides_window(
     !native_origin_attested && screen_extents_trusted(raw, display)
 }
 
-/// True only when the Hyprland compositor identifies this exact client
-/// (nonzero address `xid` AND `pid`) as native Wayland, not XWayland. Missing,
-/// mismatched, or unreported clients fail closed, so `Screen` extents keep
-/// winning, which is correct for XWayland GTK and LibreOffice. Performs
-/// blocking compositor IPC: async callers must use `bounded_blocking`.
+/// True only when the compositor identifies this exact client (nonzero
+/// window id `xid` AND `pid`) as native Wayland, not XWayland, with an origin.
+/// Hyprland reports XWayland per client; under niri an X11 client belongs to
+/// xwayland-satellite's pid, so a matching pid on a placed niri window is a
+/// native client. Missing, mismatched, or unreported clients fail closed, so
+/// `Screen` extents keep winning, which is correct for XWayland GTK and
+/// LibreOffice. Performs blocking compositor IPC: async callers must use
+/// `bounded_blocking`.
 fn native_wayland_origin_attested(pid: u32, xid: u64) -> bool {
     xid != 0
         && crate::wayland::is_wayland()
-        && crate::wayland::hyprland::is_session()
-        && crate::wayland::hyprland::native_client_attested(xid, pid)
+        && if crate::wayland::hyprland::is_session() {
+            crate::wayland::hyprland::native_client_attested(xid, pid)
+        } else {
+            crate::wayland::niri::is_session()
+                && crate::wayland::niri::window_for_id(xid)
+                    .is_ok_and(|window| window.pid == Some(pid) && window.placement.is_ok())
+        }
 }
 
 pub(crate) fn x11_window_origin(xid: u64) -> Option<(i32, i32)> {

@@ -1977,7 +1977,7 @@ fn niri_gate_holds(gate: &mut Option<niri::PointerGate>, sess: &VptrSession) -> 
     };
     gate.confirm()?;
     let space = (sess.origin_x, sess.origin_y, sess.output_w, sess.output_h);
-    let current = niri::pointer_space().map_err(niri::input_unavailable)?;
+    let current = gate.pointer_space().map_err(niri::input_unavailable)?;
     pointer_space_holds(space, current)
 }
 

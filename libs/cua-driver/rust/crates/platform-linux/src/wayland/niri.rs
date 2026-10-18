@@ -11,17 +11,18 @@
 //! view's scroll position, which IPC does not report. Tiled windows keep
 //! identity, focus and keyboard routes; geometry-bound routes refuse. IPC
 //! positions also omit niri's animation offset, so pointer and crop routes
-//! wait for a quiet event stream first (see [`Quiet`]).
+//! wait until the layout has been quiet for a while (see [`History`]).
 
 use anyhow::{anyhow, bail, Context, Result};
 use serde::de::DeserializeOwned;
 use serde::Deserialize;
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::ffi::OsString;
 use std::io::{self, Read, Write};
 use std::os::fd::AsRawFd;
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -1483,28 +1484,50 @@ fn restore_workspace<C: FnMut(Instant) -> Result<UnixStream>>(
 
 // ── Settled geometry ─────────────────────────────────────────────────────────
 
-/// Whether an event-stream event can move, uncover or animate a window.
-/// Unknown events count, so a newer niri fails closed. A window event that
-/// only changes a title or similar metadata does not.
+/// What an event-stream event did to the shown layout.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Change {
+    /// Anything that can move, uncover or animate a window, and any event
+    /// this adapter does not know, so a newer niri fails closed.
+    Moved,
+    /// Keyboard focus went to this window, or to none.
+    Focus(Option<u64>),
+    /// This workspace became active on its output.
+    Activated(Option<u64>),
+    /// This window became its workspace's active window.
+    Active(Option<u64>),
+}
+
+/// The focus change a pointer action makes itself. Focus moves no floating
+/// window, so the events naming the window it focuses are expected.
+#[derive(Clone, Copy, Debug, Default)]
+struct Expected {
+    window: Option<u64>,
+    /// The window's workspace, already active on its output: when focus
+    /// moves there from another output, niri reports it activated.
+    workspace: Option<u64>,
+}
+
+impl Change {
+    fn counts(self, expected: Expected) -> bool {
+        match self {
+            Self::Moved => true,
+            Self::Focus(id) | Self::Active(id) => {
+                expected.window.is_none() || id != expected.window
+            }
+            Self::Activated(id) => expected.workspace.is_none() || id != expected.workspace,
+        }
+    }
+}
+
+/// Classifies event-stream events. A window event that only changes a title
+/// or similar metadata changes nothing.
+#[derive(Default)]
 struct LayoutWatch {
     layouts: HashMap<u64, serde_json::Value>,
-    /// A window the driver itself is focusing: the focus events naming it
-    /// are expected. Focus moves no window.
-    focusing: Option<u64>,
-    /// The focused window's workspace, already active on its output: when
-    /// focus moves there from another output, niri reports it activated.
-    focusing_workspace: Option<u64>,
 }
 
 impl LayoutWatch {
-    fn new() -> Self {
-        Self {
-            layouts: HashMap::new(),
-            focusing: None,
-            focusing_workspace: None,
-        }
-    }
-
     /// The parts of a window that place it on screen.
     fn placing(window: &serde_json::Value) -> serde_json::Value {
         serde_json::json!([
@@ -1514,10 +1537,11 @@ impl LayoutWatch {
         ])
     }
 
-    fn moves(&mut self, event: &serde_json::Value) -> bool {
+    fn change(&mut self, event: &serde_json::Value) -> Option<Change> {
         let Some((name, body)) = event.as_object().and_then(|event| event.iter().next()) else {
-            return true;
+            return Some(Change::Moved);
         };
+        let id = |key: &str| body.get(key).and_then(serde_json::Value::as_u64);
         match name.as_str() {
             "WindowFocusTimestampChanged"
             | "WindowUrgencyChanged"
@@ -1528,22 +1552,10 @@ impl LayoutWatch {
             | "ScreenshotCaptured"
             | "CastsChanged"
             | "CastStartedOrChanged"
-            | "CastStopped" => false,
-            "WindowFocusChanged" => {
-                self.focusing.is_none()
-                    || body.get("id").and_then(serde_json::Value::as_u64) != self.focusing
-            }
-            "WorkspaceActivated" => {
-                self.focusing_workspace.is_none()
-                    || body.get("id").and_then(serde_json::Value::as_u64) != self.focusing_workspace
-            }
-            "WorkspaceActiveWindowChanged" => {
-                self.focusing.is_none()
-                    || body
-                        .get("active_window_id")
-                        .and_then(serde_json::Value::as_u64)
-                        != self.focusing
-            }
+            | "CastStopped" => None,
+            "WindowFocusChanged" => Some(Change::Focus(id("id"))),
+            "WorkspaceActivated" => Some(Change::Activated(id("id"))),
+            "WorkspaceActiveWindowChanged" => Some(Change::Active(id("active_window_id"))),
             "WindowsChanged" => {
                 self.layouts = body
                     .get("windows")
@@ -1552,47 +1564,156 @@ impl LayoutWatch {
                     .flatten()
                     .filter_map(|window| Some((window.get("id")?.as_u64()?, Self::placing(window))))
                     .collect();
-                true
+                Some(Change::Moved)
             }
             "WindowOpenedOrChanged" => {
                 let Some(window) = body.get("window") else {
-                    return true;
+                    return Some(Change::Moved);
                 };
                 let Some(id) = window.get("id").and_then(serde_json::Value::as_u64) else {
-                    return true;
+                    return Some(Change::Moved);
                 };
                 let placing = Self::placing(window);
-                self.layouts.insert(id, placing.clone()) != Some(placing)
+                (self.layouts.insert(id, placing.clone()) != Some(placing)).then_some(Change::Moved)
             }
-            _ => true,
+            _ => Some(Change::Moved),
         }
     }
 }
 
-/// An open event stream that has seen the layout stay unchanged for
-/// [`SETTLE_QUIET`]. niri reports a new place at once and animates to it, and
-/// the stream does not report the animation's end. The quiet period only
-/// covers animations no longer than [`SETTLE_QUIET`]; a longer one passes
-/// this gate with stale geometry.
-struct Quiet {
+/// How many recent changes a history keeps for checks still in flight; a
+/// check older than that counts as changed.
+const MAX_CHANGES: usize = 1024;
+
+/// niri's layout changes as one long-lived, attested event stream reports
+/// them. niri reports a new place at once and animates to it, and the stream
+/// does not report the animation's end, so the layout counts as settled once
+/// it has not changed for [`SETTLE_QUIET`]; that covers only animations no
+/// longer than it (see [`SETTLE_QUIET`]).
+struct Replica {
     lines: Lines,
+    generation: u64,
     watch: LayoutWatch,
+    /// When the layout last changed. Connecting counts: an animation may
+    /// have started before the stream did.
+    changed_at: Instant,
+    /// Recent changes, the first numbered `first`.
+    changes: VecDeque<Change>,
+    first: u64,
 }
 
-impl Quiet {
-    fn wait(stream: UnixStream, quiet: Duration, limit: Duration) -> Result<Self> {
-        let started = Instant::now();
+impl Replica {
+    fn start(stream: UnixStream, generation: u64) -> Result<Self> {
+        let deadline = Instant::now() + QUERY_TIMEOUT;
         let mut lines = Lines::new(stream);
-        lines.send("\"EventStream\"", started + QUERY_TIMEOUT)?;
+        lines.send("\"EventStream\"", deadline)?;
         let first = lines
-            .next(started + QUERY_TIMEOUT)?
+            .next(deadline)?
             .context("niri event stream did not start")?;
-        reply_ok("EventStream", serde_json::from_slice(&first)?)?;
-        let mut watch = LayoutWatch::new();
-        // An animation may have started just before the stream connected.
-        let mut changed = Instant::now();
+        reply_ok(
+            "EventStream",
+            serde_json::from_slice(&first).context("invalid niri IPC JSON")?,
+        )?;
+        // From here on, reads take only what niri has already sent.
+        lines.stream.set_nonblocking(true)?;
+        Ok(Self {
+            lines,
+            generation,
+            watch: LayoutWatch::default(),
+            changed_at: Instant::now(),
+            changes: VecDeque::new(),
+            first: 0,
+        })
+    }
+
+    fn mark(&self) -> Mark {
+        Mark {
+            generation: self.generation,
+            at: self.first + self.changes.len() as u64,
+        }
+    }
+
+    /// Apply every event niri has sent so far.
+    fn catch_up(&mut self) -> Result<()> {
+        while let Some(line) = self.lines.next(Instant::now() + QUERY_TIMEOUT)? {
+            let event: serde_json::Value =
+                serde_json::from_slice(&line).context("invalid niri event")?;
+            if let Some(change) = self.watch.change(&event) {
+                self.changed_at = Instant::now();
+                self.changes.push_back(change);
+                if self.changes.len() > MAX_CHANGES {
+                    self.changes.pop_front();
+                    self.first += 1;
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Where a layout history stood when a check passed: later changes are new.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Mark {
+    generation: u64,
+    at: u64,
+}
+
+/// The process's niri layout history: one event stream, kept open between
+/// actions so an action on a layout that has been quiet for
+/// [`SETTLE_QUIET`] need not wait. A background thread reads it as events
+/// arrive, which dates each change and keeps niri from dropping a stream
+/// that reads too slowly; every check also reads what has arrived itself.
+/// A stream that fails is dropped and the next settle connects again; a
+/// check made against an earlier connection refuses.
+struct History {
+    replica: Mutex<Option<Replica>>,
+    generations: AtomicU64,
+}
+
+impl History {
+    const fn new() -> Self {
+        Self {
+            replica: Mutex::new(None),
+            generations: AtomicU64::new(0),
+        }
+    }
+
+    fn lock(&self) -> Result<std::sync::MutexGuard<'_, Option<Replica>>> {
+        self.replica
+            .lock()
+            .map_err(|_| anyhow!("niri layout history is unavailable"))
+    }
+
+    /// Wait until the layout has not changed for `quiet`, at most `limit`,
+    /// connecting through `connect` when no stream is open.
+    fn settle(
+        &'static self,
+        connect: impl FnOnce() -> Result<UnixStream>,
+        quiet: Duration,
+        limit: Duration,
+    ) -> Result<Mark> {
+        let started = Instant::now();
+        let mut connect = Some(connect);
         loop {
-            let settled = changed + quiet;
+            let settled = {
+                let mut replica = self.lock()?;
+                if replica.is_none() {
+                    let connect = connect
+                        .take()
+                        .context("niri event stream closed while settling")?;
+                    *replica = Some(self.start(connect()?)?);
+                }
+                let current = replica.as_mut().expect("connected above");
+                if let Err(error) = current.catch_up() {
+                    *replica = None;
+                    return Err(error.context("niri event stream failed"));
+                }
+                let settled = current.changed_at + quiet;
+                if settled <= Instant::now() {
+                    return Ok(current.mark());
+                }
+                settled
+            };
             if settled > started + limit {
                 return Err(foreground_unavailable(format!(
                     "the niri layout did not stay unchanged for {} ms within {} ms, so window geometry may not match the screen",
@@ -1600,36 +1721,82 @@ impl Quiet {
                     limit.as_millis()
                 )));
             }
-            match lines.next(settled)? {
-                None => return Ok(Self { lines, watch }),
-                Some(line) => {
-                    let event: serde_json::Value =
-                        serde_json::from_slice(&line).context("invalid niri event")?;
-                    if watch.moves(&event) {
-                        changed = Instant::now();
+            std::thread::sleep(settled.saturating_duration_since(Instant::now()));
+        }
+    }
+
+    fn start(&'static self, stream: UnixStream) -> Result<Replica> {
+        let generation = self.generations.fetch_add(1, Ordering::Relaxed) + 1;
+        let replica = Replica::start(stream, generation)?;
+        let watched = replica.lines.stream.try_clone()?;
+        std::thread::Builder::new()
+            .name("cua-niri-events".into())
+            .spawn(move || self.watch(generation, &watched))?;
+        Ok(replica)
+    }
+
+    /// Read events as they arrive until this generation's stream is gone.
+    fn watch(&self, generation: u64, stream: &UnixStream) {
+        loop {
+            let mut poll = libc::pollfd {
+                fd: stream.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            // SAFETY: one valid pollfd that outlives the call.
+            if unsafe { libc::poll(&mut poll, 1, 1000) } < 0
+                && io::Error::last_os_error().kind() != io::ErrorKind::Interrupted
+            {
+                return;
+            }
+            let Ok(mut replica) = self.replica.lock() else {
+                return;
+            };
+            match replica.as_mut() {
+                Some(current) if current.generation == generation => {
+                    if let Err(error) = current.catch_up() {
+                        tracing::warn!("niri event stream failed: {error:#}");
+                        *replica = None;
+                        return;
                     }
                 }
+                _ => return,
             }
         }
     }
 
-    /// Whether the layout changed since the stream went quiet.
-    fn changed(&mut self) -> Result<bool> {
-        let mut changed = false;
-        // Events niri already sent are in the socket buffer: a short read
-        // deadline drains them without waiting for new ones.
-        while let Some(line) = self.lines.next(Instant::now() + Duration::from_millis(1))? {
-            let event: serde_json::Value =
-                serde_json::from_slice(&line).context("invalid niri event")?;
-            changed |= self.watch.moves(&event);
+    /// Whether the layout changed after `mark`, other than as `expected`.
+    /// A stream that failed or reconnected since cannot tell, so it refuses.
+    fn changed_since(&self, mark: Mark, expected: Expected) -> Result<bool> {
+        let mut replica = self.lock()?;
+        let Some(current) = replica
+            .as_mut()
+            .filter(|current| current.generation == mark.generation)
+        else {
+            bail!("niri's event stream reconnected after the layout was checked");
+        };
+        if let Err(error) = current.catch_up() {
+            *replica = None;
+            return Err(error.context("niri event stream failed"));
         }
-        Ok(changed)
+        let Some(skip) = mark.at.checked_sub(current.first) else {
+            return Ok(true);
+        };
+        Ok(current
+            .changes
+            .iter()
+            .skip(usize::try_from(skip)?)
+            .any(|change| change.counts(expected)))
     }
 }
 
-fn settled() -> Result<Quiet> {
-    Quiet::wait(
-        attested_connection(Instant::now() + QUERY_TIMEOUT)?,
+static HISTORY: History = History::new();
+
+/// Wait until niri's layout has been quiet for [`SETTLE_QUIET`]: at once
+/// when it already has been.
+fn settled() -> Result<Mark> {
+    HISTORY.settle(
+        || attested_connection(Instant::now() + QUERY_TIMEOUT),
         SETTLE_QUIET,
         SETTLE_LIMIT,
     )
@@ -1688,20 +1855,36 @@ fn aimed_rect(window: u64, point: (i32, i32)) -> Option<Rect> {
         .map(|aim| aim.rect)
 }
 
-/// A window-addressed pointer action admitted on a quiet layout. The event
-/// stream stays open until the input is sent, so a change in between refuses.
-pub struct PointerGate(Quiet);
+/// A window-addressed pointer action admitted on a settled layout. Each
+/// confirmation reads the layout history again, so a change after admission
+/// refuses the next event.
+pub struct PointerGate {
+    history: &'static History,
+    mark: Mark,
+    expected: Expected,
+    ipc: AttestedIpc,
+}
 
 impl PointerGate {
     /// Refuse when the layout changed after admission. Call right before the
     /// first motion and again right before every press or wheel event.
     pub fn confirm(&mut self) -> Result<()> {
-        if self.0.changed().map_err(input_unavailable)? {
+        if self
+            .history
+            .changed_since(self.mark, self.expected)
+            .map_err(input_unavailable)?
+        {
             return Err(foreground_unavailable(
                 "the niri layout changed after the pointer target was checked; take a new screenshot",
             ));
         }
         Ok(())
+    }
+
+    /// The pointer space now, read on the action's connection: niri sends
+    /// no event when outputs change.
+    pub fn pointer_space(&mut self) -> Result<(i32, i32, u32, u32)> {
+        pointer_space_of(&self.ipc.query(Request::Outputs)?)
     }
 }
 
@@ -1711,21 +1894,33 @@ impl PointerGate {
 /// With `activate`, focus the window only once all of that holds, so a
 /// refused action leaves focus alone.
 pub fn gate_pointer(window_id: u64, points: &[(i32, i32)], activate: bool) -> Result<PointerGate> {
-    let before = window_for_id(window_id).map_err(input_unavailable)?;
-    let before = placed_or_refuse(&before)?.rect;
-    let quiet = settled().map_err(input_unavailable)?;
-    let window = window_for_id(window_id).map_err(input_unavailable)?;
+    let mut ipc = ipc();
+    let scene = ipc.scene().map_err(input_unavailable)?;
+    let window = scene.window(window_id).map_err(input_unavailable)?;
+    let before = placed_or_refuse(&window)?.rect;
+    let mark = settled().map_err(input_unavailable)?;
+    let window = ipc
+        .scene()
+        .and_then(|scene| scene.window(window_id))
+        .map_err(input_unavailable)?;
     pointer_admission(&window, before, points, |point| {
         aimed_rect(window_id, point)
     })?;
     // Changes queued while the admission scene was read refuse here, before
     // focus moves.
-    let mut gate = PointerGate(quiet);
+    let mut gate = PointerGate {
+        history: &HISTORY,
+        mark,
+        expected: Expected::default(),
+        ipc,
+    };
     gate.confirm()?;
     if activate {
-        gate.0.watch.focusing = Some(window_id);
-        gate.0.watch.focusing_workspace = window.workspace;
-        activate_in(&mut ipc(), window_id, None, FOCUS_CONFIRM_TIMEOUT)
+        gate.expected = Expected {
+            window: Some(window_id),
+            workspace: window.workspace,
+        };
+        activate_in(&mut gate.ipc, window_id, None, FOCUS_CONFIRM_TIMEOUT)
             .map_err(input_unavailable)?;
     }
     Ok(gate)
@@ -1855,12 +2050,21 @@ pub fn capture_window(
     pid: Option<u32>,
     capture_display: impl FnOnce() -> Result<DisplayCapture>,
 ) -> Result<(Vec<u8>, CapturePlan), String> {
-    capture_window_in(|| ipc().scene(), settled, id, pid, capture_display)
+    let mut ipc = ipc();
+    capture_window_in(
+        || ipc.scene(),
+        settled,
+        |mark| HISTORY.changed_since(mark, Expected::default()),
+        id,
+        pid,
+        capture_display,
+    )
 }
 
 fn capture_window_in(
     mut scene: impl FnMut() -> Result<Scene>,
-    settle: impl FnOnce() -> Result<Quiet>,
+    settle: impl FnOnce() -> Result<Mark>,
+    changed_since: impl FnOnce(Mark) -> Result<bool>,
     id: u64,
     pid: Option<u32>,
     capture_display: impl FnOnce() -> Result<DisplayCapture>,
@@ -1873,13 +2077,13 @@ fn capture_window_in(
         )?)
     };
     let before = plan_now()?;
-    let mut quiet = settle().map_err(|e| format!("{e:#}"))?;
+    let mark = settle().map_err(|e| format!("{e:#}"))?;
     let plan = plan_now()?;
     if plan != before {
         return Err("the window moved while niri was settling".into());
     }
     let capture = capture_display().map_err(|e| format!("{e:#}"))?;
-    if quiet.changed().map_err(|e| format!("{e:#}"))? {
+    if changed_since(mark).map_err(|e| format!("{e:#}"))? {
         return Err("the niri layout changed during capture".into());
     }
     // niri has no output-change event: compare the output itself.
@@ -2680,13 +2884,15 @@ mod tests {
         assert!(placed.covers(101, 100));
     }
 
-    fn quiet_now() -> Quiet {
-        Quiet::wait(
-            event_stream(vec![]),
-            Duration::from_millis(10),
-            Duration::from_secs(1),
-        )
-        .unwrap()
+    fn settled_now() -> Result<Mark> {
+        Ok(Mark {
+            generation: 1,
+            at: 0,
+        })
+    }
+
+    fn unchanged(_: Mark) -> Result<bool> {
+        Ok(false)
     }
 
     fn display(output: &str, size: (u32, u32)) -> Result<DisplayCapture> {
@@ -2718,7 +2924,8 @@ mod tests {
                     false,
                 ))
             },
-            || Ok(quiet_now()),
+            settled_now,
+            unchanged,
             7,
             None,
             || display("winit", (1280, 720)),
@@ -2736,13 +2943,11 @@ mod tests {
         // name, area, scale and image size.
         let one = || Ok(one_output(vec![floating(7, 1, (100.0, 60.0), (300, 200))]));
         assert_eq!(
-            capture_window_in(
-                one,
-                || Ok(quiet_now()),
-                7,
-                None,
-                || oriented("winit", 0, (1280, 720))
-            )
+            capture_window_in(one, settled_now, unchanged, 7, None, || oriented(
+                "winit",
+                0,
+                (1280, 720)
+            ))
             .unwrap_err(),
             "the capture was oriented for output transform 0, but the window's output has 6"
         );
@@ -2758,7 +2963,8 @@ mod tests {
                     false,
                 ))
             },
-            || Ok(quiet_now()),
+            settled_now,
+            unchanged,
             7,
             None,
             || display("winit", (1280, 720)),
@@ -2774,35 +2980,28 @@ mod tests {
     fn capture_refuses_another_output_or_size() {
         let one = || Ok(one_output(vec![floating(7, 1, (100.0, 60.0), (300, 200))]));
         assert_eq!(
-            capture_window_in(
-                one,
-                || Ok(quiet_now()),
-                7,
-                None,
-                || display("DP-1", (1280, 720))
-            )
+            capture_window_in(one, settled_now, unchanged, 7, None, || display(
+                "DP-1",
+                (1280, 720)
+            ))
             .unwrap_err(),
             "the display capture copied output \"DP-1\", not the window's output \"winit\""
         );
         assert_eq!(
-            capture_window_in(
-                one,
-                || Ok(quiet_now()),
-                7,
-                None,
-                || display("winit", (1920, 1080))
-            )
+            capture_window_in(one, settled_now, unchanged, 7, None, || display(
+                "winit",
+                (1920, 1080)
+            ))
             .unwrap_err(),
             "the capture is 1920x1080 pixels, but niri reports 1280x720 for output \"winit\""
         );
-        assert!(capture_window_in(
-            one,
-            || Ok(quiet_now()),
-            7,
-            None,
-            || display("winit", (1280, 720))
-        )
-        .is_ok());
+        assert!(
+            capture_window_in(one, settled_now, unchanged, 7, None, || display(
+                "winit",
+                (1280, 720)
+            ))
+            .is_ok()
+        );
     }
 
     #[test]
@@ -3202,67 +3401,90 @@ mod tests {
 
     #[test]
     fn title_changes_do_not_count_as_layout_changes() {
-        let mut watch = LayoutWatch::new();
+        let mut watch = LayoutWatch::default();
         let window = floating(7, 1, (100.0, 60.0), (300, 200));
-        assert!(watch.moves(&json!({"WindowsChanged": {"windows": [window.clone()]}})));
+        let mut change = |event: Value| watch.change(&event);
+        assert_eq!(
+            change(json!({"WindowsChanged": {"windows": [window.clone()]}})),
+            Some(Change::Moved)
+        );
         let mut retitled = window.clone();
         retitled["title"] = json!("Float 7 clicked 1");
-        assert!(!watch.moves(&json!({"WindowOpenedOrChanged": {"window": retitled}})));
+        assert_eq!(
+            change(json!({"WindowOpenedOrChanged": {"window": retitled}})),
+            None
+        );
         let mut moved = window;
         moved["layout"]["tile_pos_in_workspace_view"] = json!([200.0, 100.0]);
-        assert!(watch.moves(&json!({"WindowOpenedOrChanged": {"window": moved}})));
-        assert!(watch.moves(
-            &json!({"WindowOpenedOrChanged": {"window": floating(9, 1, (0.0, 0.0), (10, 10))}})
-        ));
-        assert!(!watch.moves(&json!({"WindowFocusTimestampChanged": {"id": 7}})));
-        assert!(watch.moves(&json!({"WorkspaceActivated": {"id": 2, "focused": true}})));
-        assert!(watch.moves(&json!({"SomethingFromALaterNiri": {}})));
+        assert_eq!(
+            change(json!({"WindowOpenedOrChanged": {"window": moved}})),
+            Some(Change::Moved)
+        );
+        assert_eq!(
+            change(
+                json!({"WindowOpenedOrChanged": {"window": floating(9, 1, (0.0, 0.0), (10, 10))}})
+            ),
+            Some(Change::Moved)
+        );
+        assert_eq!(
+            change(json!({"WindowFocusTimestampChanged": {"id": 7}})),
+            None
+        );
+        assert_eq!(
+            change(json!({"SomethingFromALaterNiri": {}})),
+            Some(Change::Moved)
+        );
     }
 
     #[test]
     fn only_the_drivers_own_focus_change_is_expected() {
-        let mut watch = LayoutWatch::new();
-        assert!(watch.moves(&json!({"WindowFocusChanged": {"id": 7}})));
-        watch.focusing = Some(7);
-        assert!(!watch.moves(&json!({"WindowFocusChanged": {"id": 7}})));
-        assert!(!watch.moves(
-            &json!({"WorkspaceActiveWindowChanged": {"workspace_id": 1, "active_window_id": 7}})
+        let mut watch = LayoutWatch::default();
+        let mut counts =
+            |event: Value, expected: Expected| watch.change(&event).unwrap().counts(expected);
+        let none = Expected::default();
+        assert!(counts(json!({"WindowFocusChanged": {"id": 7}}), none));
+        let focusing = Expected {
+            window: Some(7),
+            workspace: Some(4),
+        };
+        assert!(!counts(json!({"WindowFocusChanged": {"id": 7}}), focusing));
+        assert!(!counts(
+            json!({"WorkspaceActiveWindowChanged": {"workspace_id": 1, "active_window_id": 7}}),
+            focusing
         ));
-        assert!(watch.moves(&json!({"WindowFocusChanged": {"id": 8}})));
-        assert!(watch.moves(&json!({"WindowFocusChanged": {"id": null}})));
-        assert!(watch.moves(
-            &json!({"WorkspaceActiveWindowChanged": {"workspace_id": 1, "active_window_id": 8}})
+        assert!(counts(json!({"WindowFocusChanged": {"id": 8}}), focusing));
+        assert!(counts(
+            json!({"WindowFocusChanged": {"id": null}}),
+            focusing
+        ));
+        assert!(counts(
+            json!({"WorkspaceActiveWindowChanged": {"workspace_id": 1, "active_window_id": 8}}),
+            focusing
         ));
         // Focus moving to the target's (already active) workspace on another
         // output is expected; another workspace is not.
-        watch.focusing_workspace = Some(4);
-        assert!(!watch.moves(&json!({"WorkspaceActivated": {"id": 4, "focused": true}})));
-        assert!(watch.moves(&json!({"WorkspaceActivated": {"id": 3, "focused": true}})));
+        assert!(!counts(
+            json!({"WorkspaceActivated": {"id": 4, "focused": true}}),
+            focusing
+        ));
+        assert!(counts(
+            json!({"WorkspaceActivated": {"id": 3, "focused": true}}),
+            focusing
+        ));
+        assert!(counts(
+            json!({"WorkspaceActivated": {"id": 4, "focused": true}}),
+            none
+        ));
     }
 
-    #[test]
-    fn a_layout_change_after_positioning_refuses_the_press() {
-        let quiet = Quiet::wait(
-            event_stream(vec![(
-                Duration::from_millis(250),
-                json!({"WindowLayoutsChanged": {"changes": []}}),
-            )]),
-            Duration::from_millis(100),
-            Duration::from_secs(1),
-        )
-        .unwrap();
-        let mut gate = PointerGate(quiet);
-        // Still quiet before the first motion; a window moves over the point
-        // while the pointer is positioned, so the press must refuse.
-        gate.confirm().unwrap();
-        std::thread::sleep(Duration::from_millis(300));
-        assert_eq!(
-            gate.confirm().unwrap_err().to_string(),
-            "foreground_unavailable: the niri layout changed after the pointer target was checked; take a new screenshot"
-        );
+    /// A fresh history; each test needs its own event stream.
+    fn history() -> &'static History {
+        Box::leak(Box::new(History::new()))
     }
 
-    fn event_stream(events: Vec<(Duration, Value)>) -> UnixStream {
+    /// A niri event stream that sends `events`, each after its delay, then
+    /// stays open for `open`.
+    fn event_stream_open(events: Vec<(Duration, Value)>, open: Duration) -> UnixStream {
         let (client, mut server) = UnixStream::pair().unwrap();
         std::thread::spawn(move || {
             let mut request = [0u8; 64];
@@ -3274,31 +3496,99 @@ mod tests {
                     return;
                 }
             }
-            std::thread::sleep(Duration::from_secs(2));
+            std::thread::sleep(open);
         });
         client
     }
 
+    fn event_stream(events: Vec<(Duration, Value)>) -> UnixStream {
+        event_stream_open(events, Duration::from_secs(5))
+    }
+
+    fn workspaces_changed() -> Value {
+        json!({"WorkspacesChanged": {"workspaces": []}})
+    }
+
     #[test]
-    fn quiet_layout_settles_after_the_quiet_period() {
+    fn a_layout_that_stayed_quiet_settles_at_once_for_the_next_action() {
+        let history = history();
+        let quiet = Duration::from_millis(200);
         let started = Instant::now();
-        let mut quiet = Quiet::wait(
-            event_stream(vec![
-                (
-                    Duration::ZERO,
-                    json!({"WorkspacesChanged": {"workspaces": []}}),
-                ),
-                (
-                    Duration::from_millis(30),
-                    json!({"WindowFocusTimestampChanged": {"id": 7}}),
-                ),
-            ]),
-            Duration::from_millis(100),
-            Duration::from_secs(1),
-        )
-        .unwrap();
-        assert!(started.elapsed() >= Duration::from_millis(100));
-        assert!(!quiet.changed().unwrap());
+        let first = history
+            .settle(
+                || Ok(event_stream(vec![(Duration::ZERO, workspaces_changed())])),
+                quiet,
+                Duration::from_secs(2),
+            )
+            .unwrap();
+        // Connecting counts as a change: an animation may be running.
+        assert!(started.elapsed() >= quiet);
+        let again = Instant::now();
+        let second = history
+            .settle(
+                || bail!("the stream stays open between actions"),
+                quiet,
+                Duration::from_secs(2),
+            )
+            .unwrap();
+        assert!(
+            again.elapsed() < Duration::from_millis(100),
+            "{:?}",
+            again.elapsed()
+        );
+        assert_eq!(first, second);
+    }
+
+    #[test]
+    fn a_change_is_dated_when_niri_sends_it_not_when_an_action_looks() {
+        let history = history();
+        let quiet = Duration::from_millis(200);
+        let started = Instant::now();
+        // The change comes 50 ms in, while the first wait sleeps: read then,
+        // the layout is quiet 250 ms in; read when the wait wakes, 400 ms.
+        history
+            .settle(
+                || {
+                    Ok(event_stream(vec![(
+                        Duration::from_millis(50),
+                        json!({"WindowLayoutsChanged": {"changes": []}}),
+                    )]))
+                },
+                quiet,
+                Duration::from_secs(2),
+            )
+            .unwrap();
+        let elapsed = started.elapsed();
+        assert!(elapsed >= Duration::from_millis(250), "{elapsed:?}");
+        assert!(elapsed < Duration::from_millis(380), "{elapsed:?}");
+    }
+
+    #[test]
+    fn a_recent_change_still_waits_out_the_quiet_period() {
+        let history = history();
+        let quiet = Duration::from_millis(200);
+        history
+            .settle(
+                || {
+                    Ok(event_stream(vec![(
+                        Duration::from_millis(400),
+                        json!({"WindowLayoutsChanged": {"changes": []}}),
+                    )]))
+                },
+                quiet,
+                Duration::from_secs(2),
+            )
+            .unwrap();
+        std::thread::sleep(Duration::from_millis(500).saturating_sub(quiet));
+        let again = Instant::now();
+        history
+            .settle(|| bail!("still connected"), quiet, Duration::from_secs(2))
+            .unwrap();
+        assert!(
+            again.elapsed() >= Duration::from_millis(80),
+            "{:?}",
+            again.elapsed()
+        );
     }
 
     #[test]
@@ -3311,13 +3601,13 @@ mod tests {
                 )
             })
             .collect();
-        let error = Quiet::wait(
-            event_stream(events),
-            Duration::from_millis(100),
-            Duration::from_millis(300),
-        )
-        .err()
-        .unwrap();
+        let error = history()
+            .settle(
+                || Ok(event_stream(events)),
+                Duration::from_millis(100),
+                Duration::from_millis(300),
+            )
+            .unwrap_err();
         assert_eq!(
             error.to_string(),
             "foreground_unavailable: the niri layout did not stay unchanged for 100 ms within 300 ms, so window geometry may not match the screen"
@@ -3326,36 +3616,98 @@ mod tests {
 
     #[test]
     fn a_change_after_settling_is_detected() {
-        let mut quiet = Quiet::wait(
-            event_stream(vec![(
-                Duration::from_millis(150),
-                json!({"WorkspaceActivated": {"id": 2, "focused": true}}),
-            )]),
-            Duration::from_millis(100),
-            Duration::from_secs(1),
-        )
-        .unwrap();
-        std::thread::sleep(Duration::from_millis(100));
-        assert!(quiet.changed().unwrap());
+        let history = history();
+        let mark = history
+            .settle(
+                || {
+                    Ok(event_stream(vec![(
+                        Duration::from_millis(150),
+                        json!({"WorkspaceActivated": {"id": 2, "focused": true}}),
+                    )]))
+                },
+                Duration::from_millis(100),
+                Duration::from_secs(1),
+            )
+            .unwrap();
+        assert!(!history.changed_since(mark, Expected::default()).unwrap());
+        std::thread::sleep(Duration::from_millis(150));
+        assert!(history.changed_since(mark, Expected::default()).unwrap());
+    }
+
+    #[test]
+    fn a_lost_or_reconnected_stream_cannot_vouch_for_an_earlier_check() {
+        let history = history();
+        let quiet = Duration::from_millis(50);
+        let mark = history
+            .settle(
+                || Ok(event_stream_open(vec![], Duration::from_millis(100))),
+                quiet,
+                Duration::from_secs(1),
+            )
+            .unwrap();
+        std::thread::sleep(Duration::from_millis(200));
+        // niri closed the stream: whatever happened since is unknown.
+        assert!(history.changed_since(mark, Expected::default()).is_err());
+        let again = history
+            .settle(|| Ok(event_stream(vec![])), quiet, Duration::from_secs(1))
+            .unwrap();
+        assert_ne!(again, mark);
+        assert_eq!(
+            history
+                .changed_since(mark, Expected::default())
+                .unwrap_err()
+                .to_string(),
+            "niri's event stream reconnected after the layout was checked"
+        );
+        assert!(!history.changed_since(again, Expected::default()).unwrap());
+    }
+
+    fn offline_ipc() -> AttestedIpc {
+        Ipc {
+            connect: |_| bail!("no niri in this test"),
+            per_attempt: QUERY_TIMEOUT,
+            total: QUERY_TOTAL_TIMEOUT,
+            backoff: QUERY_RETRY_BACKOFF,
+            lines: None,
+        }
+    }
+
+    #[test]
+    fn a_layout_change_after_positioning_refuses_the_press() {
+        let history = history();
+        let mark = history
+            .settle(
+                || {
+                    Ok(event_stream(vec![(
+                        Duration::from_millis(250),
+                        json!({"WindowLayoutsChanged": {"changes": []}}),
+                    )]))
+                },
+                Duration::from_millis(100),
+                Duration::from_secs(1),
+            )
+            .unwrap();
+        let mut gate = PointerGate {
+            history,
+            mark,
+            expected: Expected::default(),
+            ipc: offline_ipc(),
+        };
+        // Still quiet before the first motion; a window moves over the point
+        // while the pointer is positioned, so the press must refuse.
+        gate.confirm().unwrap();
+        std::thread::sleep(Duration::from_millis(300));
+        assert_eq!(
+            gate.confirm().unwrap_err().to_string(),
+            "foreground_unavailable: the niri layout changed after the pointer target was checked; take a new screenshot"
+        );
     }
 
     // ── Pointer admission ───────────────────────────────────────────────────
 
     #[test]
-    fn window_coordinates_refuse_a_tiled_window_instead_of_passing_through() {
-        let scene = one_output(vec![
-            tiled(5, 1, (402.0, 448.0)),
-            floating(7, 1, (100.0, 60.0), (300, 200)),
-        ]);
-        assert_eq!(
-            aim_at(&scene.window(5).unwrap(), 10, 20)
-                .unwrap_err()
-                .to_string(),
-            format!(
-                "foreground_unavailable: niri window 5: {}",
-                Unplaced::Tiled.reason()
-            )
-        );
+    fn floating_window_coordinates_add_the_window_origin() {
+        let scene = one_output(vec![floating(7, 1, (100.0, 60.0), (300, 200))]);
         let (point, rect) = aim_at(&scene.window(7).unwrap(), 10, 20).unwrap();
         assert_eq!(point, (110, 80));
         assert_eq!(

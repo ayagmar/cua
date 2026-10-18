@@ -8,20 +8,23 @@
 //!
 //! niri 26.04 reports a position only for floating windows
 //! (`tile_pos_in_workspace_view`): a tiled window's place depends on the
-//! view's scroll position, which IPC does not report. Tiled windows keep
-//! identity, focus and keyboard routes; geometry-bound routes refuse. IPC
-//! positions also omit niri's animation offset, so pointer and crop routes
-//! wait for a quiet event stream first (see [`Quiet`]).
+//! view's scroll position, which IPC does not report. A tiled window's
+//! screenshot is therefore its whole output, and its window coordinates are
+//! pixels of that screenshot while niri reports no layout change, for at
+//! most [`FRAME_MAX_AGE`] (see [`OutputFrame`]). IPC positions also omit niri's animation offset, so
+//! pointer and crop routes wait until the layout has been quiet for a while
+//! (see [`History`]).
 
 use anyhow::{anyhow, bail, Context, Result};
 use serde::de::DeserializeOwned;
 use serde::Deserialize;
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::ffi::OsString;
 use std::io::{self, Read, Write};
 use std::os::fd::AsRawFd;
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -47,11 +50,21 @@ const SETTLE_QUIET: Duration = Duration::from_secs(1);
 const SETTLE_LIMIT: Duration = Duration::from_secs(4);
 /// Recent window-local to layout translations kept for the pointer gate.
 const MAX_AIMS: usize = 64;
+/// How long a tiled window's output screenshot stays usable for pointer
+/// input. niri scrolls a view without reporting it (see [`Shown`]), so an
+/// unchanged layout proves less the older the screenshot is.
+pub const FRAME_MAX_AGE: Duration = Duration::from_secs(60);
 
 // ── Session ──────────────────────────────────────────────────────────────────
 
 /// The compositor process recognised as niri for this driver process.
 static RECOGNIZED: OnceLock<libc::pid_t> = OnceLock::new();
+/// Whether the adapter supports the recognised niri's release: `None` until
+/// niri answers a `Version` request, and every route refuses meanwhile.
+static RELEASE: Mutex<Option<Result<(), String>>> = Mutex::new(None);
+/// The oldest niri release the adapter supports: 25.08 reports the window
+/// layout that geometry needs, and serves several requests per connection.
+const MIN_RELEASE: (u32, u32) = (25, 8);
 
 #[derive(Debug, PartialEq, Eq)]
 enum Attestation {
@@ -172,9 +185,19 @@ pub fn is_session() -> bool {
     {
         return false;
     }
-    let (attestation, _, lasting) = probe(None, QUERY_TIMEOUT);
+    let (attestation, connection, lasting) = probe(None, QUERY_TIMEOUT);
     match attestation {
         Attestation::Attested(pid) => {
+            // A proven niri stays niri even when it is too old for the
+            // adapter or its version is not read yet: routes refuse with the
+            // reason instead of falling back to generic Wayland discovery.
+            if let Err(error) = release_check(&RELEASE, || {
+                connection
+                    .context("niri IPC connection unavailable")
+                    .and_then(release_of)
+            }) {
+                tracing::warn!("{error:#}");
+            }
             let pinned = *RECOGNIZED.get_or_init(|| pid);
             tracing::info!(pid = pinned, "niri session recognised");
             true
@@ -214,11 +237,99 @@ fn session_check(adapter_on: bool, recognized: bool, socket_set: bool) -> Sessio
     }
 }
 
-/// A connection to the recognised niri process, re-attested each time.
-fn attested_connection(deadline: Instant) -> Result<UnixStream> {
+/// The `Version` reply on a newly attested connection, which carries only
+/// this request: niri before 25.05 serves one request per connection.
+fn release_of(connection: UnixStream) -> Result<String> {
+    let mut connection = Some(connection);
+    Ipc {
+        connect: move |_| {
+            connection
+                .take()
+                .context("niri IPC connection already used")
+        },
+        per_attempt: QUERY_TIMEOUT,
+        total: QUERY_TOTAL_TIMEOUT,
+        backoff: QUERY_RETRY_BACKOFF,
+        lines: None,
+    }
+    .query(Request::Version)
+}
+
+/// Whether the adapter supports niri `version`, such as `26.04 (8ed0da4)`.
+/// Only the leading digits of the year and month count: packagers may add
+/// a suffix, such as `26.04-1 (e35c630)`.
+fn release_supported(version: &str) -> Result<(), String> {
+    let release = version
+        .split_once(" (")
+        .map_or(version, |(release, _)| release);
+    let leading = |part: Option<&str>| {
+        let part = part?;
+        let digits = part
+            .find(|c: char| !c.is_ascii_digit())
+            .unwrap_or(part.len());
+        part[..digits].parse::<u32>().ok()
+    };
+    let mut parts = release.split('.');
+    match (leading(parts.next()), leading(parts.next())) {
+        (Some(year), Some(month)) => {
+            if (year, month) >= MIN_RELEASE {
+                Ok(())
+            } else {
+                Err(format!(
+                    "niri {release} is not supported: the niri adapter needs niri {}.{:02} or later",
+                    MIN_RELEASE.0, MIN_RELEASE.1
+                ))
+            }
+        }
+        _ => Err(format!(
+            "niri reports version {version:?}, which the niri adapter cannot read; it needs niri {}.{:02} or later",
+            MIN_RELEASE.0, MIN_RELEASE.1
+        )),
+    }
+}
+
+/// Decide whether the adapter supports niri's release, reading its version
+/// through `read` while undecided. A failed read leaves it undecided.
+fn release_check(
+    release: &Mutex<Option<Result<(), String>>>,
+    read: impl FnOnce() -> Result<String>,
+) -> Result<()> {
+    let mut release = release
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let verdict = match release.as_ref() {
+        Some(verdict) => verdict.clone(),
+        None => {
+            let version = read().context(
+                "niri did not report its version, so the niri adapter cannot yet check that it supports it",
+            )?;
+            let verdict = release_supported(&version);
+            if let Err(reason) = &verdict {
+                tracing::warn!("{reason}");
+            }
+            release.insert(verdict).clone()
+        }
+    };
+    verdict.map_err(|reason| anyhow!(reason))
+}
+
+/// The recognised niri process, when the adapter supports it. Until niri's
+/// release is known, each call asks a newly attested connection.
+fn pinned() -> Result<libc::pid_t> {
     let pinned = *RECOGNIZED
         .get()
         .context("niri session has not been recognised")?;
+    release_check(&RELEASE, || match probe(Some(pinned), QUERY_TIMEOUT) {
+        (Attestation::Attested(_), Some(ipc), _) => release_of(ipc),
+        (Attestation::Unrelated(reason) | Attestation::Refused(reason), ..) => bail!("{reason}"),
+        (Attestation::Attested(_), None, _) => bail!("niri IPC connection unavailable"),
+    })?;
+    Ok(pinned)
+}
+
+/// A connection to the recognised niri process, re-attested each time.
+fn attested_connection(deadline: Instant) -> Result<UnixStream> {
+    let pinned = pinned()?;
     match probe(Some(pinned), time_remaining(deadline)?) {
         (Attestation::Attested(_), Some(ipc), _) => Ok(ipc),
         (Attestation::Unrelated(reason) | Attestation::Refused(reason), ..) => bail!("{reason}"),
@@ -229,9 +340,7 @@ fn attested_connection(deadline: Instant) -> Result<UnixStream> {
 /// Bind a Wayland connection used for capture or input to the recognised
 /// niri process.
 pub(super) fn verify_wayland_peer(connection: &wayland_client::Connection) -> Result<()> {
-    let pinned = *RECOGNIZED
-        .get()
-        .context("niri session has not been recognised")?;
+    let pinned = pinned()?;
     let peer = peer_pid(connection.backend().poll_fd().as_raw_fd())?;
     if peer != pinned {
         bail!("WAYLAND_DISPLAY is served by pid {peer}, not the recognised niri pid {pinned}");
@@ -242,9 +351,7 @@ pub(super) fn verify_wayland_peer(connection: &wayland_client::Connection) -> Re
 /// A Wayland client socket proven to reach the recognised niri process, for
 /// a keyboard helper that must not rediscover the display on its own.
 pub(super) fn attested_wayland_socket() -> Result<UnixStream> {
-    let pinned = *RECOGNIZED
-        .get()
-        .context("niri session has not been recognised")?;
+    let pinned = pinned()?;
     let socket = super::compositor_peer::wayland_socket_with_timeout(QUERY_TIMEOUT)?;
     let peer = peer_pid(socket.as_raw_fd())?;
     if peer != pinned {
@@ -253,12 +360,17 @@ pub(super) fn attested_wayland_socket() -> Result<UnixStream> {
     Ok(socket)
 }
 
-fn ipc() -> Ipc<impl FnMut(Instant) -> Result<UnixStream>> {
+/// IPC to the recognised niri process. One value serves one action: its
+/// requests share one attested connection.
+type AttestedIpc = Ipc<fn(Instant) -> Result<UnixStream>>;
+
+fn ipc() -> AttestedIpc {
     Ipc {
         connect: attested_connection,
         per_attempt: QUERY_TIMEOUT,
         total: QUERY_TOTAL_TIMEOUT,
         backoff: QUERY_RETRY_BACKOFF,
+        lines: None,
     }
 }
 
@@ -409,9 +521,21 @@ struct Ipc<C> {
     per_attempt: Duration,
     total: Duration,
     backoff: Duration,
+    /// The connection earlier requests used. A connected socket keeps its
+    /// peer, so it stays attested; niri answers one connection's requests
+    /// in order. A failed exchange drops it, so a late reply is never read
+    /// as the answer to a later request.
+    lines: Option<Lines>,
 }
 
 impl<C: FnMut(Instant) -> Result<UnixStream>> Ipc<C> {
+    fn connection(&mut self, deadline: Instant) -> Result<Lines> {
+        match self.lines.take() {
+            Some(lines) => Ok(lines),
+            None => Ok(Lines::new((self.connect)(deadline)?)),
+        }
+    }
+
     /// A read-only request. Only a timed-out request/reply is retried, on a
     /// newly attested connection; connection and attestation errors are final.
     fn query<T: DeserializeOwned>(&mut self, request: Request) -> Result<T> {
@@ -420,9 +544,10 @@ impl<C: FnMut(Instant) -> Result<UnixStream>> Ipc<C> {
         for attempt in 1..=QUERY_MAX_ATTEMPTS {
             time_remaining(deadline)?;
             let attempt_deadline = deadline.min(Instant::now() + self.per_attempt);
-            let mut lines = Lines::new((self.connect)(attempt_deadline)?);
+            let mut lines = self.connection(attempt_deadline)?;
             match lines.exchange(&format!("\"{name}\""), attempt_deadline) {
                 Ok(reply) => {
+                    self.lines = Some(lines);
                     let mut payload = reply_ok(name, reply)?;
                     let value = payload
                         .get_mut(name)
@@ -454,10 +579,11 @@ impl<C: FnMut(Instant) -> Result<UnixStream>> Ipc<C> {
     fn action(&mut self, action: serde_json::Value) -> Result<()> {
         let deadline = Instant::now() + self.per_attempt;
         let request = serde_json::json!({ "Action": action }).to_string();
-        let mut lines = Lines::new((self.connect)(deadline)?);
+        let mut lines = self.connection(deadline)?;
         let reply = lines
             .exchange(&request, deadline)
             .context("niri action outcome is unknown")?;
+        self.lines = Some(lines);
         match reply_ok(&request, reply)? {
             serde_json::Value::String(handled) if handled == "Handled" => Ok(()),
             other => bail!("unexpected niri reply to {request}: {other}"),
@@ -690,9 +816,7 @@ pub enum Unplaced {
 impl Unplaced {
     pub fn reason(self) -> &'static str {
         match self {
-            Self::Tiled => {
-                "niri does not report where a tiled window is on screen; float the window to use window coordinates"
-            }
+            Self::Tiled => "niri does not report where a tiled window is on screen",
             Self::NotShowing => {
                 "the window is not showing: its workspace is not active on an output, or the niri overview is open"
             }
@@ -1162,6 +1286,11 @@ pub fn health_note() -> Option<String> {
             Attestation::Attested(_) => HealthSession::Inactive,
         };
         return Some(describe_health(session, Ok(1)));
+    }
+    if let Err(reason) = pinned() {
+        return Some(format!(
+            "niri: {reason:#}; niri window ids, focus and geometry refuse."
+        ));
     }
     let scene = ipc().scene();
     Some(describe_health(
@@ -1694,28 +1823,50 @@ fn restore_workspace<C: FnMut(Instant) -> Result<UnixStream>>(
 
 // ── Settled geometry ─────────────────────────────────────────────────────────
 
-/// Whether an event-stream event can move, uncover or animate a window.
-/// Unknown events count, so a newer niri fails closed. A window event that
-/// only changes a title or similar metadata does not.
+/// What an event-stream event did to the shown layout.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Change {
+    /// Anything that can move, uncover or animate a window, and any event
+    /// this adapter does not know, so a newer niri fails closed.
+    Moved,
+    /// Keyboard focus went to this window, or to none.
+    Focus(Option<u64>),
+    /// This workspace became active on its output.
+    Activated(Option<u64>),
+    /// This window became its workspace's active window.
+    Active(Option<u64>),
+}
+
+/// The focus change a pointer action makes itself. Focus moves no floating
+/// window, so the events naming the window it focuses are expected.
+#[derive(Clone, Copy, Debug, Default)]
+struct Expected {
+    window: Option<u64>,
+    /// The window's workspace, already active on its output: when focus
+    /// moves there from another output, niri reports it activated.
+    workspace: Option<u64>,
+}
+
+impl Change {
+    fn counts(self, expected: Expected) -> bool {
+        match self {
+            Self::Moved => true,
+            Self::Focus(id) | Self::Active(id) => {
+                expected.window.is_none() || id != expected.window
+            }
+            Self::Activated(id) => expected.workspace.is_none() || id != expected.workspace,
+        }
+    }
+}
+
+/// Classifies event-stream events. A window event that only changes a title
+/// or similar metadata changes nothing.
+#[derive(Default)]
 struct LayoutWatch {
     layouts: HashMap<u64, serde_json::Value>,
-    /// A window the driver itself is focusing: the focus events naming it
-    /// are expected. Focus moves no window.
-    focusing: Option<u64>,
-    /// The focused window's workspace, already active on its output: when
-    /// focus moves there from another output, niri reports it activated.
-    focusing_workspace: Option<u64>,
 }
 
 impl LayoutWatch {
-    fn new() -> Self {
-        Self {
-            layouts: HashMap::new(),
-            focusing: None,
-            focusing_workspace: None,
-        }
-    }
-
     /// The parts of a window that place it on screen.
     fn placing(window: &serde_json::Value) -> serde_json::Value {
         serde_json::json!([
@@ -1725,36 +1876,27 @@ impl LayoutWatch {
         ])
     }
 
-    fn moves(&mut self, event: &serde_json::Value) -> bool {
+    fn change(&mut self, event: &serde_json::Value) -> Option<Change> {
         let Some((name, body)) = event.as_object().and_then(|event| event.iter().next()) else {
-            return true;
+            return Some(Change::Moved);
         };
+        let id = |key: &str| body.get(key).and_then(serde_json::Value::as_u64);
         match name.as_str() {
             "WindowFocusTimestampChanged"
             | "WindowUrgencyChanged"
             | "WorkspaceUrgencyChanged"
             | "KeyboardLayoutsChanged"
             | "KeyboardLayoutSwitched"
-            | "ConfigLoaded"
             | "ScreenshotCaptured"
             | "CastsChanged"
             | "CastStartedOrChanged"
-            | "CastStopped" => false,
-            "WindowFocusChanged" => {
-                self.focusing.is_none()
-                    || body.get("id").and_then(serde_json::Value::as_u64) != self.focusing
-            }
-            "WorkspaceActivated" => {
-                self.focusing_workspace.is_none()
-                    || body.get("id").and_then(serde_json::Value::as_u64) != self.focusing_workspace
-            }
-            "WorkspaceActiveWindowChanged" => {
-                self.focusing.is_none()
-                    || body
-                        .get("active_window_id")
-                        .and_then(serde_json::Value::as_u64)
-                        != self.focusing
-            }
+            | "CastStopped" => None,
+            // A reload can move tiled columns (struts, gaps, centering) and
+            // change animation lengths without any other event.
+            "ConfigLoaded" => Some(Change::Moved),
+            "WindowFocusChanged" => Some(Change::Focus(id("id"))),
+            "WorkspaceActivated" => Some(Change::Activated(id("id"))),
+            "WorkspaceActiveWindowChanged" => Some(Change::Active(id("active_window_id"))),
             "WindowsChanged" => {
                 self.layouts = body
                     .get("windows")
@@ -1763,47 +1905,156 @@ impl LayoutWatch {
                     .flatten()
                     .filter_map(|window| Some((window.get("id")?.as_u64()?, Self::placing(window))))
                     .collect();
-                true
+                Some(Change::Moved)
             }
             "WindowOpenedOrChanged" => {
                 let Some(window) = body.get("window") else {
-                    return true;
+                    return Some(Change::Moved);
                 };
                 let Some(id) = window.get("id").and_then(serde_json::Value::as_u64) else {
-                    return true;
+                    return Some(Change::Moved);
                 };
                 let placing = Self::placing(window);
-                self.layouts.insert(id, placing.clone()) != Some(placing)
+                (self.layouts.insert(id, placing.clone()) != Some(placing)).then_some(Change::Moved)
             }
-            _ => true,
+            _ => Some(Change::Moved),
         }
     }
 }
 
-/// An open event stream that has seen the layout stay unchanged for
-/// [`SETTLE_QUIET`]. niri reports a new place at once and animates to it, and
-/// the stream does not report the animation's end. The quiet period only
-/// covers animations no longer than [`SETTLE_QUIET`]; a longer one passes
-/// this gate with stale geometry.
-struct Quiet {
+/// How many recent changes a history keeps for checks still in flight; a
+/// check older than that counts as changed.
+const MAX_CHANGES: usize = 1024;
+
+/// niri's layout changes as one long-lived, attested event stream reports
+/// them. niri reports a new place at once and animates to it, and the stream
+/// does not report the animation's end, so the layout counts as settled once
+/// it has not changed for [`SETTLE_QUIET`]; that covers only animations no
+/// longer than it (see [`SETTLE_QUIET`]).
+struct Replica {
     lines: Lines,
+    generation: u64,
     watch: LayoutWatch,
+    /// When the layout last changed. Connecting counts: an animation may
+    /// have started before the stream did.
+    changed_at: Instant,
+    /// Recent changes, the first numbered `first`.
+    changes: VecDeque<Change>,
+    first: u64,
 }
 
-impl Quiet {
-    fn wait(stream: UnixStream, quiet: Duration, limit: Duration) -> Result<Self> {
-        let started = Instant::now();
+impl Replica {
+    fn start(stream: UnixStream, generation: u64) -> Result<Self> {
+        let deadline = Instant::now() + QUERY_TIMEOUT;
         let mut lines = Lines::new(stream);
-        lines.send("\"EventStream\"", started + QUERY_TIMEOUT)?;
+        lines.send("\"EventStream\"", deadline)?;
         let first = lines
-            .next(started + QUERY_TIMEOUT)?
+            .next(deadline)?
             .context("niri event stream did not start")?;
-        reply_ok("EventStream", serde_json::from_slice(&first)?)?;
-        let mut watch = LayoutWatch::new();
-        // An animation may have started just before the stream connected.
-        let mut changed = Instant::now();
+        reply_ok(
+            "EventStream",
+            serde_json::from_slice(&first).context("invalid niri IPC JSON")?,
+        )?;
+        // From here on, reads take only what niri has already sent.
+        lines.stream.set_nonblocking(true)?;
+        Ok(Self {
+            lines,
+            generation,
+            watch: LayoutWatch::default(),
+            changed_at: Instant::now(),
+            changes: VecDeque::new(),
+            first: 0,
+        })
+    }
+
+    fn mark(&self) -> Mark {
+        Mark {
+            generation: self.generation,
+            at: self.first + self.changes.len() as u64,
+        }
+    }
+
+    /// Apply every event niri has sent so far.
+    fn catch_up(&mut self) -> Result<()> {
+        while let Some(line) = self.lines.next(Instant::now() + QUERY_TIMEOUT)? {
+            let event: serde_json::Value =
+                serde_json::from_slice(&line).context("invalid niri event")?;
+            if let Some(change) = self.watch.change(&event) {
+                self.changed_at = Instant::now();
+                self.changes.push_back(change);
+                if self.changes.len() > MAX_CHANGES {
+                    self.changes.pop_front();
+                    self.first += 1;
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Where a layout history stood when a check passed: later changes are new.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Mark {
+    generation: u64,
+    at: u64,
+}
+
+/// The process's niri layout history: one event stream, kept open between
+/// actions so an action on a layout that has been quiet for
+/// [`SETTLE_QUIET`] need not wait. A background thread reads it as events
+/// arrive, which dates each change and keeps niri from dropping a stream
+/// that reads too slowly; every check also reads what has arrived itself.
+/// A stream that fails is dropped and the next settle connects again; a
+/// check made against an earlier connection refuses.
+struct History {
+    replica: Mutex<Option<Replica>>,
+    generations: AtomicU64,
+}
+
+impl History {
+    const fn new() -> Self {
+        Self {
+            replica: Mutex::new(None),
+            generations: AtomicU64::new(0),
+        }
+    }
+
+    fn lock(&self) -> Result<std::sync::MutexGuard<'_, Option<Replica>>> {
+        self.replica
+            .lock()
+            .map_err(|_| anyhow!("niri layout history is unavailable"))
+    }
+
+    /// Wait until the layout has not changed for `quiet`, at most `limit`,
+    /// connecting through `connect` when no stream is open.
+    fn settle(
+        &'static self,
+        connect: impl FnOnce() -> Result<UnixStream>,
+        quiet: Duration,
+        limit: Duration,
+    ) -> Result<Mark> {
+        let started = Instant::now();
+        let mut connect = Some(connect);
         loop {
-            let settled = changed + quiet;
+            let settled = {
+                let mut replica = self.lock()?;
+                if replica.is_none() {
+                    let connect = connect
+                        .take()
+                        .context("niri event stream closed while settling")?;
+                    *replica = Some(self.start(connect()?)?);
+                }
+                let current = replica.as_mut().expect("connected above");
+                if let Err(error) = current.catch_up() {
+                    *replica = None;
+                    return Err(error.context("niri event stream failed"));
+                }
+                let settled = current.changed_at + quiet;
+                if settled <= Instant::now() {
+                    return Ok(current.mark());
+                }
+                settled
+            };
             if settled > started + limit {
                 return Err(foreground_unavailable(format!(
                     "the niri layout did not stay unchanged for {} ms within {} ms, so window geometry may not match the screen",
@@ -1811,36 +2062,82 @@ impl Quiet {
                     limit.as_millis()
                 )));
             }
-            match lines.next(settled)? {
-                None => return Ok(Self { lines, watch }),
-                Some(line) => {
-                    let event: serde_json::Value =
-                        serde_json::from_slice(&line).context("invalid niri event")?;
-                    if watch.moves(&event) {
-                        changed = Instant::now();
+            std::thread::sleep(settled.saturating_duration_since(Instant::now()));
+        }
+    }
+
+    fn start(&'static self, stream: UnixStream) -> Result<Replica> {
+        let generation = self.generations.fetch_add(1, Ordering::Relaxed) + 1;
+        let replica = Replica::start(stream, generation)?;
+        let watched = replica.lines.stream.try_clone()?;
+        std::thread::Builder::new()
+            .name("cua-niri-events".into())
+            .spawn(move || self.watch(generation, &watched))?;
+        Ok(replica)
+    }
+
+    /// Read events as they arrive until this generation's stream is gone.
+    fn watch(&self, generation: u64, stream: &UnixStream) {
+        loop {
+            let mut poll = libc::pollfd {
+                fd: stream.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            // SAFETY: one valid pollfd that outlives the call.
+            if unsafe { libc::poll(&mut poll, 1, 1000) } < 0
+                && io::Error::last_os_error().kind() != io::ErrorKind::Interrupted
+            {
+                return;
+            }
+            let Ok(mut replica) = self.replica.lock() else {
+                return;
+            };
+            match replica.as_mut() {
+                Some(current) if current.generation == generation => {
+                    if let Err(error) = current.catch_up() {
+                        tracing::warn!("niri event stream failed: {error:#}");
+                        *replica = None;
+                        return;
                     }
                 }
+                _ => return,
             }
         }
     }
 
-    /// Whether the layout changed since the stream went quiet.
-    fn changed(&mut self) -> Result<bool> {
-        let mut changed = false;
-        // Events niri already sent are in the socket buffer: a short read
-        // deadline drains them without waiting for new ones.
-        while let Some(line) = self.lines.next(Instant::now() + Duration::from_millis(1))? {
-            let event: serde_json::Value =
-                serde_json::from_slice(&line).context("invalid niri event")?;
-            changed |= self.watch.moves(&event);
+    /// Whether the layout changed after `mark`, other than as `expected`.
+    /// A stream that failed or reconnected since cannot tell, so it refuses.
+    fn changed_since(&self, mark: Mark, expected: Expected) -> Result<bool> {
+        let mut replica = self.lock()?;
+        let Some(current) = replica
+            .as_mut()
+            .filter(|current| current.generation == mark.generation)
+        else {
+            bail!("niri's event stream reconnected after the layout was checked");
+        };
+        if let Err(error) = current.catch_up() {
+            *replica = None;
+            return Err(error.context("niri event stream failed"));
         }
-        Ok(changed)
+        let Some(skip) = mark.at.checked_sub(current.first) else {
+            return Ok(true);
+        };
+        Ok(current
+            .changes
+            .iter()
+            .skip(usize::try_from(skip)?)
+            .any(|change| change.counts(expected)))
     }
 }
 
-fn settled() -> Result<Quiet> {
-    Quiet::wait(
-        attested_connection(Instant::now() + QUERY_TIMEOUT)?,
+static HISTORY: History = History::new();
+
+/// Wait until niri's layout has been quiet for [`SETTLE_QUIET`]: at once
+/// when it already has been.
+fn settled() -> Result<Mark> {
+    HISTORY.settle(
+        || attested_connection(Instant::now() + QUERY_TIMEOUT),
         SETTLE_QUIET,
         SETTLE_LIMIT,
     )
@@ -1863,12 +2160,17 @@ fn placed_or_refuse(window: &Window) -> Result<&Placed> {
     })
 }
 
-/// Translate window-local logical coordinates into the global layout, and
-/// remember the geometry used so the pointer gate can prove it still holds.
-/// A window without a reported place refuses instead of passing `(x, y)`
-/// through as output coordinates.
+/// Translate window coordinates into the global layout. A floating window's
+/// coordinates are window-local; the geometry used is remembered so the
+/// pointer gate can prove it still holds. A tiled window's are pixels of its
+/// output frame (see [`OutputFrame`]); without one it refuses instead of
+/// passing `(x, y)` through as output coordinates.
 pub fn aim(window_id: u64, x: i32, y: i32) -> Result<(i32, i32)> {
-    let window = window_for_id(window_id).map_err(input_unavailable)?;
+    let scene = ipc().scene().map_err(input_unavailable)?;
+    let window = scene.window(window_id).map_err(input_unavailable)?;
+    if matches!(window.placement, Err(Unplaced::Tiled)) {
+        return adopted_frame(window_id)?.aim_window(&scene, &window, &HISTORY, x, y);
+    }
     let (point, rect) = aim_at(&window, x, y)?;
     if let Ok(mut aims) = aims().lock() {
         aims.retain(|aim| (aim.window, aim.point) != (window_id, point));
@@ -1899,44 +2201,91 @@ fn aimed_rect(window: u64, point: (i32, i32)) -> Option<Rect> {
         .map(|aim| aim.rect)
 }
 
-/// A window-addressed pointer action admitted on a quiet layout. The event
-/// stream stays open until the input is sent, so a change in between refuses.
-pub struct PointerGate(Quiet);
+/// A window-addressed pointer action admitted on a settled layout. Each
+/// confirmation reads the layout history again, so a change after admission
+/// refuses the next event.
+pub struct PointerGate {
+    history: &'static History,
+    mark: Mark,
+    expected: Expected,
+    ipc: AttestedIpc,
+}
 
 impl PointerGate {
     /// Refuse when the layout changed after admission. Call right before the
     /// first motion and again right before every press or wheel event.
     pub fn confirm(&mut self) -> Result<()> {
-        if self.0.changed().map_err(input_unavailable)? {
+        if self
+            .history
+            .changed_since(self.mark, self.expected)
+            .map_err(input_unavailable)?
+        {
             return Err(foreground_unavailable(
                 "the niri layout changed after the pointer target was checked; take a new screenshot",
             ));
         }
         Ok(())
     }
+
+    /// The pointer space now, read on the action's connection: niri sends
+    /// no event when outputs change.
+    pub fn pointer_space(&mut self) -> Result<(i32, i32, u32, u32)> {
+        pointer_space_of(&self.ipc.query(Request::Outputs)?)
+    }
 }
 
-/// Gate window-addressed pointer input: wait until the layout is quiet,
-/// then require the target to be placed where its coordinates were computed
-/// and every point to land on it rather than on another floating window.
-/// With `activate`, focus the window only once all of that holds, so a
-/// refused action leaves focus alone.
+/// Gate window-addressed pointer input. A floating window: wait until the
+/// layout is quiet, then require the target to be placed where its
+/// coordinates were computed and every point to land on it rather than on
+/// another floating window. A tiled window: require its output frame to
+/// still hold (see [`OutputFrame`]). With `activate`, focus the window only
+/// once all of that holds, so a refused action leaves focus alone.
 pub fn gate_pointer(window_id: u64, points: &[(i32, i32)], activate: bool) -> Result<PointerGate> {
-    let before = window_for_id(window_id).map_err(input_unavailable)?;
-    let before = placed_or_refuse(&before)?.rect;
-    let quiet = settled().map_err(input_unavailable)?;
-    let window = window_for_id(window_id).map_err(input_unavailable)?;
+    // One read: the frame admitted below is the one the bound capture is
+    // checked against.
+    let adopted = adopted(window_id);
+    if let Some(capture_id) = bound_capture() {
+        admits_capture(adopted.as_ref(), window_id, &capture_id)?;
+    }
+    let mut ipc = ipc();
+    let scene = ipc.scene().map_err(input_unavailable)?;
+    let window = scene.window(window_id).map_err(input_unavailable)?;
+    if matches!(window.placement, Err(Unplaced::Tiled)) {
+        let frame = adopted
+            .and_then(|record| record.frame)
+            .ok_or_else(|| no_frame(window_id))?;
+        frame.admit(&scene, &window, points, activate, &HISTORY)?;
+        return Ok(PointerGate {
+            history: &HISTORY,
+            mark: frame.mark,
+            expected: Expected::default(),
+            ipc,
+        });
+    }
+    let before = placed_or_refuse(&window)?.rect;
+    let mark = settled().map_err(input_unavailable)?;
+    let window = ipc
+        .scene()
+        .and_then(|scene| scene.window(window_id))
+        .map_err(input_unavailable)?;
     pointer_admission(&window, before, points, |point| {
         aimed_rect(window_id, point)
     })?;
     // Changes queued while the admission scene was read refuse here, before
     // focus moves.
-    let mut gate = PointerGate(quiet);
+    let mut gate = PointerGate {
+        history: &HISTORY,
+        mark,
+        expected: Expected::default(),
+        ipc,
+    };
     gate.confirm()?;
     if activate {
-        gate.0.watch.focusing = Some(window_id);
-        gate.0.watch.focusing_workspace = window.workspace;
-        activate_in(&mut ipc(), window_id, None, FOCUS_CONFIRM_TIMEOUT)
+        gate.expected = Expected {
+            window: Some(window_id),
+            workspace: window.workspace,
+        };
+        activate_in(&mut gate.ipc, window_id, None, FOCUS_CONFIRM_TIMEOUT)
             .map_err(input_unavailable)?;
     }
     Ok(gate)
@@ -1978,6 +2327,325 @@ fn pointer_admission(
     Ok(())
 }
 
+// ── Tiled windows ────────────────────────────────────────────────────────────
+
+/// What one output shows, as far as niri reports it: the output, its active
+/// workspace with that workspace's active window and every window's layout,
+/// the focused window and the overview. niri can also scroll the view and
+/// so move every tiled window without changing any of this or sending any
+/// event: the `center-column`, `center-visible-columns` and `center-window`
+/// actions, and a touchpad or mouse view gesture that ends on the same
+/// column. Nothing in IPC detects those; [`FRAME_MAX_AGE`] bounds them.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Shown {
+    output: IpcOutput,
+    workspace: u64,
+    active: Option<u64>,
+    focused: Option<u64>,
+    overview_open: bool,
+    windows: Vec<(u64, Option<IpcLayout>)>,
+}
+
+impl Scene {
+    fn shown(&self, output: &str) -> Option<Shown> {
+        let workspace = self
+            .workspaces
+            .iter()
+            .find(|workspace| workspace.is_active && workspace.output.as_deref() == Some(output))?;
+        let mut windows: Vec<_> = self
+            .windows
+            .iter()
+            .filter(|window| window.workspace_id == Some(workspace.id))
+            .map(|window| (window.id, window.layout.clone()))
+            .collect();
+        windows.sort_by_key(|(id, _)| *id);
+        Some(Shown {
+            output: self.outputs.get(output)?.clone(),
+            workspace: workspace.id,
+            active: workspace.active_window_id,
+            focused: self
+                .windows
+                .iter()
+                .find(|window| window.is_focused)
+                .map(|window| window.id),
+            overview_open: self.overview_open,
+            windows,
+        })
+    }
+}
+
+/// A tiled window's pixel frame. niri does not report where a tiled window
+/// is, so its `get_window_state` screenshot is its whole output and its
+/// window coordinates are that output's logical pixels. They are admitted
+/// while niri's event stream reports no layout change after `mark`, taken
+/// once the layout had settled before the capture, the output still shows
+/// what `shown` recorded, and the screenshot is at most [`FRAME_MAX_AGE`]
+/// old. That proves only that niri reported no change: a view scroll niri
+/// does not report (see [`Shown`]) or an animation longer than
+/// [`SETTLE_QUIET`] still moves the pixels, and a point can be on another
+/// tiled window or a layer-shell surface, which IPC does not place. A point
+/// inside a floating window, drawn above every tiled one, refuses.
+#[derive(Clone, Debug, PartialEq)]
+pub struct OutputFrame {
+    window: u64,
+    area: Rect,
+    shown: Shown,
+    mark: Mark,
+    /// When the capture started.
+    taken: Instant,
+}
+
+impl OutputFrame {
+    pub fn output(&self) -> &str {
+        &self.shown.output.name
+    }
+
+    fn changed(&self, why: &str) -> anyhow::Error {
+        foreground_unavailable(format!(
+            "{why} after the screenshot of tiled niri window {}, so its pixels may be elsewhere now; take a new screenshot",
+            self.window
+        ))
+    }
+
+    fn holds(&self, scene: &Scene, history: &History) -> Result<()> {
+        if self.taken.elapsed() > FRAME_MAX_AGE {
+            return Err(foreground_unavailable(format!(
+                "the screenshot of tiled niri window {} is over {} s old, and niri does not report every scroll of its view; take a new screenshot",
+                self.window,
+                FRAME_MAX_AGE.as_secs()
+            )));
+        }
+        if scene.shown(self.output()).as_ref() != Some(&self.shown) {
+            return Err(self.changed(&format!("niri output {} changed", self.output())));
+        }
+        if history
+            .changed_since(self.mark, Expected::default())
+            .map_err(input_unavailable)?
+        {
+            return Err(self.changed("the niri layout changed"));
+        }
+        Ok(())
+    }
+
+    /// Focusing a tiled window can scroll niri's view, which niri does not
+    /// report, so the screenshot could no longer show the point.
+    fn not_focused(&self) -> anyhow::Error {
+        foreground_unavailable(format!(
+            "tiled niri window {} is not focused, and niri may scroll its view to focus it; focus it, then take a new screenshot",
+            self.window
+        ))
+    }
+
+    /// The layout point of pixel `(x, y)` for window-addressed input on
+    /// `window`, the frame's window as `scene` reports it now. It must
+    /// already be focused: this runs before any route focuses the window,
+    /// so an unfocused one refuses before focus or the view move.
+    fn aim_window(
+        &self,
+        scene: &Scene,
+        window: &Window,
+        history: &History,
+        x: i32,
+        y: i32,
+    ) -> Result<(i32, i32)> {
+        if !window.focused {
+            return Err(self.not_focused());
+        }
+        self.holds(scene, history)?;
+        self.aim(x, y)
+    }
+
+    /// The layout point of pixel `(x, y)` of the screenshot.
+    fn aim(&self, x: i32, y: i32) -> Result<(i32, i32)> {
+        let point = (self.area.x.saturating_add(x), self.area.y.saturating_add(y));
+        if x < 0 || y < 0 || !self.area.contains(point.0, point.1) {
+            return Err(foreground_unavailable(format!(
+                "point ({x}, {y}) is outside the screenshot of tiled niri window {}, which is its whole output, {}x{}",
+                self.window, self.area.width, self.area.height
+            )));
+        }
+        Ok(point)
+    }
+
+    /// Admit pointer input at layout `points` for `window`, the frame's
+    /// window as `scene` reports it now.
+    fn admit(
+        &self,
+        scene: &Scene,
+        window: &Window,
+        points: &[(i32, i32)],
+        activate: bool,
+        history: &History,
+    ) -> Result<()> {
+        self.holds(scene, history)?;
+        let logical = self.shown.output.logical.as_ref();
+        for &(x, y) in points {
+            if !self.area.contains(x, y) {
+                return Err(foreground_unavailable(format!(
+                    "point ({x}, {y}) is past the edge of niri output {}, which tiled window {} was captured on",
+                    self.output(),
+                    self.window
+                )));
+            }
+            let floating = self
+                .shown
+                .windows
+                .iter()
+                .filter_map(|(id, layout)| Some((id, floating_tile(logical?, layout.as_ref()?)?)))
+                .find(|(_, tile)| tile.contains(f64::from(x), f64::from(y)));
+            if let Some((id, _)) = floating {
+                return Err(foreground_unavailable(format!(
+                    "point ({x}, {y}) lies on floating niri window {id}, which niri draws above tiled window {}",
+                    self.window
+                )));
+            }
+        }
+        if activate && !window.focused {
+            return Err(self.not_focused());
+        }
+        Ok(())
+    }
+}
+
+/// The capture registry keeps at most 32 captures in all by default, so an
+/// output capture id older than this many of its window's is no longer live.
+const MAX_OUTPUT_CAPTURES: usize = 32;
+
+/// The `get_window_state` screenshots of a window that has been tiled.
+#[derive(Clone)]
+struct Adopted {
+    window: u64,
+    /// The latest screenshot's frame; `None` once it shows only the window.
+    frame: Option<OutputFrame>,
+    /// The capture id the latest screenshot was published as.
+    capture: Option<String>,
+    /// The capture ids of its output screenshots, newest last.
+    outputs: VecDeque<String>,
+}
+
+/// Records of windows that have been tiled, least recently adopted first. A
+/// record is evicted only after [`MAX_AIMS`] - 1 later screenshots of other
+/// windows, more than the capture registry keeps, so its ids are gone too.
+fn frames() -> &'static Mutex<Vec<Adopted>> {
+    static FRAMES: OnceLock<Mutex<Vec<Adopted>>> = OnceLock::new();
+    FRAMES.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+/// Record a window's latest `get_window_state` screenshot: a tiled window's
+/// output `frame`, published as `capture_id`, or `None` for a window whose
+/// screenshot shows only itself, which drops any earlier frame but keeps
+/// refusing the ids of its output screenshots.
+pub fn adopt_frame(window: u64, frame: Option<OutputFrame>, capture_id: Option<&str>) {
+    let Ok(mut frames) = frames().lock() else {
+        return;
+    };
+    let mut record = match frames.iter().position(|record| record.window == window) {
+        Some(index) => frames.remove(index),
+        None if frame.is_some() => Adopted {
+            window,
+            frame: None,
+            capture: None,
+            outputs: VecDeque::new(),
+        },
+        None => return,
+    };
+    if let (Some(_), Some(capture_id)) = (&frame, capture_id) {
+        record.outputs.push_back(capture_id.to_owned());
+        if record.outputs.len() > MAX_OUTPUT_CAPTURES {
+            record.outputs.pop_front();
+        }
+    }
+    record.frame = frame;
+    record.capture = capture_id.map(str::to_owned);
+    if frames.len() >= MAX_AIMS {
+        frames.remove(0);
+    }
+    frames.push(record);
+}
+
+/// Held while `get_window_state` publishes a screenshot to the snapshot
+/// store and adopts its frame, so concurrent calls on one window leave the
+/// store's latest screenshot and the adopted frame from the same call.
+pub fn publication() -> std::sync::MutexGuard<'static, ()> {
+    static PUBLICATION: Mutex<()> = Mutex::new(());
+    PUBLICATION
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+fn adopted(window: u64) -> Option<Adopted> {
+    frames()
+        .lock()
+        .ok()?
+        .iter()
+        .find(|record| record.window == window)
+        .cloned()
+}
+
+fn adopted_frame(window: u64) -> Result<OutputFrame> {
+    adopted(window)
+        .and_then(|record| record.frame)
+        .ok_or_else(|| no_frame(window))
+}
+
+fn no_frame(window: u64) -> anyhow::Error {
+    foreground_unavailable(format!(
+        "niri does not report where tiled window {window} is, so its coordinates are pixels of its get_window_state screenshot, which shows its whole output; take one first"
+    ))
+}
+
+thread_local! {
+    /// The `capture_id` the pointer action on this thread is bound to.
+    static BOUND_CAPTURE: std::cell::RefCell<Option<String>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Restores the previous capture binding when dropped.
+pub struct CaptureBinding(Option<String>);
+
+impl Drop for CaptureBinding {
+    fn drop(&mut self) {
+        let previous = self.0.take();
+        BOUND_CAPTURE.with(|bound| *bound.borrow_mut() = previous);
+    }
+}
+
+/// Bind the pointer action run on this thread to `capture_id`, so the
+/// pointer gate checks it against the same frame it admits the action on.
+pub fn bind_capture(capture_id: Option<String>) -> CaptureBinding {
+    CaptureBinding(BOUND_CAPTURE.with(|bound| bound.replace(capture_id)))
+}
+
+fn bound_capture() -> Option<String> {
+    BOUND_CAPTURE.with(|bound| bound.borrow().clone())
+}
+
+/// A click bound to `capture_id` on a tiled window needs that capture to be
+/// the window's latest screenshot: only that one's frame is checked against
+/// the layout, and an earlier one may show another.
+pub fn frame_admits_capture(window: u64, capture_id: &str) -> Result<()> {
+    admits_capture(adopted(window).as_ref(), window, capture_id)
+}
+
+fn admits_capture(adopted: Option<&Adopted>, window: u64, capture_id: &str) -> Result<()> {
+    let Some(record) = adopted else {
+        return Ok(());
+    };
+    if record.capture.as_deref() == Some(capture_id) {
+        Ok(())
+    } else if record.frame.is_some() {
+        Err(foreground_unavailable(format!(
+            "capture {capture_id} is not the latest screenshot of tiled niri window {window}, and only that one's pixels are checked against niri's layout; use the latest get_window_state screenshot"
+        )))
+    } else if record.outputs.iter().any(|output| output == capture_id) {
+        Err(foreground_unavailable(format!(
+            "capture {capture_id} is not the latest screenshot of niri window {window}, and it shows the whole output rather than the window; use the latest get_window_state screenshot"
+        )))
+    } else {
+        Ok(())
+    }
+}
+
 // ── Window capture ───────────────────────────────────────────────────────────
 
 /// Where a window is in a single-output display capture, and the output
@@ -1996,6 +2664,9 @@ pub struct CapturePlan {
     pub scale: f64,
     pub transform: u32,
     pub image: (u32, u32),
+    /// For a tiled window, captured as its whole output, what that output
+    /// shows.
+    pub shown: Option<Shown>,
 }
 
 /// An oriented display capture, the output it copied and the transform the
@@ -2007,6 +2678,16 @@ pub struct DisplayCapture {
     pub size: (u32, u32),
 }
 
+/// A window capture: the oriented display capture, where the window is in
+/// it, and for a tiled window the frame its coordinates use once a
+/// `get_window_state` screenshot adopts it.
+#[derive(Debug)]
+pub struct WindowCapture {
+    pub png: Vec<u8>,
+    pub plan: CapturePlan,
+    pub frame: Option<OutputFrame>,
+}
+
 fn capture_plan_in(scene: &Scene, id: u64, pid: Option<u32>) -> Result<CapturePlan, &'static str> {
     let window = scene
         .window(id)
@@ -2014,13 +2695,24 @@ fn capture_plan_in(scene: &Scene, id: u64, pid: Option<u32>) -> Result<CapturePl
     if pid.is_some_and(|pid| window.pid != Some(pid)) {
         return Err("niri reports the window belongs to a different process");
     }
-    let placed = window
-        .placement
-        .as_ref()
-        .map_err(|unplaced| unplaced.reason())?;
     let (output, logical) = scene
         .single_output()
         .map_err(|_| "niri window capture supports a single output, and this layout has several")?;
+    let mode = output
+        .current_mode
+        .and_then(|index| output.modes.get(index))
+        .ok_or("niri reports no current mode for the output")?;
+    let transform =
+        transform_code(&logical.transform).map_err(|_| "unknown niri output transform")?;
+    let image = super::logical_output_size((mode.width, mode.height), transform);
+    let scale = logical.scale;
+    let placed = match &window.placement {
+        Ok(placed) => placed,
+        Err(Unplaced::Tiled) => {
+            return tiled_plan(scene, &window, &output.name, logical, transform, image)
+        }
+        Err(unplaced) => return Err(unplaced.reason()),
+    };
     if placed.output != output.name {
         return Err("the window is not on the captured output");
     }
@@ -2030,13 +2722,6 @@ fn capture_plan_in(scene: &Scene, id: u64, pid: Option<u32>) -> Result<CapturePl
     if placed.overlapped() {
         return Err("another floating window overlaps it, and niri reports no stacking order");
     }
-    let mode = output
-        .current_mode
-        .and_then(|index| output.modes.get(index))
-        .ok_or("niri reports no current mode for the output")?;
-    let transform =
-        transform_code(&logical.transform).map_err(|_| "unknown niri output transform")?;
-    let scale = logical.scale;
     // Round only in pixel space: the fractional origin is what niri drew.
     let pixels = Rect::from_f64(
         (placed.origin.0 - f64::from(logical.x)) * scale,
@@ -2053,29 +2738,87 @@ fn capture_plan_in(scene: &Scene, id: u64, pid: Option<u32>) -> Result<CapturePl
         area: placed.area,
         scale,
         transform,
-        image: super::logical_output_size((mode.width, mode.height), transform),
+        image,
+        shown: None,
     })
 }
 
-/// Capture one floating window by cropping a settled display capture. The
-/// layout must stay quiet through the capture, and the window and its
-/// output unchanged. Errors are refusal reasons for
-/// `surface_identity_unproven`.
+/// A tiled window is captured as its whole output, and only when niri
+/// surely shows it: as the active window of the workspace shown on that
+/// output, with the overview closed. niri keeps the active column in view;
+/// any other tiled window may be scrolled out of it.
+fn tiled_plan(
+    scene: &Scene,
+    window: &Window,
+    output: &str,
+    logical: &IpcLogical,
+    transform: u32,
+    image: (u32, u32),
+) -> Result<CapturePlan, &'static str> {
+    if scene.overview_open {
+        return Err(Unplaced::NotShowing.reason());
+    }
+    let workspace = scene
+        .workspaces
+        .iter()
+        .find(|workspace| Some(workspace.id) == window.workspace)
+        .filter(|workspace| workspace.is_active && workspace.output.as_deref() == Some(output))
+        .ok_or(Unplaced::NotShowing.reason())?;
+    if workspace.active_window_id != Some(window.id) {
+        return Err("niri does not report where a tiled window is, and shows for certain only its workspace's active window; focus the window first");
+    }
+    Ok(CapturePlan {
+        pixels: Rect {
+            x: 0,
+            y: 0,
+            width: image.0,
+            height: image.1,
+        },
+        width: logical.width,
+        height: logical.height,
+        output: output.to_owned(),
+        area: Rect {
+            x: logical.x,
+            y: logical.y,
+            width: logical.width,
+            height: logical.height,
+        },
+        scale: logical.scale,
+        transform,
+        image,
+        shown: scene.shown(output),
+    })
+}
+
+/// Capture one window from a settled display capture: a floating window
+/// cropped to its place, a tiled one as its whole output. The layout must
+/// stay unchanged through the capture, and the window and its output too.
+/// Errors are refusal reasons for `surface_identity_unproven`.
 pub fn capture_window(
     id: u64,
     pid: Option<u32>,
     capture_display: impl FnOnce() -> Result<DisplayCapture>,
-) -> Result<(Vec<u8>, CapturePlan), String> {
-    capture_window_in(|| ipc().scene(), settled, id, pid, capture_display)
+) -> Result<WindowCapture, String> {
+    let mut ipc = ipc();
+    capture_window_in(
+        || ipc.scene(),
+        settled,
+        |mark| HISTORY.changed_since(mark, Expected::default()),
+        id,
+        pid,
+        capture_display,
+    )
 }
 
 fn capture_window_in(
     mut scene: impl FnMut() -> Result<Scene>,
-    settle: impl FnOnce() -> Result<Quiet>,
+    settle: impl FnOnce() -> Result<Mark>,
+    changed_since: impl FnOnce(Mark) -> Result<bool>,
     id: u64,
     pid: Option<u32>,
     capture_display: impl FnOnce() -> Result<DisplayCapture>,
-) -> Result<(Vec<u8>, CapturePlan), String> {
+) -> Result<WindowCapture, String> {
+    let taken = Instant::now();
     let mut plan_now = || -> Result<CapturePlan, String> {
         Ok(capture_plan_in(
             &scene().map_err(|e| format!("{e:#}"))?,
@@ -2084,13 +2827,13 @@ fn capture_window_in(
         )?)
     };
     let before = plan_now()?;
-    let mut quiet = settle().map_err(|e| format!("{e:#}"))?;
+    let mark = settle().map_err(|e| format!("{e:#}"))?;
     let plan = plan_now()?;
     if plan != before {
         return Err("the window moved while niri was settling".into());
     }
     let capture = capture_display().map_err(|e| format!("{e:#}"))?;
-    if quiet.changed().map_err(|e| format!("{e:#}"))? {
+    if changed_since(mark).map_err(|e| format!("{e:#}"))? {
         return Err("the niri layout changed during capture".into());
     }
     // niri has no output-change event: compare the output itself.
@@ -2115,7 +2858,18 @@ fn capture_window_in(
             capture.size.0, capture.size.1, plan.image.0, plan.image.1, plan.output
         ));
     }
-    Ok((capture.png, plan))
+    let frame = plan.shown.clone().map(|shown| OutputFrame {
+        window: id,
+        area: plan.area,
+        shown,
+        mark,
+        taken,
+    });
+    Ok(WindowCapture {
+        png: capture.png,
+        plan,
+        frame,
+    })
 }
 
 #[cfg(test)]
@@ -2337,6 +3091,7 @@ mod tests {
         workspace_lag: usize,
         stale: Option<(usize, Vec<Value>)>,
         requests: Vec<String>,
+        connections: usize,
     }
 
     impl Fake {
@@ -2436,14 +3191,21 @@ mod tests {
             connect: move |_| {
                 let (client, server) = UnixStream::pair()?;
                 let fake = fake.clone();
+                fake.lock().unwrap().connections += 1;
                 std::thread::spawn(move || {
                     let mut lines = Lines::new(server);
-                    if let Ok(Some(line)) = lines.next(Instant::now() + Duration::from_secs(2)) {
+                    while let Ok(Some(line)) = lines.next(Instant::now() + Duration::from_secs(2)) {
                         let reply = fake
                             .lock()
                             .unwrap()
                             .reply(std::str::from_utf8(&line).unwrap());
-                        let _ = lines.stream.write_all(format!("{reply}\n").as_bytes());
+                        if lines
+                            .stream
+                            .write_all(format!("{reply}\n").as_bytes())
+                            .is_err()
+                        {
+                            return;
+                        }
                     }
                 });
                 Ok(client)
@@ -2451,6 +3213,7 @@ mod tests {
             per_attempt: Duration::from_secs(1),
             total: Duration::from_secs(2),
             backoff: Duration::from_millis(1),
+            lines: None,
         }
     }
 
@@ -2474,6 +3237,7 @@ mod tests {
             per_attempt,
             total,
             backoff: Duration::from_millis(1),
+            lines: None,
         }
     }
 
@@ -2501,6 +3265,67 @@ mod tests {
         assert_eq!(session_check(true, false, false), SessionCheck::NotNiri);
         assert_eq!(session_check(true, false, true), SessionCheck::Probe);
         assert_eq!(session_check(false, true, true), SessionCheck::NotNiri);
+    }
+
+    #[test]
+    fn a_proven_niri_refuses_until_a_version_read_answers() {
+        let release = Mutex::new(None);
+        // niri did not answer: still niri, refused, and asked again later.
+        assert_eq!(
+            format!(
+                "{:#}",
+                release_check(&release, || bail!("niri IPC request timed out")).unwrap_err()
+            ),
+            "niri did not report its version, so the niri adapter cannot yet check that it supports it: niri IPC request timed out"
+        );
+        release_check(&release, || Ok("26.04 (8ed0da4)".into())).unwrap();
+        // Answered once: never read again.
+        release_check(&release, || panic!("the release was read again")).unwrap();
+
+        let release = Mutex::new(None);
+        let old = "niri 25.05 is not supported: the niri adapter needs niri 25.08 or later";
+        assert_eq!(
+            release_check(&release, || Ok("25.05 (abc)".into()))
+                .unwrap_err()
+                .to_string(),
+            old
+        );
+        assert_eq!(
+            release_check(&release, || panic!("the release was read again"))
+                .unwrap_err()
+                .to_string(),
+            old
+        );
+    }
+
+    #[test]
+    fn niri_older_than_25_08_is_refused_at_recognition() {
+        for version in [
+            "25.08 (6a1b2c3)",
+            "25.11.1 (abc)",
+            "26.04 (8ed0da4)",
+            "26.04",
+            // niri's packaging guide suggests a distribution suffix.
+            "26.04-1 (abc)",
+            "25.08.1-2",
+        ] {
+            assert_eq!(release_supported(version), Ok(()), "{version}");
+        }
+        // 25.05 still reads one request per connection; 25.08 added the
+        // window layout every geometry route needs.
+        assert_eq!(
+            release_supported("25.05.1 (abc)"),
+            Err("niri 25.05.1 is not supported: the niri adapter needs niri 25.08 or later".into())
+        );
+        assert!(release_supported("25.02").is_err());
+        for version in ["", "unknown (abc)", "25", "25.x"] {
+            assert_eq!(
+                release_supported(version),
+                Err(format!(
+                    "niri reports version {version:?}, which the niri adapter cannot read; it needs niri 25.08 or later"
+                )),
+            );
+        }
     }
 
     #[test]
@@ -2547,6 +3372,17 @@ mod tests {
         assert_eq!(attempts, 2);
         // Bounded by the deadlines, not by the peer; loose for loaded CI.
         assert!(started.elapsed() < Duration::from_secs(2));
+    }
+
+    #[test]
+    fn one_action_attests_one_connection_for_all_its_requests() {
+        let fake = focus_fixture();
+        let mut ipc = fake_ipc(&fake);
+        ipc.focused_window().unwrap();
+        activate_in(&mut ipc, 7, Some(107), Duration::from_millis(200)).unwrap();
+        let fake = fake.lock().unwrap();
+        assert_eq!(fake.requests.len(), 5, "{:?}", fake.requests);
+        assert_eq!(fake.connections, 1);
     }
 
     #[test]
@@ -2956,6 +3792,7 @@ mod tests {
                 scale: 1.5,
                 transform: 0,
                 image: (1920, 1080),
+                shown: None,
             })
         );
     }
@@ -2993,13 +3830,15 @@ mod tests {
         assert!(placed.covers(101, 100));
     }
 
-    fn quiet_now() -> Quiet {
-        Quiet::wait(
-            event_stream(vec![]),
-            Duration::from_millis(10),
-            Duration::from_secs(1),
-        )
-        .unwrap()
+    fn settled_now() -> Result<Mark> {
+        Ok(Mark {
+            generation: 1,
+            at: 0,
+        })
+    }
+
+    fn unchanged(_: Mark) -> Result<bool> {
+        Ok(false)
     }
 
     fn display(output: &str, size: (u32, u32)) -> Result<DisplayCapture> {
@@ -3031,7 +3870,8 @@ mod tests {
                     false,
                 ))
             },
-            || Ok(quiet_now()),
+            settled_now,
+            unchanged,
             7,
             None,
             || display("winit", (1280, 720)),
@@ -3049,13 +3889,11 @@ mod tests {
         // name, area, scale and image size.
         let one = || Ok(one_output(vec![floating(7, 1, (100.0, 60.0), (300, 200))]));
         assert_eq!(
-            capture_window_in(
-                one,
-                || Ok(quiet_now()),
-                7,
-                None,
-                || oriented("winit", 0, (1280, 720))
-            )
+            capture_window_in(one, settled_now, unchanged, 7, None, || oriented(
+                "winit",
+                0,
+                (1280, 720)
+            ))
             .unwrap_err(),
             "the capture was oriented for output transform 0, but the window's output has 6"
         );
@@ -3071,7 +3909,8 @@ mod tests {
                     false,
                 ))
             },
-            || Ok(quiet_now()),
+            settled_now,
+            unchanged,
             7,
             None,
             || display("winit", (1280, 720)),
@@ -3087,35 +3926,28 @@ mod tests {
     fn capture_refuses_another_output_or_size() {
         let one = || Ok(one_output(vec![floating(7, 1, (100.0, 60.0), (300, 200))]));
         assert_eq!(
-            capture_window_in(
-                one,
-                || Ok(quiet_now()),
-                7,
-                None,
-                || display("DP-1", (1280, 720))
-            )
+            capture_window_in(one, settled_now, unchanged, 7, None, || display(
+                "DP-1",
+                (1280, 720)
+            ))
             .unwrap_err(),
             "the display capture copied output \"DP-1\", not the window's output \"winit\""
         );
         assert_eq!(
-            capture_window_in(
-                one,
-                || Ok(quiet_now()),
-                7,
-                None,
-                || display("winit", (1920, 1080))
-            )
+            capture_window_in(one, settled_now, unchanged, 7, None, || display(
+                "winit",
+                (1920, 1080)
+            ))
             .unwrap_err(),
             "the capture is 1920x1080 pixels, but niri reports 1280x720 for output \"winit\""
         );
-        assert!(capture_window_in(
-            one,
-            || Ok(quiet_now()),
-            7,
-            None,
-            || display("winit", (1280, 720))
-        )
-        .is_ok());
+        assert!(
+            capture_window_in(one, settled_now, unchanged, 7, None, || display(
+                "winit",
+                (1280, 720)
+            ))
+            .is_ok()
+        );
     }
 
     #[test]
@@ -3138,7 +3970,7 @@ mod tests {
     }
 
     #[test]
-    fn crop_refuses_other_outputs_overlap_tiled_and_other_pids() {
+    fn crop_refuses_other_outputs_overlap_and_other_pids() {
         let two_outputs = scene(
             vec![floating(7, 2, (100.0, 60.0), (300, 200))],
             vec![
@@ -3162,11 +3994,6 @@ mod tests {
         assert_eq!(
             capture_plan_in(&overlapped, 7, None),
             Err("another floating window overlaps it, and niri reports no stacking order")
-        );
-        let tiled_only = one_output(vec![tiled(5, 1, (402.0, 448.0))]);
-        assert_eq!(
-            capture_plan_in(&tiled_only, 5, None),
-            Err(Unplaced::Tiled.reason())
         );
         let window = one_output(vec![floating(7, 1, (100.0, 60.0), (300, 200))]);
         assert_eq!(
@@ -3514,68 +4341,104 @@ mod tests {
     // ── Settling ────────────────────────────────────────────────────────────
 
     #[test]
+    fn a_config_reload_counts_as_a_layout_change() {
+        // A reload can move tiled columns (struts, gaps, centering) or
+        // lengthen animations past the settle period, with no other event.
+        let mut watch = LayoutWatch::default();
+        for event in [
+            json!({"ConfigLoaded": {"failed": false}}),
+            json!({"ConfigLoaded": {"failed": true}}),
+        ] {
+            assert_eq!(watch.change(&event), Some(Change::Moved), "{event}");
+        }
+    }
+
+    #[test]
     fn title_changes_do_not_count_as_layout_changes() {
-        let mut watch = LayoutWatch::new();
+        let mut watch = LayoutWatch::default();
         let window = floating(7, 1, (100.0, 60.0), (300, 200));
-        assert!(watch.moves(&json!({"WindowsChanged": {"windows": [window.clone()]}})));
+        let mut change = |event: Value| watch.change(&event);
+        assert_eq!(
+            change(json!({"WindowsChanged": {"windows": [window.clone()]}})),
+            Some(Change::Moved)
+        );
         let mut retitled = window.clone();
         retitled["title"] = json!("Float 7 clicked 1");
-        assert!(!watch.moves(&json!({"WindowOpenedOrChanged": {"window": retitled}})));
+        assert_eq!(
+            change(json!({"WindowOpenedOrChanged": {"window": retitled}})),
+            None
+        );
         let mut moved = window;
         moved["layout"]["tile_pos_in_workspace_view"] = json!([200.0, 100.0]);
-        assert!(watch.moves(&json!({"WindowOpenedOrChanged": {"window": moved}})));
-        assert!(watch.moves(
-            &json!({"WindowOpenedOrChanged": {"window": floating(9, 1, (0.0, 0.0), (10, 10))}})
-        ));
-        assert!(!watch.moves(&json!({"WindowFocusTimestampChanged": {"id": 7}})));
-        assert!(watch.moves(&json!({"WorkspaceActivated": {"id": 2, "focused": true}})));
-        assert!(watch.moves(&json!({"SomethingFromALaterNiri": {}})));
+        assert_eq!(
+            change(json!({"WindowOpenedOrChanged": {"window": moved}})),
+            Some(Change::Moved)
+        );
+        assert_eq!(
+            change(
+                json!({"WindowOpenedOrChanged": {"window": floating(9, 1, (0.0, 0.0), (10, 10))}})
+            ),
+            Some(Change::Moved)
+        );
+        assert_eq!(
+            change(json!({"WindowFocusTimestampChanged": {"id": 7}})),
+            None
+        );
+        assert_eq!(
+            change(json!({"SomethingFromALaterNiri": {}})),
+            Some(Change::Moved)
+        );
     }
 
     #[test]
     fn only_the_drivers_own_focus_change_is_expected() {
-        let mut watch = LayoutWatch::new();
-        assert!(watch.moves(&json!({"WindowFocusChanged": {"id": 7}})));
-        watch.focusing = Some(7);
-        assert!(!watch.moves(&json!({"WindowFocusChanged": {"id": 7}})));
-        assert!(!watch.moves(
-            &json!({"WorkspaceActiveWindowChanged": {"workspace_id": 1, "active_window_id": 7}})
+        let mut watch = LayoutWatch::default();
+        let mut counts =
+            |event: Value, expected: Expected| watch.change(&event).unwrap().counts(expected);
+        let none = Expected::default();
+        assert!(counts(json!({"WindowFocusChanged": {"id": 7}}), none));
+        let focusing = Expected {
+            window: Some(7),
+            workspace: Some(4),
+        };
+        assert!(!counts(json!({"WindowFocusChanged": {"id": 7}}), focusing));
+        assert!(!counts(
+            json!({"WorkspaceActiveWindowChanged": {"workspace_id": 1, "active_window_id": 7}}),
+            focusing
         ));
-        assert!(watch.moves(&json!({"WindowFocusChanged": {"id": 8}})));
-        assert!(watch.moves(&json!({"WindowFocusChanged": {"id": null}})));
-        assert!(watch.moves(
-            &json!({"WorkspaceActiveWindowChanged": {"workspace_id": 1, "active_window_id": 8}})
+        assert!(counts(json!({"WindowFocusChanged": {"id": 8}}), focusing));
+        assert!(counts(
+            json!({"WindowFocusChanged": {"id": null}}),
+            focusing
+        ));
+        assert!(counts(
+            json!({"WorkspaceActiveWindowChanged": {"workspace_id": 1, "active_window_id": 8}}),
+            focusing
         ));
         // Focus moving to the target's (already active) workspace on another
         // output is expected; another workspace is not.
-        watch.focusing_workspace = Some(4);
-        assert!(!watch.moves(&json!({"WorkspaceActivated": {"id": 4, "focused": true}})));
-        assert!(watch.moves(&json!({"WorkspaceActivated": {"id": 3, "focused": true}})));
+        assert!(!counts(
+            json!({"WorkspaceActivated": {"id": 4, "focused": true}}),
+            focusing
+        ));
+        assert!(counts(
+            json!({"WorkspaceActivated": {"id": 3, "focused": true}}),
+            focusing
+        ));
+        assert!(counts(
+            json!({"WorkspaceActivated": {"id": 4, "focused": true}}),
+            none
+        ));
     }
 
-    #[test]
-    fn a_layout_change_after_positioning_refuses_the_press() {
-        let quiet = Quiet::wait(
-            event_stream(vec![(
-                Duration::from_millis(250),
-                json!({"WindowLayoutsChanged": {"changes": []}}),
-            )]),
-            Duration::from_millis(100),
-            Duration::from_secs(1),
-        )
-        .unwrap();
-        let mut gate = PointerGate(quiet);
-        // Still quiet before the first motion; a window moves over the point
-        // while the pointer is positioned, so the press must refuse.
-        gate.confirm().unwrap();
-        std::thread::sleep(Duration::from_millis(300));
-        assert_eq!(
-            gate.confirm().unwrap_err().to_string(),
-            "foreground_unavailable: the niri layout changed after the pointer target was checked; take a new screenshot"
-        );
+    /// A fresh history; each test needs its own event stream.
+    fn history() -> &'static History {
+        Box::leak(Box::new(History::new()))
     }
 
-    fn event_stream(events: Vec<(Duration, Value)>) -> UnixStream {
+    /// A niri event stream that sends `events`, each after its delay, then
+    /// stays open for `open`.
+    fn event_stream_open(events: Vec<(Duration, Value)>, open: Duration) -> UnixStream {
         let (client, mut server) = UnixStream::pair().unwrap();
         std::thread::spawn(move || {
             let mut request = [0u8; 64];
@@ -3587,31 +4450,99 @@ mod tests {
                     return;
                 }
             }
-            std::thread::sleep(Duration::from_secs(2));
+            std::thread::sleep(open);
         });
         client
     }
 
+    fn event_stream(events: Vec<(Duration, Value)>) -> UnixStream {
+        event_stream_open(events, Duration::from_secs(5))
+    }
+
+    fn workspaces_changed() -> Value {
+        json!({"WorkspacesChanged": {"workspaces": []}})
+    }
+
     #[test]
-    fn quiet_layout_settles_after_the_quiet_period() {
+    fn a_layout_that_stayed_quiet_settles_at_once_for_the_next_action() {
+        let history = history();
+        let quiet = Duration::from_millis(200);
         let started = Instant::now();
-        let mut quiet = Quiet::wait(
-            event_stream(vec![
-                (
-                    Duration::ZERO,
-                    json!({"WorkspacesChanged": {"workspaces": []}}),
-                ),
-                (
-                    Duration::from_millis(30),
-                    json!({"WindowFocusTimestampChanged": {"id": 7}}),
-                ),
-            ]),
-            Duration::from_millis(100),
-            Duration::from_secs(1),
-        )
-        .unwrap();
-        assert!(started.elapsed() >= Duration::from_millis(100));
-        assert!(!quiet.changed().unwrap());
+        let first = history
+            .settle(
+                || Ok(event_stream(vec![(Duration::ZERO, workspaces_changed())])),
+                quiet,
+                Duration::from_secs(2),
+            )
+            .unwrap();
+        // Connecting counts as a change: an animation may be running.
+        assert!(started.elapsed() >= quiet);
+        let again = Instant::now();
+        let second = history
+            .settle(
+                || bail!("the stream stays open between actions"),
+                quiet,
+                Duration::from_secs(2),
+            )
+            .unwrap();
+        assert!(
+            again.elapsed() < Duration::from_millis(100),
+            "{:?}",
+            again.elapsed()
+        );
+        assert_eq!(first, second);
+    }
+
+    #[test]
+    fn a_change_is_dated_when_niri_sends_it_not_when_an_action_looks() {
+        let history = history();
+        let quiet = Duration::from_millis(200);
+        let started = Instant::now();
+        // The change comes 50 ms in, while the first wait sleeps: read then,
+        // the layout is quiet 250 ms in; read when the wait wakes, 400 ms.
+        history
+            .settle(
+                || {
+                    Ok(event_stream(vec![(
+                        Duration::from_millis(50),
+                        json!({"WindowLayoutsChanged": {"changes": []}}),
+                    )]))
+                },
+                quiet,
+                Duration::from_secs(2),
+            )
+            .unwrap();
+        let elapsed = started.elapsed();
+        assert!(elapsed >= Duration::from_millis(250), "{elapsed:?}");
+        assert!(elapsed < Duration::from_millis(380), "{elapsed:?}");
+    }
+
+    #[test]
+    fn a_recent_change_still_waits_out_the_quiet_period() {
+        let history = history();
+        let quiet = Duration::from_millis(200);
+        history
+            .settle(
+                || {
+                    Ok(event_stream(vec![(
+                        Duration::from_millis(400),
+                        json!({"WindowLayoutsChanged": {"changes": []}}),
+                    )]))
+                },
+                quiet,
+                Duration::from_secs(2),
+            )
+            .unwrap();
+        std::thread::sleep(Duration::from_millis(500).saturating_sub(quiet));
+        let again = Instant::now();
+        history
+            .settle(|| bail!("still connected"), quiet, Duration::from_secs(2))
+            .unwrap();
+        assert!(
+            again.elapsed() >= Duration::from_millis(80),
+            "{:?}",
+            again.elapsed()
+        );
     }
 
     #[test]
@@ -3624,13 +4555,13 @@ mod tests {
                 )
             })
             .collect();
-        let error = Quiet::wait(
-            event_stream(events),
-            Duration::from_millis(100),
-            Duration::from_millis(300),
-        )
-        .err()
-        .unwrap();
+        let error = history()
+            .settle(
+                || Ok(event_stream(events)),
+                Duration::from_millis(100),
+                Duration::from_millis(300),
+            )
+            .unwrap_err();
         assert_eq!(
             error.to_string(),
             "foreground_unavailable: the niri layout did not stay unchanged for 100 ms within 300 ms, so window geometry may not match the screen"
@@ -3639,36 +4570,98 @@ mod tests {
 
     #[test]
     fn a_change_after_settling_is_detected() {
-        let mut quiet = Quiet::wait(
-            event_stream(vec![(
-                Duration::from_millis(150),
-                json!({"WorkspaceActivated": {"id": 2, "focused": true}}),
-            )]),
-            Duration::from_millis(100),
-            Duration::from_secs(1),
-        )
-        .unwrap();
-        std::thread::sleep(Duration::from_millis(100));
-        assert!(quiet.changed().unwrap());
+        let history = history();
+        let mark = history
+            .settle(
+                || {
+                    Ok(event_stream(vec![(
+                        Duration::from_millis(150),
+                        json!({"WorkspaceActivated": {"id": 2, "focused": true}}),
+                    )]))
+                },
+                Duration::from_millis(100),
+                Duration::from_secs(1),
+            )
+            .unwrap();
+        assert!(!history.changed_since(mark, Expected::default()).unwrap());
+        std::thread::sleep(Duration::from_millis(150));
+        assert!(history.changed_since(mark, Expected::default()).unwrap());
+    }
+
+    #[test]
+    fn a_lost_or_reconnected_stream_cannot_vouch_for_an_earlier_check() {
+        let history = history();
+        let quiet = Duration::from_millis(50);
+        let mark = history
+            .settle(
+                || Ok(event_stream_open(vec![], Duration::from_millis(100))),
+                quiet,
+                Duration::from_secs(1),
+            )
+            .unwrap();
+        std::thread::sleep(Duration::from_millis(200));
+        // niri closed the stream: whatever happened since is unknown.
+        assert!(history.changed_since(mark, Expected::default()).is_err());
+        let again = history
+            .settle(|| Ok(event_stream(vec![])), quiet, Duration::from_secs(1))
+            .unwrap();
+        assert_ne!(again, mark);
+        assert_eq!(
+            history
+                .changed_since(mark, Expected::default())
+                .unwrap_err()
+                .to_string(),
+            "niri's event stream reconnected after the layout was checked"
+        );
+        assert!(!history.changed_since(again, Expected::default()).unwrap());
+    }
+
+    fn offline_ipc() -> AttestedIpc {
+        Ipc {
+            connect: |_| bail!("no niri in this test"),
+            per_attempt: QUERY_TIMEOUT,
+            total: QUERY_TOTAL_TIMEOUT,
+            backoff: QUERY_RETRY_BACKOFF,
+            lines: None,
+        }
+    }
+
+    #[test]
+    fn a_layout_change_after_positioning_refuses_the_press() {
+        let history = history();
+        let mark = history
+            .settle(
+                || {
+                    Ok(event_stream(vec![(
+                        Duration::from_millis(250),
+                        json!({"WindowLayoutsChanged": {"changes": []}}),
+                    )]))
+                },
+                Duration::from_millis(100),
+                Duration::from_secs(1),
+            )
+            .unwrap();
+        let mut gate = PointerGate {
+            history,
+            mark,
+            expected: Expected::default(),
+            ipc: offline_ipc(),
+        };
+        // Still quiet before the first motion; a window moves over the point
+        // while the pointer is positioned, so the press must refuse.
+        gate.confirm().unwrap();
+        std::thread::sleep(Duration::from_millis(300));
+        assert_eq!(
+            gate.confirm().unwrap_err().to_string(),
+            "foreground_unavailable: the niri layout changed after the pointer target was checked; take a new screenshot"
+        );
     }
 
     // ── Pointer admission ───────────────────────────────────────────────────
 
     #[test]
-    fn window_coordinates_refuse_a_tiled_window_instead_of_passing_through() {
-        let scene = one_output(vec![
-            tiled(5, 1, (402.0, 448.0)),
-            floating(7, 1, (100.0, 60.0), (300, 200)),
-        ]);
-        assert_eq!(
-            aim_at(&scene.window(5).unwrap(), 10, 20)
-                .unwrap_err()
-                .to_string(),
-            format!(
-                "foreground_unavailable: niri window 5: {}",
-                Unplaced::Tiled.reason()
-            )
-        );
+    fn floating_window_coordinates_add_the_window_origin() {
+        let scene = one_output(vec![floating(7, 1, (100.0, 60.0), (300, 200))]);
         let (point, rect) = aim_at(&scene.window(7).unwrap(), 10, 20).unwrap();
         assert_eq!(point, (110, 80));
         assert_eq!(
@@ -3729,6 +4722,386 @@ mod tests {
                 Unplaced::Tiled.reason()
             )
         );
+    }
+
+    // ── Tiled windows ───────────────────────────────────────────────────────
+
+    /// Tiled window 5 (active) and 6 beside it, and floating window 7, on
+    /// workspace 1 of output winit placed at x=1920; workspace 2 hidden.
+    fn tiled_scene(focused: Option<u64>) -> Scene {
+        let mut windows = vec![
+            tiled(5, 1, (402.0, 448.0)),
+            tiled(6, 1, (402.0, 448.0)),
+            floating(7, 1, (100.0, 60.0), (300, 200)),
+            tiled(8, 2, (402.0, 448.0)),
+        ];
+        for window in &mut windows {
+            window["is_focused"] = json!(Some(window["id"].as_u64().unwrap()) == focused);
+        }
+        scene(
+            windows,
+            vec![
+                workspace(1, "winit", true, Some(5)),
+                workspace(2, "winit", false, Some(8)),
+            ],
+            vec![output("winit", 1920, 0, (1280, 720), 1.5, "Flipped180")],
+            false,
+        )
+    }
+
+    #[test]
+    fn a_tiled_window_is_captured_as_its_output_while_niri_surely_shows_it() {
+        let scene = tiled_scene(Some(5));
+        let plan = capture_plan_in(&scene, 5, Some(105)).unwrap();
+        assert_eq!(
+            plan.pixels,
+            Rect {
+                x: 0,
+                y: 0,
+                width: 1280,
+                height: 720
+            }
+        );
+        assert_eq!((plan.width, plan.height), (853, 480));
+        assert_eq!(
+            plan.area,
+            Rect {
+                x: 1920,
+                y: 0,
+                width: 853,
+                height: 480
+            }
+        );
+        assert_eq!(plan.shown, scene.shown("winit"));
+        assert_eq!(
+            capture_plan_in(&scene, 6, None),
+            Err("niri does not report where a tiled window is, and shows for certain only its workspace's active window; focus the window first")
+        );
+        assert_eq!(
+            capture_plan_in(&scene, 8, None),
+            Err(Unplaced::NotShowing.reason())
+        );
+        let mut overview = tiled_scene(Some(5));
+        overview.overview_open = true;
+        assert_eq!(
+            capture_plan_in(&overview, 5, None),
+            Err(Unplaced::NotShowing.reason())
+        );
+    }
+
+    #[test]
+    fn a_tiled_capture_yields_the_frame_of_its_settled_layout() {
+        let mark = Mark {
+            generation: 3,
+            at: 9,
+        };
+        let capture = capture_window_in(
+            || Ok(tiled_scene(Some(5))),
+            || Ok(mark),
+            unchanged,
+            5,
+            None,
+            || display("winit", (1280, 720)),
+        )
+        .unwrap();
+        let frame = capture.frame.unwrap();
+        assert_eq!((frame.window, frame.mark), (5, mark));
+        assert_eq!(frame.area, capture.plan.area);
+        assert!(capture_window_in(
+            || Ok(one_output(vec![floating(7, 1, (100.0, 60.0), (300, 200))])),
+            settled_now,
+            unchanged,
+            7,
+            None,
+            || display("winit", (1280, 720)),
+        )
+        .unwrap()
+        .frame
+        .is_none());
+    }
+
+    /// The frame window 5's capture gives, checked against `history`.
+    fn tiled_frame(history: &'static History) -> OutputFrame {
+        let mark = history
+            .settle(
+                || Ok(event_stream(vec![])),
+                Duration::from_millis(10),
+                Duration::from_secs(1),
+            )
+            .unwrap();
+        capture_window_in(
+            || Ok(tiled_scene(Some(5))),
+            || Ok(mark),
+            |mark| history.changed_since(mark, Expected::default()),
+            5,
+            None,
+            || display("winit", (1280, 720)),
+        )
+        .unwrap()
+        .frame
+        .unwrap()
+    }
+
+    #[test]
+    fn tiled_window_pixels_aim_at_the_output_while_its_layout_holds() {
+        let history = history();
+        let frame = tiled_frame(history);
+        let scene = tiled_scene(Some(5));
+        let window = scene.window(5).unwrap();
+        frame.holds(&scene, history).unwrap();
+        assert_eq!(frame.aim(10, 20).unwrap(), (1930, 20));
+        assert_eq!(frame.aim(852, 479).unwrap(), (2772, 479));
+        assert_eq!(
+            frame.aim(853, 20).unwrap_err().to_string(),
+            "foreground_unavailable: point (853, 20) is outside the screenshot of tiled niri window 5, which is its whole output, 853x480"
+        );
+        assert!(frame.aim(-1, 20).is_err());
+        frame
+            .admit(&scene, &window, &[(2500, 400)], true, history)
+            .unwrap();
+        // Floating window 7 covers layout x 2020..2320, y 60..260.
+        assert_eq!(
+            frame
+                .admit(&scene, &window, &[(2100, 100)], true, history)
+                .unwrap_err()
+                .to_string(),
+            "foreground_unavailable: point (2100, 100) lies on floating niri window 7, which niri draws above tiled window 5"
+        );
+        assert!(frame
+            .admit(&scene, &window, &[(10, 100)], true, history)
+            .is_err());
+    }
+
+    #[test]
+    fn tiled_window_pixels_refuse_once_the_layout_changed() {
+        let history = history();
+        let frame = tiled_frame(history);
+        let changed = "foreground_unavailable: niri output winit changed after the screenshot of tiled niri window 5, so its pixels may be elsewhere now; take a new screenshot";
+        // Focus moved to the tiled window beside it: niri may have scrolled.
+        let mut focus = tiled_scene(Some(6));
+        focus.workspaces[0].active_window_id = Some(6);
+        assert_eq!(
+            frame.holds(&focus, history).unwrap_err().to_string(),
+            changed
+        );
+        // A column resized or opened shifts the columns after it.
+        let mut resized = tiled_scene(Some(5));
+        resized.windows[1].layout.as_mut().unwrap().tile_size = (500.0, 448.0);
+        assert_eq!(
+            frame.holds(&resized, history).unwrap_err().to_string(),
+            changed
+        );
+        let mut overview = tiled_scene(Some(5));
+        overview.overview_open = true;
+        assert!(frame.holds(&overview, history).is_err());
+        // A window on the hidden workspace changes nothing shown.
+        let mut hidden = tiled_scene(Some(5));
+        hidden.windows[3].layout.as_mut().unwrap().tile_size = (500.0, 448.0);
+        frame.holds(&hidden, history).unwrap();
+    }
+
+    #[test]
+    fn a_change_niri_reported_after_the_capture_refuses_tiled_pixels() {
+        let captured = tiled_frame(history());
+        let history = history();
+        let mark = history
+            .settle(
+                || {
+                    Ok(event_stream(vec![(
+                        Duration::from_millis(100),
+                        json!({"WindowFocusChanged": {"id": 6}}),
+                    )]))
+                },
+                Duration::from_millis(50),
+                Duration::from_secs(1),
+            )
+            .unwrap();
+        let frame = OutputFrame { mark, ..captured };
+        let scene = tiled_scene(Some(5));
+        frame.holds(&scene, history).unwrap();
+        // Focus went elsewhere and back: the scene matches again, but niri
+        // may have scrolled its view in between.
+        std::thread::sleep(Duration::from_millis(100));
+        assert_eq!(
+            frame.holds(&scene, history).unwrap_err().to_string(),
+            "foreground_unavailable: the niri layout changed after the screenshot of tiled niri window 5, so its pixels may be elsewhere now; take a new screenshot"
+        );
+    }
+
+    #[test]
+    fn an_unfocused_tiled_window_is_not_focused_for_a_pointer_action() {
+        let history = history();
+        // Focus is on a layer-shell surface: no window has it.
+        let unfocused = tiled_scene(None);
+        let frame = OutputFrame {
+            shown: unfocused.shown("winit").unwrap(),
+            ..tiled_frame(history)
+        };
+        let window = unfocused.window(5).unwrap();
+        assert_eq!(
+            frame
+                .admit(&unfocused, &window, &[(2500, 400)], true, history)
+                .unwrap_err()
+                .to_string(),
+            "foreground_unavailable: tiled niri window 5 is not focused, and niri may scroll its view to focus it; focus it, then take a new screenshot"
+        );
+        // Desktop-scope input focuses nothing.
+        frame
+            .admit(&unfocused, &window, &[(2500, 400)], false, history)
+            .unwrap();
+    }
+
+    #[test]
+    fn a_tiled_frame_expires_because_niri_does_not_report_every_view_scroll() {
+        let history = history();
+        let scene = tiled_scene(Some(5));
+        let frame = tiled_frame(history);
+        let aged = |age: Duration| OutputFrame {
+            taken: Instant::now().checked_sub(age).unwrap(),
+            ..frame.clone()
+        };
+        aged(Duration::from_secs(59))
+            .holds(&scene, history)
+            .unwrap();
+        assert_eq!(
+            aged(Duration::from_secs(61))
+                .holds(&scene, history)
+                .unwrap_err()
+                .to_string(),
+            "foreground_unavailable: the screenshot of tiled niri window 5 is over 60 s old, and niri does not report every scroll of its view; take a new screenshot"
+        );
+    }
+
+    #[test]
+    fn an_unfocused_tiled_window_refuses_before_any_route_focuses_it() {
+        let history = history();
+        // Captured and still shown while a layer-shell surface has focus.
+        let unfocused = tiled_scene(None);
+        let frame = OutputFrame {
+            shown: unfocused.shown("winit").unwrap(),
+            ..tiled_frame(history)
+        };
+        let window = unfocused.window(5).unwrap();
+        assert_eq!(
+            frame
+                .aim_window(&unfocused, &window, history, 10, 20)
+                .unwrap_err()
+                .to_string(),
+            "foreground_unavailable: tiled niri window 5 is not focused, and niri may scroll its view to focus it; focus it, then take a new screenshot"
+        );
+        let focused = tiled_scene(Some(5));
+        let frame = tiled_frame(history);
+        assert_eq!(
+            frame
+                .aim_window(&focused, &focused.window(5).unwrap(), history, 10, 20)
+                .unwrap(),
+            (1930, 20)
+        );
+    }
+
+    #[test]
+    fn a_click_bound_to_a_capture_refuses_once_a_newer_screenshot_is_adopted() {
+        // A window id no other test adopts: the frames are process-wide.
+        let frame = OutputFrame {
+            window: 9002,
+            ..tiled_frame(history())
+        };
+        adopt_frame(9002, Some(frame.clone()), Some("c1"));
+        let _bound = bind_capture(Some("c1".to_owned()));
+        // Another call adopts a newer screenshot while the click is checked.
+        adopt_frame(9002, Some(frame), Some("c2"));
+        let refusal = gate_pointer(9002, &[(2500, 400)], false)
+            .err()
+            .expect("a click bound to an older capture is refused");
+        assert_eq!(
+            refusal.to_string(),
+            "foreground_unavailable: capture c1 is not the latest screenshot of tiled niri window 9002, and only that one's pixels are checked against niri's layout; use the latest get_window_state screenshot"
+        );
+    }
+
+    #[test]
+    fn only_the_latest_screenshot_of_a_tiled_window_aims() {
+        // Window ids no other test adopts: the frames are process-wide.
+        let frame = OutputFrame {
+            window: 9001,
+            ..tiled_frame(history())
+        };
+        assert!(adopted_frame(9001)
+            .unwrap_err()
+            .to_string()
+            .ends_with("which shows its whole output; take one first"));
+        adopt_frame(9001, Some(frame.clone()), Some("c1"));
+        adopt_frame(9001, Some(frame.clone()), Some("c2"));
+        assert_eq!(adopted_frame(9001).unwrap(), frame);
+        frame_admits_capture(9001, "c2").unwrap();
+        assert!(frame_admits_capture(9001, "c1")
+            .unwrap_err()
+            .to_string()
+            .starts_with("foreground_unavailable: capture c1 is not the latest screenshot"));
+        // Its latest screenshot shows only the window (it was floated).
+        adopt_frame(9001, None, Some("c3"));
+        assert!(adopted_frame(9001).is_err());
+    }
+
+    #[test]
+    fn the_screenshot_published_last_is_the_one_whose_frame_is_adopted() {
+        use std::sync::{mpsc, Arc};
+        let frame = OutputFrame {
+            window: 9004,
+            ..tiled_frame(history())
+        };
+        // The snapshot store's latest screenshot of the window.
+        let store = Arc::new(Mutex::new(Vec::new()));
+        let (published, wait_published) = mpsc::channel();
+        let (release, wait_release) = mpsc::channel::<()>();
+        let first = std::thread::spawn({
+            let (frame, store) = (frame.clone(), store.clone());
+            move || {
+                let _publication = publication();
+                store.lock().unwrap().push("a");
+                published.send(()).unwrap();
+                wait_release.recv().unwrap();
+                adopt_frame(9004, Some(frame), Some("a"));
+            }
+        });
+        wait_published.recv().unwrap();
+        let second = std::thread::spawn({
+            let store = store.clone();
+            move || {
+                let _publication = publication();
+                store.lock().unwrap().push("b");
+                adopt_frame(9004, Some(frame), Some("b"));
+            }
+        });
+        // The second call would publish and adopt now, between the first
+        // call's publish and adopt, unless the publication holds it off.
+        std::thread::sleep(Duration::from_millis(100));
+        release.send(()).unwrap();
+        first.join().unwrap();
+        second.join().unwrap();
+        assert_eq!(
+            adopted(9004).unwrap().capture.as_deref(),
+            store.lock().unwrap().last().copied()
+        );
+    }
+
+    #[test]
+    fn an_output_capture_stays_refused_after_its_window_floats() {
+        let frame = OutputFrame {
+            window: 9003,
+            ..tiled_frame(history())
+        };
+        adopt_frame(9003, Some(frame), Some("c1"));
+        // Floated: its latest screenshot shows only the window.
+        adopt_frame(9003, None, Some("c2"));
+        assert_eq!(
+            frame_admits_capture(9003, "c1").unwrap_err().to_string(),
+            "foreground_unavailable: capture c1 is not the latest screenshot of niri window 9003, and it shows the whole output rather than the window; use the latest get_window_state screenshot"
+        );
+        frame_admits_capture(9003, "c2").unwrap();
+        // A window-only capture other than the latest is the floating
+        // window's own business: its pixels are window-local.
+        frame_admits_capture(9003, "c0").unwrap();
     }
 
     #[test]

@@ -1374,6 +1374,10 @@ impl Tool for GetWindowStateTool {
             // binding must identify the bytes returned to the caller, including
             // any max-dimension resize, rather than the backend's raw frame.
             let mut screenshot_error = None;
+            // niri: a tiled window's screenshot is its whole output.
+            let mut output_frame = None;
+            let mut output_screenshot = None;
+            let mut adoption = None;
             // Same-pid popups (menus, combo lists) and transient dialogs mapped
             // over this window: listed for the caller, and when one overlaps
             // the window the screenshot is taken from the screen, since the
@@ -1404,7 +1408,10 @@ impl Tool for GetWindowStateTool {
                         .or_else(|_| crate::wayland::screenshot_dispatch_with_pid(xid, pid))
                         .map(|png| (png, None))
                 } else {
-                    crate::wayland::screenshot_dispatch_with_pid(xid, pid).map(|png| (png, None))
+                    crate::wayland::screenshot_for_window_state(xid, pid).map(|(png, frame)| {
+                        output_frame = frame;
+                        (png, None)
+                    })
                 };
                 match captured {
                     Ok((raw, original_size)) => {
@@ -1447,6 +1454,19 @@ impl Tool for GetWindowStateTool {
                                 (orig_w, orig_h),
                             )?)
                         };
+                        output_screenshot = output_frame
+                            .as_ref()
+                            .map(|frame| frame.output().to_owned());
+                        // The published screenshot is the window's pixel
+                        // frame from now on; on niri a tiled window's frame
+                        // is its output, checked against niri's layout. It is
+                        // adopted where the snapshot is published.
+                        if !observation_only
+                            && crate::wayland::is_wayland()
+                            && crate::wayland::niri::is_session()
+                        {
+                            adoption = Some((output_frame.take(), capture_id.clone()));
+                        }
                         Some((b64, file_path, w, h, original_w, capture_id))
                     }
                     Err(error) if crate::wayland::is_surface_identity_unproven(&error) => {
@@ -1471,12 +1491,32 @@ impl Tool for GetWindowStateTool {
             } else {
                 None
             };
-            Ok((tree_result, screenshot, bounds, screenshot_error, overlays))
+            Ok((
+                tree_result,
+                screenshot,
+                bounds,
+                screenshot_error,
+                overlays,
+                output_screenshot,
+                adoption,
+            ))
         })
         .await;
 
         match result {
-            Ok(Ok((tree_opt, shot_opt, bounds, screenshot_error, overlays))) => {
+            Ok(Ok((
+                tree_opt,
+                shot_opt,
+                bounds,
+                screenshot_error,
+                overlays,
+                output_screenshot,
+                adoption,
+            ))) => {
+                // Concurrent reads of one window must leave the snapshot
+                // store's latest screenshot and niri's adopted frame from the
+                // same read.
+                let publication = adoption.is_some().then(crate::wayland::niri::publication);
                 let mut content = Vec::new();
                 let mut structured = json!({ "window_id": xid, "pid": pid });
                 let screenshot_scale = shot_opt.as_ref().map(|(_, _, w, _, original_w, _)| {
@@ -1722,6 +1762,10 @@ impl Tool for GetWindowStateTool {
                         }
                     }
                 }
+                if let Some((frame, capture_id)) = adoption {
+                    crate::wayland::niri::adopt_frame(xid, frame, capture_id.as_deref());
+                }
+                drop(publication);
                 if let Some(id) = refreshed {
                     let sid = cua_driver_core::element_token::format_snapshot_id(id);
                     content.push(cua_driver_core::protocol::Content::text(format!(
@@ -1823,6 +1867,22 @@ impl Tool for GetWindowStateTool {
                      window_bounds is where it sits on the screen. Pass scope:\"desktop\" only \
                      for get_desktop_state pixels."
                 );
+                if let Some(output) = &output_screenshot {
+                    let note = format!(
+                        "niri does not report where tiled window {xid} is, so this screenshot \
+                         is its whole output {output}, and x/y for pointer actions on this window \
+                         are pixels of it. They are accepted for at most {max_age} s, while niri \
+                         reports no layout change on that output and the window stays focused. \
+                         niri does not report every scroll of the view (center-column, \
+                         center-window, view gestures), so a point can still land on another tiled \
+                         window or on a panel shown there. Float the window for a window-only \
+                         screenshot.",
+                        max_age = crate::wayland::niri::FRAME_MAX_AGE.as_secs()
+                    );
+                    structured["screenshot_scope"] = json!("output");
+                    structured["frame_note"] = json!(note);
+                    content.push(cua_driver_core::protocol::Content::text(note));
+                }
                 if display_only {
                     cua_driver_core::window_state_view::mark_display_only(&mut structured);
                 }
@@ -6664,6 +6724,7 @@ impl Tool for ClickTool {
         // We resolve before the legacy `opt_u64("element_index")` branch
         // so a token-only call (no integer arg) still takes the element path.
         let capture_id_arg = args.opt_str("capture_id");
+        let bound_capture = capture_id_arg.clone();
         let window_id_arg = args.opt_u64("window_id");
         let resolved = match self.state.snapshots.resolve(pid as i32, &args) {
             Ok(r) => r,
@@ -7093,6 +7154,14 @@ impl Tool for ClickTool {
             if let Some(refusal) = native_refusal {
                 return refusal;
             }
+            // A tiled niri window's pixels are checked against the layout of
+            // its latest screenshot only. This refuses early; the pointer gate
+            // checks again against the frame it admits the click on.
+            if crate::wayland::is_wayland() && crate::wayland::niri::is_session() {
+                if let Err(error) = crate::wayland::niri::frame_admits_capture(xid, &capture_id) {
+                    return input_error_result(error);
+                }
+            }
             match crate::capture_action_frame::admit_window_click(
                 &self.state.capture_service,
                 &args,
@@ -7232,6 +7301,9 @@ impl Tool for ClickTool {
         // then restore prior active. Mirrors macOS/Windows.
         let fg_budget = foreground_budget(0);
         let result = spawn_blocking_bounded("foreground click", fg_budget, move || -> anyhow::Result<(&'static str, Option<crate::input::ForegroundReport>, Option<PointerRoute>, Option<crate::input::FocusGuardReport>)> {
+            // niri's pointer gate checks the capture against the very frame
+            // it admits the click on.
+            let _capture = crate::wayland::niri::bind_capture(bound_capture);
             if crate::wayland::wayland_input_enabled() {
                 if !modifiers_for_task.is_empty() {
                     anyhow::bail!(

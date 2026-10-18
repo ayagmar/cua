@@ -380,8 +380,11 @@ Wayland results are compositor-specific. The hosted lane uses Sway to prove
 wlroots protocols. The niri lane (`CUA_E2E_WAYLAND_SESSION=niri` in
 `nix develop .#cua-driver-niri-e2e`) runs niri's winit backend inside a
 headless cage; its observer reads niri IPC, which reports no stacking order and
-no tiled-window positions, so it certifies occlusion only for floating harness
-windows behind the focused fullscreen sentinel. GNOME requires the optional WinRects Shell helper for
+no tiled-window positions. It reports a floating harness window behind the
+focused fullscreen sentinel as occluded, and one that overlaps no other
+floating window as visible; it refuses tiled targets, overlapping floating
+windows, an open overview, and fullscreen occlusion outside the lane config.
+GNOME requires the optional WinRects Shell helper for
 authoritative frame and buffer geometry, observation, capture, and verified
 target activation. A portal/libei grant persists until the user revokes it, so
 subsequent driver processes do not reopen the consent dialog.

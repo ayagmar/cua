@@ -1170,6 +1170,7 @@ fn screenshot_dispatch_for_pid(xid: u64, pid: Option<u32>) -> anyhow::Result<Vec
 /// are not tied to the attested compositor or orient differently, so niri
 /// never falls back to them.
 fn niri_display_capture() -> anyhow::Result<niri::DisplayCapture> {
+    niri::refuse_if_locked()?;
     // Read the transforms on both sides of the copy: a change in between
     // would orient the buffer with a transform it was not taken in.
     let before = niri::output_transforms()?;
@@ -2057,6 +2058,7 @@ fn niri_pointer_gate(
     if !(is_wayland() && niri::is_session()) {
         return Ok(None);
     }
+    niri::refuse_if_locked().map_err(niri::input_unavailable)?;
     // `motion_absolute` clamps into the pointer space: a point it would move
     // lands somewhere other than where it was aimed.
     for &(x, y) in points {

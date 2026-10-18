@@ -1337,6 +1337,124 @@ fn active_layout(layouts: &KeyboardLayouts) -> Result<u32> {
     Ok(layouts.current_idx)
 }
 
+/// How long one logind query may take.
+const LOGIND_TIMEOUT: Duration = Duration::from_secs(1);
+
+/// Refuse input and capture while the niri session is locked; input routes
+/// add the `foreground_unavailable` code (see [`input_unavailable`]). niri records
+/// its lock in logind's `LockedHint` of the session it started in
+/// (`XDG_SESSION_ID`), and only when it runs as the session instance
+/// (`niri --session`; `update_locked_hint` in niri v26.04 `src/niri.rs`).
+/// A niri started any other way, such as a nested one, sets no hint, so this
+/// check cannot see its lock and passes. Keyboard input does not rely on it:
+/// a locked niri reports no focused window (see [`keyboard_focus`]).
+pub fn refuse_if_locked() -> Result<()> {
+    let pid = *RECOGNIZED
+        .get()
+        .context("niri session has not been recognised")?;
+    lock_refusal(logind_session(pid).and_then(|session| match session {
+        Some(session) => locked_hint(&session),
+        None => Ok(false),
+    }))
+}
+
+/// The refusal for a lock read: a lock, or a hint niri sets but that cannot
+/// be read, refuses.
+fn lock_refusal(checked: Result<bool>) -> Result<()> {
+    match checked {
+        Ok(false) => Ok(()),
+        Ok(true) => bail!("the niri session is locked (logind LockedHint)"),
+        Err(error) => bail!("cannot read whether the niri session is locked: {error:#}"),
+    }
+}
+
+/// The logind session niri sets its locked hint on, or `None` when niri runs
+/// without `--session` and sets none. Fixed for the recognised process.
+fn logind_session(pid: libc::pid_t) -> Result<Option<String>> {
+    static SESSION: OnceLock<Option<String>> = OnceLock::new();
+    if let Some(session) = SESSION.get() {
+        return Ok(session.clone());
+    }
+    let cmdline = std::fs::read(format!("/proc/{pid}/cmdline"))
+        .with_context(|| format!("read niri's command line (pid {pid})"))?;
+    let session = if cmdline
+        .split(|&byte| byte == 0)
+        .any(|arg| arg == b"--session")
+    {
+        let environ = std::fs::read(format!("/proc/{pid}/environ"))
+            .with_context(|| format!("read niri's environment (pid {pid})"))?;
+        Some(session_id(&environ)?)
+    } else {
+        None
+    };
+    Ok(SESSION.get_or_init(|| session).clone())
+}
+
+/// Whether a `/proc/<pid>/cmdline` image has the `--session` argument.
+fn session_instance(cmdline: &[u8]) -> bool {
+    cmdline
+        .split(|&byte| byte == 0)
+        .any(|arg| arg == b"--session")
+}
+
+/// `XDG_SESSION_ID` from a `/proc/<pid>/environ` image. niri started with
+/// `--session` but without it sets no hint while locked, so that refuses.
+fn session_id(environ: &[u8]) -> Result<String> {
+    let id = environ
+        .split(|&byte| byte == 0)
+        .find_map(|entry| entry.strip_prefix(b"XDG_SESSION_ID="))
+        .context("niri runs with --session but has no XDG_SESSION_ID")?;
+    let id = std::str::from_utf8(id).context("XDG_SESSION_ID is not UTF-8")?;
+    // `self` and `auto` would name the caller's own session, not niri's.
+    if id.is_empty()
+        || id == "self"
+        || id == "auto"
+        || !id.chars().all(|c| c.is_ascii_alphanumeric())
+    {
+        bail!("XDG_SESSION_ID {id:?} is not a logind session id");
+    }
+    Ok(id.to_owned())
+}
+
+fn locked_hint(session: &str) -> Result<bool> {
+    static BUS: Mutex<Option<zbus::blocking::Connection>> = Mutex::new(None);
+    let mut bus = BUS
+        .lock()
+        .map_err(|_| anyhow!("logind connection lock poisoned"))?;
+    let connection = match bus.as_ref() {
+        Some(connection) => connection.clone(),
+        None => {
+            let connection = zbus::blocking::connection::Builder::system()?
+                .method_timeout(LOGIND_TIMEOUT)
+                .build()
+                .context("connect to the system bus")?;
+            bus.insert(connection).clone()
+        }
+    };
+    drop(bus);
+    let reply = connection
+        .call_method(
+            Some("org.freedesktop.login1"),
+            "/org/freedesktop/login1",
+            Some("org.freedesktop.login1.Manager"),
+            "GetSession",
+            &(session,),
+        )
+        .with_context(|| format!("logind GetSession({session})"))?;
+    let path: zbus::zvariant::OwnedObjectPath = reply.body().deserialize()?;
+    let reply = connection
+        .call_method(
+            Some("org.freedesktop.login1"),
+            path.as_str(),
+            Some("org.freedesktop.DBus.Properties"),
+            "Get",
+            &("org.freedesktop.login1.Session", "LockedHint"),
+        )
+        .with_context(|| format!("logind LockedHint of session {session}"))?;
+    let hint: zbus::zvariant::OwnedValue = reply.body().deserialize()?;
+    bool::try_from(hint).context("logind LockedHint is not a boolean")
+}
+
 /// Briefly focus one niri window for `pid`, run `body`, then restore the
 /// previously focused window, or the previously focused workspace when no
 /// window had focus, and each output's previously active workspace.
@@ -1925,6 +2043,42 @@ mod tests {
     use super::*;
     use serde_json::{json, Value};
     use std::sync::{Arc, Mutex};
+
+    #[test]
+    fn only_a_session_niri_with_a_logind_session_id_has_a_lock_hint() {
+        assert!(session_instance(b"niri\0--session\0"));
+        assert!(!session_instance(b"niri\0-c\0/tmp/niri--session.kdl\0"));
+        let environ = b"HOME=/home/u\0XDG_SESSION_ID=c2\0";
+        assert_eq!(session_id(environ).unwrap(), "c2");
+        for environ in [
+            &b"HOME=/home/u\0"[..],
+            b"XDG_SESSION_ID=self\0",
+            b"XDG_SESSION_ID=-p\0",
+        ] {
+            assert!(
+                session_id(environ).is_err(),
+                "{:?}",
+                String::from_utf8_lossy(environ)
+            );
+        }
+    }
+
+    #[test]
+    fn a_locked_or_unreadable_session_refuses_input_with_the_code() {
+        assert!(lock_refusal(Ok(false)).is_ok());
+        for read in [Ok(true), Err(anyhow!("system bus unavailable"))] {
+            let error = input_unavailable(lock_refusal(read).unwrap_err());
+            assert_eq!(
+                crate::input::foreground::error_code(&error),
+                Some(crate::input::foreground::CODE_UNAVAILABLE),
+                "{error}"
+            );
+        }
+        assert!(lock_refusal(Ok(true))
+            .unwrap_err()
+            .to_string()
+            .contains("the niri session is locked"));
+    }
 
     // Shapes recorded from niri 26.04 (8ed0da4) in a nested session.
     fn floating(id: u64, workspace: u64, at: (f64, f64), size: (i32, i32)) -> Value {

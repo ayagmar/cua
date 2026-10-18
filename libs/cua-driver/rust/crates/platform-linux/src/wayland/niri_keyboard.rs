@@ -460,6 +460,7 @@ impl Session {
                      it); nothing was typed"
                 )
             })?;
+        super::niri::refuse_if_locked().map_err(super::niri::input_unavailable)?;
         let group = super::niri::keyboard_layout().map_err(super::niri::input_unavailable)?;
         let keyboard = Keyboard::bind(deadline).map_err(|error| refused(format!("{error:#}")))?;
         Ok(Self {

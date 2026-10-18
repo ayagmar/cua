@@ -158,6 +158,7 @@ function createWindow() {
                     mainWindow.webContents.send('cua-e2e-sentinel-arm-setup-click', request.token);
                   }
                 }
+                mainWindow.webContents.send('cua-e2e-sentinel-heartbeat-probe');
                 if (sentinelStatePath) {
                   // Fullscreen as the compositor's last configure set it; niri's
                   // IPC cannot tell a fullscreen tile from a maximized one. The
@@ -167,10 +168,13 @@ function createWindow() {
                     at_ms: Date.now(),
                     fullscreen: mainWindow.isFullScreen(),
                   });
-                  fs.writeFileSync(`${sentinelStatePath}.tmp`, state, 'utf8');
-                  fs.renameSync(`${sentinelStatePath}.tmp`, sentinelStatePath);
+                  // A failed write leaves the report stale, which the observer
+                  // already treats as no fullscreen evidence.
+                  try {
+                    fs.writeFileSync(`${sentinelStatePath}.tmp`, state, 'utf8');
+                    fs.renameSync(`${sentinelStatePath}.tmp`, sentinelStatePath);
+                  } catch {}
                 }
-                mainWindow.webContents.send('cua-e2e-sentinel-heartbeat-probe');
               }
             }, 100);
             sentinelHeartbeatTimer.unref();

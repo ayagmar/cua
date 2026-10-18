@@ -81,14 +81,17 @@ impl ForegroundSentinel {
                 "CUA_E2E_SENTINEL_CONTROL",
                 journal_path.with_extension("control.json"),
             )
-            .env(
-                "CUA_E2E_SENTINEL_STATE",
-                user_data.path().join("sentinel-state.json"),
-            )
             .env("CUA_E2E_USER_DATA_DIR", user_data.path())
             .env("CUA_ELECTRON_CDP_PORT", cdp_port.to_string())
             .stdout(Stdio::null())
             .stderr(Stdio::null());
+        // Only the niri observer reads the fullscreen state file, so other
+        // platforms never pay for the sentinel rewriting it every tick.
+        #[cfg(target_os = "linux")]
+        command.env(
+            "CUA_E2E_SENTINEL_STATE",
+            user_data.path().join("sentinel-state.json"),
+        );
         let child = spawn_in_job(&mut command)
             .map_err(|error| format!("launch foreground sentinel: {error}"))?;
         let launched_pid = child.id();

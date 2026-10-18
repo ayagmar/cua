@@ -1079,6 +1079,21 @@ fn correlate_hyprland_frame(
     Some(frame.ordinal)
 }
 
+/// [`correlate_hyprland_frame`] for niri, which also keeps the single-root
+/// shortcut, but only while niri shows the process exactly one window: the
+/// requested one.
+fn correlate_niri_frame(
+    frames: &[HyprlandFrame],
+    clients: &[(&str, u32, u32)],
+    target: usize,
+    roots: usize,
+) -> Option<usize> {
+    if roots == 1 && clients.len() == 1 && target == 0 {
+        return Some(0);
+    }
+    correlate_hyprland_frame(frames, clients, target)
+}
+
 #[cfg(test)]
 mod hyprland_frame_tests {
     use super::*;
@@ -1151,6 +1166,25 @@ mod hyprland_frame_tests {
     }
 
     #[test]
+    fn niri_binds_only_the_window_a_lone_root_belongs_to() {
+        // niri lists A and B for the process; only B's root is exported yet.
+        let mut b = frame("B");
+        b.browser_root = false;
+        b.size = None;
+        let clients = [("A", 800, 600), ("B", 800, 600)];
+        assert_eq!(correlate_niri_frame(&[b], &clients, 0, 1), None);
+        let mut b = frame("B");
+        b.browser_root = false;
+        assert_eq!(correlate_niri_frame(&[b], &clients, 1, 1), Some(7));
+        // With one window for the process, its lone root is that window's,
+        // whatever the toolkit names it.
+        assert_eq!(
+            correlate_niri_frame(&[frame("untitled")], &[("A", 800, 600)], 0, 1),
+            Some(0)
+        );
+    }
+
+    #[test]
     fn preserves_exact_non_chromium_matching() {
         let mut candidate = frame("Editor");
         candidate.browser_root = false;
@@ -1176,10 +1210,41 @@ async fn resolve_window_frame(
     xid: u64,
     seeds: &[RawObjectRef],
 ) -> Option<usize> {
-    if crate::wayland::is_wayland() && crate::wayland::hyprland::is_session() {
-        let windows = crate::wayland::hyprland::list_windows().ok()?;
-        let owned: Vec<_> = windows.iter().filter(|window| window.pid == pid).collect();
-        let target = owned.iter().position(|window| window.address == xid)?;
+    let hyprland = crate::wayland::is_wayland() && crate::wayland::hyprland::is_session();
+    // Before the single-root shortcut: niri may list a window whose root is
+    // not exported yet, and the one root then belongs to another window.
+    let niri = !hyprland && crate::wayland::is_wayland() && crate::wayland::niri::is_session();
+    if hyprland || niri {
+        let (owned, target): (Vec<(String, u32, u32)>, usize) = if hyprland {
+            let windows = crate::wayland::hyprland::list_windows().ok()?;
+            let owned: Vec<_> = windows.iter().filter(|window| window.pid == pid).collect();
+            let target = owned.iter().position(|window| window.address == xid)?;
+            let owned = owned
+                .iter()
+                .map(|window| (window.title.clone(), window.width, window.height))
+                .collect();
+            (owned, target)
+        } else {
+            // An X11 client's niri pid is xwayland-satellite's, so it never
+            // matches and its walk stays unscoped.
+            let windows = crate::wayland::niri::list_windows().ok()?;
+            let owned: Vec<_> = windows
+                .iter()
+                .filter(|window| window.pid == Some(pid))
+                .collect();
+            let target = owned.iter().position(|window| window.id == xid)?;
+            let owned = owned
+                .iter()
+                .map(|window| {
+                    let (width, height) = window
+                        .placement
+                        .as_ref()
+                        .map_or((0, 0), |placed| (placed.rect.width, placed.rect.height));
+                    (window.title.clone(), width, height)
+                })
+                .collect();
+            (owned, target)
+        };
         let chromium = std::fs::read_link(format!("/proc/{pid}/exe"))
             .ok()
             .and_then(|path| {
@@ -1225,21 +1290,19 @@ async fn resolve_window_frame(
         }
         let clients = owned
             .iter()
-            .map(|window| (window.title.as_str(), window.width, window.height))
+            .map(|(title, width, height)| (title.as_str(), *width, *height))
             .collect::<Vec<_>>();
-        return correlate_hyprland_frame(&frames, &clients, target);
+        return if niri {
+            correlate_niri_frame(&frames, &clients, target, seeds.len())
+        } else {
+            correlate_hyprland_frame(&frames, &clients, target)
+        };
     }
     if seeds.len() == 1 {
         // One top-level: the caller's window is the only thing this
         // application could be showing, and no geometry round-trip can make
         // that more certain.
         return Some(0);
-    }
-    if crate::wayland::is_wayland() && crate::wayland::niri::is_session() {
-        // A niri id is no X11 window, and niri exposes nothing that ties one
-        // of several top-level accessibles to it: stay unscoped, which keeps
-        // the snapshot from publishing element tokens.
-        return None;
     }
     // A popup menu / popover is an override-redirect window the WM's client
     // list never carries: describe it from the server directly, and let it

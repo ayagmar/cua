@@ -972,8 +972,12 @@ fn foreground_unavailable(detail: impl std::fmt::Display) -> anyhow::Error {
     anyhow!("foreground_unavailable: {detail}")
 }
 
-/// An IPC failure on an input route, with its whole cause chain.
+/// An IPC failure on an input route, with its whole cause chain. A refusal
+/// that already carries the code is kept as it is.
 fn input_unavailable(error: anyhow::Error) -> anyhow::Error {
+    if error.to_string().starts_with("foreground_unavailable") {
+        return error;
+    }
     foreground_unavailable(format!("{error:#}"))
 }
 
@@ -1042,7 +1046,7 @@ fn confirm_focus<C: FnMut(Instant) -> Result<UnixStream>>(
 
 /// Focus an exact niri window for input, confirmed by read-back.
 pub fn activate(id: u64, pid: Option<u32>) -> Result<()> {
-    activate_in(&mut ipc(), id, pid, FOCUS_CONFIRM_TIMEOUT)
+    activate_in(&mut ipc(), id, pid, FOCUS_CONFIRM_TIMEOUT).map_err(input_unavailable)
 }
 
 /// Briefly focus one niri window for `pid`, run `body`, then restore the
@@ -1060,9 +1064,10 @@ fn with_focused_window_in<C: FnMut(Instant) -> Result<UnixStream>, T>(
     confirm: Duration,
     body: impl FnOnce() -> Result<T>,
 ) -> Result<T> {
-    let prior = ipc.focused_window()?;
+    let prior = ipc.focused_window().map_err(input_unavailable)?;
     let prior_workspace = if prior.is_none() {
-        let workspaces: Vec<IpcWorkspace> = ipc.query(Request::Workspaces)?;
+        let workspaces: Vec<IpcWorkspace> =
+            ipc.query(Request::Workspaces).map_err(input_unavailable)?;
         workspaces
             .into_iter()
             .find(|workspace| workspace.is_focused)
@@ -1070,7 +1075,7 @@ fn with_focused_window_in<C: FnMut(Instant) -> Result<UnixStream>, T>(
     } else {
         None
     };
-    activate_in(ipc, id, Some(pid), confirm)?;
+    activate_in(ipc, id, Some(pid), confirm).map_err(input_unavailable)?;
     let result = body();
     let restore = match (&prior, prior_workspace) {
         (Some(prior), _) if prior.id == id => Ok(()),
@@ -1304,7 +1309,7 @@ fn aimed_rect(window: u64, point: (i32, i32)) -> Option<Rect> {
 pub fn settle_pointer(window_id: u64, points: &[(i32, i32)]) -> Result<()> {
     let before = window_for_id(window_id).map_err(input_unavailable)?;
     let before = placed_or_refuse(&before)?.rect;
-    let _quiet = settled()?;
+    let _quiet = settled().map_err(input_unavailable)?;
     let window = window_for_id(window_id).map_err(input_unavailable)?;
     pointer_admission(&window, before, points, |point| {
         aimed_rect(window_id, point)
@@ -2123,6 +2128,31 @@ mod tests {
         assert_eq!(
             error.to_string(),
             "foreground_unavailable: niri did not confirm focus on window 7 (focused: 5)"
+        );
+    }
+
+    #[test]
+    fn a_lost_niri_refuses_focus_bound_input_with_the_typed_code() {
+        let mut ran = false;
+        let error = with_focused_window_in(
+            &mut ipc_with(
+                |_| bail!("niri was recognised as pid 20, but the compositor is now pid 40"),
+                Duration::from_millis(50),
+                Duration::from_millis(100),
+            ),
+            107,
+            7,
+            Duration::from_millis(50),
+            || {
+                ran = true;
+                Ok(())
+            },
+        )
+        .unwrap_err();
+        assert!(!ran);
+        assert_eq!(
+            error.to_string(),
+            "foreground_unavailable: niri was recognised as pid 20, but the compositor is now pid 40"
         );
     }
 

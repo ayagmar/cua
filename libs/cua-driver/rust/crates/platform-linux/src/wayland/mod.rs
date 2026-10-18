@@ -9,6 +9,7 @@
 //! available, window-scoped screenshots use output crops only for visible,
 //! compositor-attested surfaces and return a typed identity error otherwise.
 
+mod compositor_peer;
 pub mod ext_screencopy;
 pub mod ext_toplevel;
 pub mod hyprland;

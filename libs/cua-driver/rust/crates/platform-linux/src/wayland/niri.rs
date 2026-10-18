@@ -1123,15 +1123,15 @@ pub fn screen_report() -> Result<(super::hyprland::DesktopFrame, serde_json::Val
     Ok((frame, serde_json::Value::Array(monitors)))
 }
 
-/// wl_output transform of the named output, for orienting its capture.
-pub fn output_transform(name: &str) -> Result<u32> {
-    let scene = ipc().scene()?;
-    let logical = scene
-        .outputs
-        .get(name)
-        .and_then(|output| output.logical.as_ref())
-        .with_context(|| format!("niri reports no enabled output {name:?}"))?;
-    transform_code(&logical.transform)
+/// wl_output transform of every enabled output, by name, for orienting a
+/// capture of one of them.
+pub fn output_transforms() -> Result<HashMap<String, u32>> {
+    ipc()
+        .scene()?
+        .laid_out()
+        .into_iter()
+        .map(|(output, logical)| Ok((output.name.clone(), transform_code(&logical.transform)?)))
+        .collect()
 }
 
 /// Doctor note: `None` without `NIRI_SOCKET`, otherwise whether this process
@@ -1754,13 +1754,16 @@ pub struct CapturePlan {
     pub output: String,
     pub area: Rect,
     pub scale: f64,
+    pub transform: u32,
     pub image: (u32, u32),
 }
 
-/// An oriented display capture and the output it copied.
+/// An oriented display capture, the output it copied and the transform the
+/// buffer was oriented with.
 pub struct DisplayCapture {
     pub png: Vec<u8>,
     pub output: String,
+    pub transform: u32,
     pub size: (u32, u32),
 }
 
@@ -1809,6 +1812,7 @@ fn capture_plan_in(scene: &Scene, id: u64, pid: Option<u32>) -> Result<CapturePl
         output: output.name.clone(),
         area: placed.area,
         scale,
+        transform,
         image: super::logical_output_size((mode.width, mode.height), transform),
     })
 }
@@ -1857,6 +1861,12 @@ fn capture_window_in(
         return Err(format!(
             "the display capture copied output {:?}, not the window's output {:?}",
             capture.output, plan.output
+        ));
+    }
+    if capture.transform != plan.transform {
+        return Err(format!(
+            "the capture was oriented for output transform {}, but the window's output has {}",
+            capture.transform, plan.transform
         ));
     }
     if capture.size != plan.image {
@@ -2579,6 +2589,7 @@ mod tests {
                     height: 720
                 },
                 scale: 1.5,
+                transform: 0,
                 image: (1920, 1080),
             })
         );
@@ -2627,9 +2638,14 @@ mod tests {
     }
 
     fn display(output: &str, size: (u32, u32)) -> Result<DisplayCapture> {
+        oriented(output, 6, size)
+    }
+
+    fn oriented(output: &str, transform: u32, size: (u32, u32)) -> Result<DisplayCapture> {
         Ok(DisplayCapture {
             png: vec![1],
             output: output.into(),
+            transform,
             size,
         })
     }
@@ -2647,6 +2663,46 @@ mod tests {
                     vec![window()],
                     vec![workspace(1, "winit", true, None)],
                     vec![output("winit", 0, 0, (1280, 720), scale, "Normal")],
+                    false,
+                ))
+            },
+            || Ok(quiet_now()),
+            7,
+            None,
+            || display("winit", (1280, 720)),
+        )
+        .unwrap_err();
+        assert_eq!(
+            error,
+            "the niri window or its output changed during capture"
+        );
+    }
+
+    #[test]
+    fn capture_refuses_a_transform_change_that_keeps_every_size() {
+        // one_output's winit output is Flipped180 (6); Normal (0) keeps the
+        // name, area, scale and image size.
+        let one = || Ok(one_output(vec![floating(7, 1, (100.0, 60.0), (300, 200))]));
+        assert_eq!(
+            capture_window_in(
+                one,
+                || Ok(quiet_now()),
+                7,
+                None,
+                || oriented("winit", 0, (1280, 720))
+            )
+            .unwrap_err(),
+            "the capture was oriented for output transform 0, but the window's output has 6"
+        );
+        let mut calls = 0;
+        let error = capture_window_in(
+            || {
+                calls += 1;
+                let transform = if calls <= 2 { "Flipped180" } else { "Normal" };
+                Ok(scene(
+                    vec![floating(7, 1, (100.0, 60.0), (300, 200))],
+                    vec![workspace(1, "winit", true, None)],
+                    vec![output("winit", 0, 0, (1280, 720), 1.5, transform)],
                     false,
                 ))
             },

@@ -1169,15 +1169,30 @@ fn screenshot_dispatch_for_pid(xid: u64, pid: Option<u32>) -> anyhow::Result<Vec
 /// are not tied to the attested compositor or orient differently, so niri
 /// never falls back to them.
 fn niri_display_capture() -> anyhow::Result<niri::DisplayCapture> {
+    // Read the transforms on both sides of the copy: a change in between
+    // would orient the buffer with a transform it was not taken in.
+    let before = niri::output_transforms()?;
     let (png, output) = screencopy_first_output()?;
     let output = output.ok_or_else(|| {
         anyhow::anyhow!("niri capture needs the wl_output name (wl_output v4) of the copied output")
     })?;
-    let png = orient_png_for_niri_transform(png, niri::output_transform(&output)?)?;
+    let transform = niri::output_transforms()?
+        .get(&output)
+        .copied()
+        .ok_or_else(|| anyhow::anyhow!("niri reports no enabled output {output:?}"))?;
+    if before.get(&output) != Some(&transform) {
+        anyhow::bail!("the transform of niri output {output:?} changed during capture");
+    }
+    let png = orient_png_for_niri_transform(png, transform)?;
     let size = image::ImageReader::new(std::io::Cursor::new(&png))
         .with_guessed_format()?
         .into_dimensions()?;
-    Ok(niri::DisplayCapture { png, output, size })
+    Ok(niri::DisplayCapture {
+        png,
+        output,
+        transform,
+        size,
+    })
 }
 
 /// niri has no per-toplevel capture protocol: crop a settled display capture

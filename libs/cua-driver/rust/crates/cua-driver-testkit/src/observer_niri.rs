@@ -182,14 +182,22 @@ pub(super) fn attest() -> Result<bool, ObserverError> {
     Ok(true)
 }
 
-/// A connection to the attested niri, with read and write deadlines. Both
-/// sockets are attested again first, so a replaced compositor is refused.
-fn attested_connection(purpose: &str) -> Result<UnixStream, ObserverError> {
-    if !attest()? {
-        return Err(ObserverError::new(
+/// Attests both sockets again. Each snapshot, journal and focus operation
+/// does this once at its start; its connections then check only niri's peer,
+/// so polling does not open a Wayland client per request.
+fn ensure_attested() -> Result<(), ObserverError> {
+    if attest()? {
+        Ok(())
+    } else {
+        Err(ObserverError::new(
             "NIRI_SOCKET is not served by the WAYLAND_DISPLAY compositor",
-        ));
+        ))
     }
+}
+
+/// A connection to the attested niri, with read and write deadlines. A peer
+/// other than the attested niri is refused.
+fn attested_connection(purpose: &str) -> Result<UnixStream, ObserverError> {
     let socket =
         niri_socket().ok_or_else(|| ObserverError::new("niri observer requires NIRI_SOCKET"))?;
     let error = |operation: &str, error: std::io::Error| {
@@ -378,6 +386,7 @@ fn fullscreen_report(state: &str) -> Option<(Duration, bool)> {
 /// so the windows are read again last and the read is retried when they
 /// changed in between, for example across a workspace switch.
 fn desktop() -> Result<Desktop, ObserverError> {
+    ensure_attested()?;
     for _ in 0..3 {
         let started = report_clock();
         let windows: Vec<Window> = query("Windows")?;
@@ -548,6 +557,7 @@ pub(super) fn snapshot(target: TargetWindow) -> Result<DesktopSnapshot, Observer
 }
 
 pub(super) fn focus_identity() -> Result<Option<u64>, ObserverError> {
+    ensure_attested()?;
     Ok(focused(&query::<Vec<Window>>("Windows")?)?.map(|window| window.id))
 }
 
@@ -632,6 +642,7 @@ pub(super) struct Journal {
 
 impl Journal {
     pub(super) fn start() -> Result<Self, ObserverError> {
+        ensure_attested()?;
         let mut stream = attested_connection("EventStream")?;
         writeln!(stream, "\"EventStream\"")
             .map_err(|error| ObserverError::new(format!("niri EventStream request: {error}")))?;
@@ -781,6 +792,7 @@ pub(super) fn wait_for_focus_transfer(
     to: TargetWindow,
     timeout: Duration,
 ) -> Result<(), ObserverError> {
+    ensure_attested()?;
     let deadline = std::time::Instant::now() + timeout;
     loop {
         let windows: Vec<Window> = query("Windows")?;
@@ -801,6 +813,7 @@ pub(super) fn wait_for_focus_transfer(
 
 /// Focuses the target through niri's own action, for test setup only.
 pub(super) fn focus(target: TargetWindow) -> Result<(), ObserverError> {
+    ensure_attested()?;
     let id = select(&query::<Vec<Window>>("Windows")?, target)?
         .ok_or_else(|| ObserverError::new("niri target window not found"))?
         .id;

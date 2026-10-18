@@ -94,7 +94,6 @@ fn bind_foreground_target(pid: u32, window_id: u64) -> ForegroundTargetGuard {
     ForegroundTargetGuard(previous)
 }
 
-#[cfg(feature = "portal-input")]
 fn current_foreground_target() -> Option<(u32, u64)> {
     CURRENT_FOREGROUND_TARGET.with(std::cell::Cell::get)
 }
@@ -772,6 +771,9 @@ fn capture_via_grim() -> anyhow::Result<Vec<u8>> {
 /// if any global is missing or the compositor flags the capture as failed.
 fn capture_via_screencopy() -> anyhow::Result<Vec<u8>> {
     let conn = Connection::connect_to_env()?;
+    if is_wayland() && niri::is_session() {
+        niri::verify_wayland_peer(&conn)?;
+    }
     let mut queue = conn.new_event_queue::<State>();
     let qh = queue.handle();
     conn.display().get_registry(&qh, ());
@@ -972,7 +974,7 @@ pub(crate) unsafe fn borrowed_fd(fd: i32) -> std::os::fd::OwnedFd {
 #[derive(Debug)]
 pub struct SurfaceIdentityUnproven {
     window_id: u64,
-    reason: &'static str,
+    reason: std::borrow::Cow<'static, str>,
 }
 
 impl std::fmt::Display for SurfaceIdentityUnproven {
@@ -999,8 +1001,15 @@ struct WaylandWindowCrop {
     height: u32,
 }
 
-fn surface_identity_unproven(window_id: u64, reason: &'static str) -> anyhow::Error {
-    SurfaceIdentityUnproven { window_id, reason }.into()
+fn surface_identity_unproven(
+    window_id: u64,
+    reason: impl Into<std::borrow::Cow<'static, str>>,
+) -> anyhow::Error {
+    SurfaceIdentityUnproven {
+        window_id,
+        reason: reason.into(),
+    }
+    .into()
 }
 
 fn attested_wayland_crop(
@@ -1112,6 +1121,9 @@ fn screenshot_dispatch_for_pid(xid: u64, pid: Option<u32>) -> anyhow::Result<Vec
             )
         });
     }
+    if is_wayland() && niri::is_session() {
+        return niri_window_capture(xid, pid);
+    }
     if is_wayland() {
         // A GNOME helper with API 9+ snapshots the window's own actor, so a
         // covering window never shows. It is then the only GNOME route: a
@@ -1136,6 +1148,35 @@ fn screenshot_dispatch_for_pid(xid: u64, pid: Option<u32>) -> anyhow::Result<Vec
         screenshot_display_dispatch,
         crate::capture::screenshot_window_bytes,
     )
+}
+
+/// niri has no per-toplevel capture protocol: crop a settled display capture
+/// to a placed, unoverlapped floating window and scale it to the window's
+/// logical size, the window-local coordinate frame input uses.
+fn niri_window_capture(xid: u64, pid: Option<u32>) -> anyhow::Result<Vec<u8>> {
+    let (png, plan) = niri::capture_window(xid, pid, screenshot_display_dispatch)
+        .map_err(|reason| surface_identity_unproven(xid, format!("niri: {reason}")))?;
+    let pixels = plan.pixels;
+    let crop = crop_png_to_rect(
+        &png,
+        pixels.x,
+        pixels.y,
+        pixels.width,
+        pixels.height,
+        &format!("niri window {xid}"),
+    )?;
+    let image = image::load_from_memory_with_format(&crop, image::ImageFormat::Png)?;
+    if (image.width(), image.height()) == (plan.width, plan.height) {
+        return Ok(crop);
+    }
+    let image = image.resize_exact(
+        plan.width,
+        plan.height,
+        image::imageops::FilterType::Triangle,
+    );
+    let mut out = std::io::Cursor::new(Vec::new());
+    image.write_to(&mut out, image::ImageFormat::Png)?;
+    Ok(out.into_inner())
 }
 
 fn crop_png_to_rect(
@@ -1199,17 +1240,17 @@ pub fn screenshot_display_dispatch() -> anyhow::Result<Vec<u8>> {
         }
         // Tier 2: native wlroots screencopy (fast, zero consent).
         match screenshot_bytes() {
-            Ok(bytes) => return orient_hyprland_display_png(bytes),
+            Ok(bytes) => return orient_display_png(bytes),
             Err(e) => {
                 tracing::debug!(
                     "wlroots screencopy unavailable ({e}); trying ext-image-copy-capture-v1"
                 );
             }
         }
-        // Tier 3: ext-image-copy-capture-v1 (sway 1.10+, labwc 0.8+, niri,
+        // Tier 3: ext-image-copy-capture-v1 (sway 1.10+, labwc 0.8+,
         // hyprland, KDE 6.2+, GNOME 47+).
         match ext_screencopy::screenshot_via_ext_copy() {
-            Ok(bytes) => return orient_hyprland_display_png(bytes),
+            Ok(bytes) => return orient_display_png(bytes),
             Err(e) => {
                 tracing::debug!(
                     "ext-image-copy-capture-v1 unavailable ({e}); trying xdg-desktop-portal"
@@ -1260,13 +1301,34 @@ fn rotate_png_for_output_transform(png: Vec<u8>, transform: u32) -> anyhow::Resu
 }
 
 /// Full-display screencopy returns the output buffer in the panel's native
-/// orientation. On Hyprland, turn it into the logical desktop frame so the
-/// screenshot matches what the user sees and what desktop-scope input uses.
-fn orient_hyprland_display_png(png: Vec<u8>) -> anyhow::Result<Vec<u8>> {
+/// orientation. On Hyprland and niri, turn it into the logical desktop frame
+/// so the screenshot matches what the user sees and what desktop-scope input
+/// uses.
+fn orient_display_png(png: Vec<u8>) -> anyhow::Result<Vec<u8>> {
+    if niri::is_session() {
+        return orient_png_for_niri_transform(png, niri::single_output_transform()?);
+    }
     if !hyprland::is_session() {
         return Ok(png);
     }
     rotate_png_for_output_transform(png, hyprland::single_output_transform()?)
+}
+
+/// niri output transforms: rotations as on Hyprland, plus the two pure
+/// flips. A nested niri forces `Flipped180` (a vertical flip) on its winit
+/// output, so its screencopy buffer is upside down. Flips combined with a
+/// quarter turn are refused rather than guessed.
+fn orient_png_for_niri_transform(png: Vec<u8>, transform: u32) -> anyhow::Result<Vec<u8>> {
+    let flip: fn(&image::DynamicImage) -> image::DynamicImage = match transform {
+        0..=3 => return rotate_png_for_output_transform(png, transform),
+        4 => image::DynamicImage::fliph,
+        6 => image::DynamicImage::flipv,
+        other => anyhow::bail!("niri output transform {other} is not supported for capture"),
+    };
+    let img = image::load_from_memory_with_format(&png, image::ImageFormat::Png)?;
+    let mut out = Vec::new();
+    flip(&img).write_to(&mut std::io::Cursor::new(&mut out), image::ImageFormat::Png)?;
+    Ok(out)
 }
 
 fn checked_shell_helper_capture(
@@ -1391,6 +1453,8 @@ impl DesktopInputSpace {
     pub fn current() -> anyhow::Result<Self> {
         let snapshot = if is_wayland() && hyprland::is_session() {
             Some(hyprland::desktop_snapshot()?)
+        } else if is_wayland() && niri::is_session() {
+            Some(niri::desktop_snapshot()?)
         } else {
             None
         };
@@ -1457,6 +1521,11 @@ fn approach_pixel(px: u32, extent: u32) -> u32 {
 /// and the virtual pointer both read this, so a desktop screenshot pixel and a
 /// pointer coordinate always share one frame.
 pub(crate) fn compositor_logical_frame() -> Option<anyhow::Result<(u32, u32)>> {
+    if niri::is_session() {
+        return Some(
+            niri::desktop_snapshot().map(|snapshot| (snapshot.frame.width, snapshot.frame.height)),
+        );
+    }
     hyprland::is_session()
         .then(|| hyprland::screen_size().map(|(width, height, _scale)| (width, height)))
 }
@@ -1474,6 +1543,8 @@ pub(crate) fn compositor_logical_frame() -> Option<anyhow::Result<(u32, u32)>> {
 fn virtual_pointer_space(output_mode: (u32, u32)) -> anyhow::Result<(i32, i32, u32, u32)> {
     let layout = if hyprland::is_session() {
         hyprland::pointer_space()?
+    } else if is_wayland() && niri::is_session() {
+        Some(niri::pointer_space()?)
     } else {
         None
     };
@@ -1835,6 +1906,20 @@ pub fn click_desktop(
     )
 }
 
+/// On niri, window-addressed pointer input waits for the layout to settle and
+/// proves each layout point lands on the target window (see
+/// [`niri::settle_pointer`]). Desktop-scope input names no window: its points
+/// are desktop-frame pixels and need no window geometry.
+fn niri_pointer_gate(window_id: Option<u64>, points: &[(i32, i32)]) -> anyhow::Result<()> {
+    if !(is_wayland() && niri::is_session()) {
+        return Ok(());
+    }
+    match window_id.or_else(|| current_foreground_target().map(|(_, id)| id)) {
+        Some(id) => niri::settle_pointer(id, points),
+        None => Ok(()),
+    }
+}
+
 /// wlroots virtual-pointer implementation of [`click`]. Falls back to libei via
 /// [`with_libei_fallback`] when the compositor exposes no virtual-pointer.
 fn click_vptr(
@@ -1853,6 +1938,10 @@ fn click_vptr(
     } else {
         sess.abs(x, y)
     };
+    niri_pointer_gate(
+        window_id,
+        &[(sess.origin_x + px as i32, sess.origin_y + py as i32)],
+    )?;
     let btn = evdev_pointer_button(button);
     for i in 0..count.max(1) {
         if i > 0 {
@@ -2048,9 +2137,20 @@ fn scroll_vptr(
     amount: u32,
     snapshot: Option<&hyprland::DesktopSnapshot>,
 ) -> anyhow::Result<()> {
+    // A niri window scroll without a point aims at the window's centre, so
+    // the wheel provably reaches the window rather than whatever is under the
+    // pointer.
+    let point = match (point, window_id) {
+        (None, Some(id)) if is_wayland() && niri::is_session() => Some(niri_window_centre(id)?),
+        (point, _) => point,
+    };
     let mut sess = open_vptr_session_in(window_id, snapshot)?;
     if let Some((x, y)) = point {
         let (px, py) = sess.abs(x, y);
+        niri_pointer_gate(
+            window_id,
+            &[(sess.origin_x + px as i32, sess.origin_y + py as i32)],
+        )?;
         sess.point_at(px, py)?;
         record_synth_cursor(sess.origin_x + px as i32, sess.origin_y + py as i32);
         std::thread::sleep(std::time::Duration::from_millis(15));
@@ -2077,6 +2177,16 @@ fn scroll_vptr(
     sess.vptr.destroy();
     sess.queue.roundtrip(&mut sess.state)?;
     Ok(())
+}
+
+fn niri_window_centre(window_id: u64) -> anyhow::Result<(i32, i32)> {
+    let (_, _, width, height) = window_geometry(window_id).ok_or_else(|| {
+        anyhow::anyhow!(
+            "foreground_unavailable: niri reports no on-screen place for window {window_id}; \
+             pass a point inside a floating window"
+        )
+    })?;
+    niri::aim(window_id, (width / 2) as i32, (height / 2) as i32)
 }
 
 /// Last cursor position the agent warped to via `move_cursor_absolute`.
@@ -2139,6 +2249,10 @@ fn move_cursor_absolute_vptr(
     let mut sess = open_vptr_session_in(window_id, snapshot)?;
     let (w, h) = (sess.output_w, sess.output_h);
     let (px, py) = sess.abs(x, y);
+    niri_pointer_gate(
+        window_id,
+        &[(sess.origin_x + px as i32, sess.origin_y + py as i32)],
+    )?;
     sess.vptr.motion_absolute(event_time_ms(), px, py, w, h);
     sess.vptr.frame();
     sess.queue.roundtrip(&mut sess.state)?;
@@ -2235,6 +2349,14 @@ fn drag_vptr(
     let (origin_x, origin_y) = (sess.origin_x, sess.origin_y);
     let clamp_xy = |x: i32, y: i32| pointer_abs(origin_x, origin_y, w, h, x, y);
     let (fx, fy) = clamp_xy(from_x, from_y);
+    let (tx, ty) = clamp_xy(to_x, to_y);
+    niri_pointer_gate(
+        window_id,
+        &[
+            (origin_x + fx as i32, origin_y + fy as i32),
+            (origin_x + tx as i32, origin_y + ty as i32),
+        ],
+    )?;
     sess.vptr.motion_absolute(event_time_ms(), fx, fy, w, h);
     sess.vptr.frame();
     sess.queue.roundtrip(&mut sess.state)?;
@@ -2253,7 +2375,6 @@ fn drag_vptr(
         sess.queue.roundtrip(&mut sess.state)?;
         std::thread::sleep(std::time::Duration::from_millis(8));
     }
-    let (tx, ty) = clamp_xy(to_x, to_y);
     sess.vptr.motion_absolute(event_time_ms(), tx, ty, w, h);
     sess.vptr.frame();
     sess.queue.roundtrip(&mut sess.state)?;
@@ -3784,7 +3905,7 @@ pub struct WaylandManagers {
     pub virtual_pointer: bool,
     pub wl_shm: bool,
     /// Staging `ext-image-copy-capture-v1` manager — sway 1.10+, labwc
-    /// 0.8+, niri, KDE 6.2+, GNOME mutter 47+.
+    /// 0.8+, KDE 6.2+, GNOME mutter 47+.
     pub ext_image_copy_capture: bool,
     /// Companion `ext-output-image-capture-source-v1` source manager —
     /// required to capture a `wl_output` via the staging protocol.
@@ -3870,7 +3991,9 @@ const _BTN_LEFT_ALIAS: u32 = BTN_LEFT;
 
 #[cfg(test)]
 mod output_transform_tests {
-    use super::{logical_output_size, rotate_png_for_output_transform};
+    use super::{
+        logical_output_size, orient_png_for_niri_transform, rotate_png_for_output_transform,
+    };
 
     #[test]
     fn logical_output_size_swaps_axes_for_quarter_turns() {
@@ -3920,6 +4043,37 @@ mod output_transform_tests {
             (blue, red)
         );
         assert!(rotate_png_for_output_transform(two_pixel_png(), 5).is_err());
+    }
+
+    #[test]
+    fn niri_capture_undoes_flipped_output_transforms() {
+        // Native frame: red above blue, as a nested niri's Flipped180 winit
+        // output delivers an upright window with red at its top.
+        let mut img = image::RgbaImage::new(2, 2);
+        let (red, blue) = (image::Rgba([255, 0, 0, 255]), image::Rgba([0, 0, 255, 255]));
+        img.put_pixel(0, 0, red);
+        img.put_pixel(1, 1, blue);
+        let mut png = Vec::new();
+        image::DynamicImage::ImageRgba8(img)
+            .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
+            .unwrap();
+        let flipped180 = decode(&orient_png_for_niri_transform(png.clone(), 6).unwrap());
+        assert_eq!(
+            (*flipped180.get_pixel(0, 1), *flipped180.get_pixel(1, 0)),
+            (red, blue)
+        );
+        let flipped = decode(&orient_png_for_niri_transform(png.clone(), 4).unwrap());
+        assert_eq!(
+            (*flipped.get_pixel(1, 0), *flipped.get_pixel(0, 1)),
+            (red, blue)
+        );
+        assert_eq!(orient_png_for_niri_transform(png.clone(), 0).unwrap(), png);
+        assert_eq!(
+            orient_png_for_niri_transform(png, 5)
+                .unwrap_err()
+                .to_string(),
+            "niri output transform 5 is not supported for capture"
+        );
     }
 }
 

@@ -153,6 +153,10 @@ fn handle_press(
     let mut sess = open_vptr_session(Some(window_id))?;
     let (w, h) = (sess.output_w, sess.output_h);
     let (px, py) = sess.abs(x, y);
+    super::niri_pointer_gate(
+        Some(window_id),
+        &[(sess.origin_x + px as i32, sess.origin_y + py as i32)],
+    )?;
     let btn = evdev_pointer_button(button);
 
     sess.vptr.motion_absolute(0, px, py, w, h);

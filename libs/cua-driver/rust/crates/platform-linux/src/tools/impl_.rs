@@ -54,6 +54,9 @@ fn desktop_point_window_resolver() -> cua_driver_core::window_target::DesktopPoi
         let (x, y) = if crate::wayland::is_wayland() && crate::wayland::hyprland::is_session() {
             let frame = crate::wayland::hyprland::desktop_frame().ok()?;
             (x + f64::from(frame.x), y + f64::from(frame.y))
+        } else if crate::wayland::is_wayland() && crate::wayland::niri::is_session() {
+            let frame = crate::wayland::niri::desktop_snapshot().ok()?.frame;
+            (x + f64::from(frame.x), y + f64::from(frame.y))
         } else {
             (x, y)
         };
@@ -12520,6 +12523,12 @@ impl Tool for GetScreenSizeTool {
                 let (frame, monitors) = crate::wayland::hyprland::screen_report()?;
                 return Ok((frame.width, frame.height, frame.scale, Some(monitors)));
             }
+            if crate::wayland::is_wayland() && crate::wayland::niri::is_session() {
+                // niri reports logical output geometry and its fractional
+                // scale over attested IPC, for a single-output layout.
+                let (frame, monitors) = crate::wayland::niri::screen_report()?;
+                return Ok((frame.width, frame.height, frame.scale, Some(monitors)));
+            }
             // X11 reports pixel dimensions; scale factor on X11 is not
             // well-defined per-monitor, so report 1.0 (matches DPI-unaware
             // assumption). Other Wayland compositors retain their existing
@@ -12766,6 +12775,12 @@ impl Tool for GetDesktopStateTool {
                     "the Hyprland monitor layout changed during get_desktop_state; call it again"
                 );
                 frame.rebase_windows(&mut windows);
+            } else if crate::wayland::is_wayland() && crate::wayland::niri::is_session() {
+                // niri window geometry is in layout coordinates; screenshot
+                // pixel (0, 0) is the single output's logical origin.
+                crate::wayland::niri::desktop_snapshot()?
+                    .frame
+                    .rebase_windows(&mut windows);
             }
             let capture_id = crate::capture_action_frame::publish_desktop(
                 &capture_service,

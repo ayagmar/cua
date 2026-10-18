@@ -1158,7 +1158,8 @@ impl Quiet {
             let settled = changed + quiet;
             if settled > started + limit {
                 return Err(foreground_unavailable(format!(
-                    "the niri layout kept changing for {} ms, so window geometry may not match the screen",
+                    "the niri layout did not stay unchanged for {} ms within {} ms, so window geometry may not match the screen",
+                    quiet.as_millis(),
                     limit.as_millis()
                 )));
             }
@@ -2300,7 +2301,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             error.to_string(),
-            "foreground_unavailable: the niri layout kept changing for 300 ms, so window geometry may not match the screen"
+            "foreground_unavailable: the niri layout did not stay unchanged for 100 ms within 300 ms, so window geometry may not match the screen"
         );
     }
 

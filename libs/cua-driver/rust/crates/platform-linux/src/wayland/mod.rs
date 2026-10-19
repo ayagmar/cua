@@ -2805,6 +2805,9 @@ fn drag_vptr(
     let (fx, fy) = clamp_xy(from_x, from_y);
     let (tx, ty) = clamp_xy(to_x, to_y);
     let mut gate = niri_pointer_gate(window_id, desktop, &sess, &[(from_x, from_y), (to_x, to_y)])?;
+    if gate.is_some() && window_id.is_none() && desktop.is_some() {
+        niri::desktop_drag_start(from_x, from_y)?;
+    }
     niri_gate_holds(&mut gate, &sess)?;
     sess.motion(fx, fy)?;
     std::thread::sleep(std::time::Duration::from_millis(15));

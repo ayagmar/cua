@@ -1418,7 +1418,11 @@ pub fn desktop_frame_window_refusal(id: u64) -> anyhow::Error {
 /// `None` for refusals this module does not word, which keep the generic
 /// suggestion.
 pub fn refusal_suggestion(detail: &str) -> Option<&'static str> {
-    let remedies: [(&[&str], &str); 8] = [
+    let remedies: [(&[&str], &str); 9] = [
+        (
+            &["click there first"],
+            "Click the drag's start point first, take a new get_desktop_state screenshot, then drag from that point.",
+        ),
         (
             &["without pid and window_id"],
             "Drop pid and window_id to act at desktop scope on the latest get_desktop_state screenshot, or pass window-local coordinates from get_window_state.",
@@ -2582,7 +2586,6 @@ impl DesktopFrame {
     /// to a tiled window can scroll the view, so it counts as a change.
     fn admit(&self, scene: &Scene, points: &[(i32, i32)], history: &History) -> Result<Expected> {
         self.holds(scene, history)?;
-        let logical = self.shown.output.logical.as_ref();
         let mut under = HashSet::new();
         for &(x, y) in points {
             if !self.area.contains(x, y) {
@@ -2591,15 +2594,7 @@ impl DesktopFrame {
                     self.output()
                 )));
             }
-            let floating: Vec<u64> = self
-                .shown
-                .windows
-                .iter()
-                .filter_map(|(id, layout)| Some((*id, floating_tile(logical?, layout.as_ref()?)?)))
-                .filter(|(_, tile)| tile.contains(f64::from(x), f64::from(y)))
-                .map(|(id, _)| id)
-                .collect();
-            under.insert(match floating.as_slice() {
+            under.insert(match self.floating_under(x, y).as_slice() {
                 [id] => Some(*id),
                 _ => None,
             });
@@ -2611,6 +2606,48 @@ impl DesktopFrame {
             },
             _ => Expected::default(),
         })
+    }
+}
+
+impl DesktopFrame {
+    /// The floating windows whose tiles cover layout point `(x, y)`.
+    fn floating_under(&self, x: i32, y: i32) -> Vec<u64> {
+        let logical = self.shown.output.logical.as_ref();
+        self.shown
+            .windows
+            .iter()
+            .filter_map(|(id, layout)| Some((*id, floating_tile(logical?, layout.as_ref()?)?)))
+            .filter(|(_, tile)| tile.contains(f64::from(x), f64::from(y)))
+            .map(|(id, _)| id)
+            .collect()
+    }
+
+    /// Refuse a drag whose press at `(x, y)` would move focus in a way
+    /// [`Self::admit`] counts as a layout change: the motions after the
+    /// press would then stop, and the app would get the press and release
+    /// as a click. A press on the one floating window there only focuses
+    /// it. Off every floating window, the press is on a tiled window or on
+    /// no window, which is safe only while a tiled window here has focus;
+    /// niri does not say where tiled windows are, so a start on another
+    /// tiled window then is not caught.
+    fn drag_start(&self, x: i32, y: i32) -> Result<()> {
+        let focused = self.shown.focused;
+        let keeps_focus = match self.floating_under(x, y).as_slice() {
+            [_] => true,
+            [] => self.shown.windows.iter().any(|(id, layout)| {
+                Some(*id) == focused
+                    && layout
+                        .as_ref()
+                        .is_some_and(|layout| layout.pos_in_scrolling_layout.is_some())
+            }),
+            several => focused.is_some_and(|id| several.contains(&id)),
+        };
+        if keeps_focus {
+            return Ok(());
+        }
+        Err(foreground_unavailable(
+            "the drag starts where niri has not focused, and its press would focus that window and stop the drag after the press, which the app would see as a click; click there first, take a new get_desktop_state screenshot, then drag",
+        ))
     }
 }
 
@@ -2719,6 +2756,16 @@ pub fn desktop_gate(points: &[(i32, i32)], capture_id: Option<&str>) -> Result<P
         expected,
         ipc,
     })
+}
+
+/// Refuse a desktop-scope drag from layout point `(x, y)` whose press would
+/// stop it (see [`DesktopFrame::drag_start`]). Call after [`desktop_gate`]
+/// admitted the drag, before the press.
+pub fn desktop_drag_start(x: i32, y: i32) -> Result<()> {
+    match latest_desktop().as_ref() {
+        Some(latest) => latest.frame.drag_start(x, y),
+        None => Ok(()),
+    }
 }
 
 fn desktop_admission(
@@ -4990,6 +5037,31 @@ mod tests {
                 .to_string(),
             "foreground_unavailable: point (10, 100) is past the edge of niri output winit, which the get_desktop_state screenshot shows"
         );
+    }
+
+    #[test]
+    fn a_desktop_drag_refuses_a_press_that_would_move_focus_off_its_start() {
+        let history = history();
+        let refusal = "foreground_unavailable: the drag starts where niri has not focused, and its press would focus that window and stop the drag after the press, which the app would see as a click; click there first, take a new get_desktop_state screenshot, then drag";
+        // Tiled window 5 has focus: a start off the floating window is on
+        // it, or on another tiled window niri cannot tell apart.
+        let frame = desktop_frame(history);
+        frame.drag_start(2500, 400).unwrap();
+        // The press focuses and raises floating window 7 without moving
+        // anything.
+        frame.drag_start(2100, 100).unwrap();
+        // Floating window 7 has focus: a start on a tiled window would move
+        // focus there and may scroll the view.
+        let frame = DesktopFrame {
+            shown: tiled_scene(Some(7)).shown("winit").unwrap(),
+            ..frame
+        };
+        let refused = frame.drag_start(2500, 400).unwrap_err().to_string();
+        assert_eq!(refused, refusal);
+        assert!(refusal_suggestion(&refused)
+            .unwrap()
+            .starts_with("Click the drag's start point first"));
+        frame.drag_start(2100, 100).unwrap();
     }
 
     #[test]

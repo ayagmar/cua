@@ -388,6 +388,13 @@ that names the remedy.
   window is such a change for the next call, and within a double or triple
   click on a tiled window that did not have focus: the train stops after the
   first press. Click once, take a new `get_desktop_state`, then double-click.
+- A desktop-scope `drag` refuses before its press when the press would move
+  focus: the start is off every floating window while no tiled window has
+  focus. Click the start point, take a new `get_desktop_state`, then drag.
+  niri does not say where tiled windows are, so a drag that starts on one
+  tiled window while another has focus is not refused: its press focuses that
+  window, the drag stops after the press, and the app gets the press and
+  release as a click.
 - `coordinate_frame:"desktop"` with a window target refuses.
 - Foreground actions activate the target, act, and give focus back to the
   window that had it. `right_click` and `hotkey` leave the target focused, as

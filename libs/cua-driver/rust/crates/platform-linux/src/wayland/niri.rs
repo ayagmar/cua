@@ -1813,6 +1813,7 @@ fn with_focused_window_in<C: FnMut(Instant) -> Result<UnixStream>, T>(
     confirm: Duration,
     body: impl FnOnce() -> Result<T>,
 ) -> Result<T> {
+    let _transaction = focus_transaction()?;
     let prior = ipc.focused_window().map_err(input_unavailable)?;
     let workspaces: Vec<IpcWorkspace> =
         ipc.query(Request::Workspaces).map_err(input_unavailable)?;
@@ -1844,6 +1845,7 @@ fn with_focus_restored_in<C: FnMut(Instant) -> Result<UnixStream>, T>(
     confirm: Duration,
     body: impl FnOnce() -> Result<T>,
 ) -> Result<T> {
+    let _transaction = focus_transaction()?;
     let prior = ipc.focused_window().map_err(input_unavailable)?;
     let workspaces: Vec<IpcWorkspace> =
         ipc.query(Request::Workspaces).map_err(input_unavailable)?;
@@ -1861,6 +1863,25 @@ fn with_focus_restored_in<C: FnMut(Instant) -> Result<UnixStream>, T>(
         Err(error) => Err(error),
     };
     finish(result, restore)
+}
+
+/// Wait for any other focus transaction to give focus back, then hold this
+/// one until it does. A worker whose call timed out still gives focus back
+/// late; meanwhile a retry on the same window would read that window as the
+/// prior focus and lose it to the late restore. The holder's waits are
+/// bounded, and a caller whose own call ends stops waiting.
+fn focus_transaction() -> Result<std::sync::MutexGuard<'static, ()>> {
+    static TRANSACTION: Mutex<()> = Mutex::new(());
+    loop {
+        match TRANSACTION.try_lock() {
+            Ok(held) => return Ok(held),
+            Err(std::sync::TryLockError::Poisoned(poisoned)) => return Ok(poisoned.into_inner()),
+            Err(std::sync::TryLockError::WouldBlock) => {
+                crate::input::action::admit(|| ())?;
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
+    }
 }
 
 /// The outcome of a focus transaction: `body`'s, with a failed restore.
@@ -4422,6 +4443,62 @@ mod tests {
             },
         )
         .unwrap_err();
+        assert_eq!(fake.lock().unwrap().focused(), Some(5));
+    }
+
+    #[test]
+    fn a_late_restore_does_not_take_focus_from_the_next_call_on_its_target() {
+        // Call 1 focused window 7 and is still running (a worker past its
+        // timeout, about to give focus back). Call 2, a retry on window 7,
+        // must not find 7 focused by call 1 and then lose it to call 1's
+        // restore while it types.
+        let fake = focus_fixture();
+        let (in_body, call_1_in_body) = std::sync::mpsc::channel();
+        let (release, released) = std::sync::mpsc::channel::<()>();
+        let (finished, call_1_finished) = std::sync::mpsc::channel();
+        let call_1 = {
+            let fake = fake.clone();
+            std::thread::spawn(move || {
+                with_focus_restored_in(
+                    &mut fake_ipc(&fake),
+                    107,
+                    7,
+                    Duration::from_millis(100),
+                    || {
+                        fake.lock()
+                            .unwrap()
+                            .reply(r#"{"Action":{"FocusWindow":{"id":7}}}"#);
+                        in_body.send(()).unwrap();
+                        released.recv().unwrap();
+                        Ok(())
+                    },
+                )
+                .unwrap();
+                finished.send(()).unwrap();
+            })
+        };
+        call_1_in_body.recv().unwrap();
+        let call_2 = {
+            let fake = fake.clone();
+            std::thread::spawn(move || {
+                with_focused_window_in(
+                    &mut fake_ipc(&fake),
+                    107,
+                    7,
+                    Duration::from_millis(100),
+                    || {
+                        // Typing outlasts call 1's restore.
+                        let _ = call_1_finished.recv_timeout(Duration::from_secs(2));
+                        Ok(fake.lock().unwrap().focused())
+                    },
+                )
+                .unwrap()
+            })
+        };
+        std::thread::sleep(Duration::from_millis(200));
+        release.send(()).unwrap();
+        call_1.join().unwrap();
+        assert_eq!(call_2.join().unwrap(), Some(7));
         assert_eq!(fake.lock().unwrap().focused(), Some(5));
     }
 

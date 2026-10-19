@@ -15222,7 +15222,7 @@ pub fn build_registry_with_provider(
                     )?;
                     // A press the tool never recorded (its recording failed
                     // and its release was not confirmed) is released too.
-                    crate::wayland::persistent_vptr::release_unrecorded(session_id)
+                    crate::wayland::persistent_vptr::release_unrecorded_at_session_end(session_id)
                         .map_err(|error| error.to_string())?;
                 } else {
                     clear_mouse_hold_after_release(&state_for_session_end, session_id);

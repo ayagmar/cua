@@ -2794,6 +2794,23 @@ fn every_wayland_input_worker_stops_when_its_call_ends() {
     );
 }
 
+/// The `steps` of a `drag` or `mouse_drag`, held to the advertised 1..=200
+/// before the button goes down: every step is a motion sent with the
+/// button held.
+fn drag_steps(args: &Value) -> usize {
+    args.u64_or("steps", 20).clamp(1, 200) as usize
+}
+
+#[cfg(test)]
+#[test]
+fn drag_steps_stay_within_the_advertised_bounds() {
+    // Without the bound, steps = u32::MAX holds the button through about
+    // 4.3 billion motions.
+    assert_eq!(drag_steps(&json!({ "steps": u32::MAX })), 200);
+    assert_eq!(drag_steps(&json!({ "steps": 0 })), 1);
+    assert_eq!(drag_steps(&json!({})), 20);
+}
+
 /// Map an input-path error to a tool error, attaching the structured
 /// foreground `code` (`foreground_unavailable` / `foreground_timeout`) when the
 /// message carries one so the caller can branch instead of parsing prose.
@@ -11396,7 +11413,7 @@ impl Tool for DragTool {
         };
 
         let duration_ms = args.u64_or("duration_ms", 500);
-        let steps = args.u64_or("steps", 20).clamp(1, 200) as usize;
+        let steps = drag_steps(&args);
         let button_str = args.str_or("button", "left");
         let button = parse_mouse_button(button_str.as_str());
         match context {
@@ -12188,7 +12205,7 @@ impl Tool for MouseDragTool {
         let from_x = hold.x;
         let from_y = hold.y;
         let duration_ms = args.u64_or("duration_ms", 500);
-        let steps = args.u64_or("steps", 20).max(1) as usize;
+        let steps = drag_steps(&args);
         crate::overlay::send_command_for(
             cursor_id.clone(),
             cursor_overlay::OverlayCommand::PinAbove(xid),

@@ -455,12 +455,27 @@ struct Session {
     deadline: Instant,
 }
 
+/// How long before its tool call's deadline a session stops: time for the
+/// keyboard's cleanup and the focus restore after it, so the call returns
+/// the keyboard's report of how far it got rather than a bare timeout.
+const REPORT_MARGIN: Duration = Duration::from_secs(2);
+
+/// When a session sending `keys` keys from `now` stops, given the deadline
+/// of the tool call it serves.
+fn session_deadline(now: Instant, keys: usize, call: Option<Instant>) -> Instant {
+    let own = now + call_budget(keys);
+    call.map_or(own, |call| {
+        own.min(call.checked_sub(REPORT_MARGIN).unwrap_or(call))
+    })
+}
+
 impl Session {
     fn begin(expected: Option<u64>, keys: usize) -> Result<Self> {
-        let mut deadline = Instant::now() + call_budget(keys);
-        if let Some(action) = crate::input::action::current() {
-            deadline = deadline.min(action.deadline());
-        }
+        let deadline = session_deadline(
+            Instant::now(),
+            keys,
+            crate::input::action::current().map(|action| action.deadline()),
+        );
         let focused = super::niri::keyboard_focus().map_err(super::niri::input_unavailable)?;
         let target = admitted_target(expected, focused)?;
         super::niri::refuse_if_locked().map_err(super::niri::input_unavailable)?;
@@ -1138,6 +1153,21 @@ mod tests {
             assert_eq!(stopped.to_string(), message);
             assert_eq!(crate::input::foreground::error_code(&stopped), None);
         }
+    }
+
+    #[test]
+    fn typing_stops_and_cleans_up_before_its_call_times_out() {
+        // A call that waited for another's focus transaction has less time
+        // left than the keyboard's own budget. The keyboard must stop, put
+        // niri's keymap back and say how far it got before the call's
+        // timeout replaces that with a bare foreground_timeout.
+        let now = Instant::now();
+        let call = now + Duration::from_secs(5);
+        assert!(session_deadline(now, 1_000, Some(call)) + CLEANUP_TIMEOUT < call);
+        // With time to spare, the keyboard keeps its own budget.
+        let far = now + Duration::from_secs(600);
+        assert_eq!(session_deadline(now, 10, Some(far)), now + call_budget(10));
+        assert_eq!(session_deadline(now, 10, None), now + call_budget(10));
     }
 
     #[test]

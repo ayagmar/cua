@@ -9389,10 +9389,7 @@ impl Tool for HotkeyTool {
                     // state-mask path. window_id is irrelevant once focused.
                     let mut combo: Vec<String> = mods_for_wayland.clone();
                     combo.push(key_for_wayland.clone());
-                    return crate::wayland::restoring_niri_focus(pid, xid, || {
-                        crate::wayland::hotkey(xid, &combo)
-                    })
-                    .map(|()| KeyRoute::Synthetic);
+                    return crate::wayland::hotkey(xid, &combo).map(|()| KeyRoute::Synthetic);
                 }
                 let m: Vec<&str> = mods.iter().map(String::as_str).collect();
                 // foreground: activate the target first, then inject the accelerator
@@ -10871,10 +10868,8 @@ impl Tool for RightClickTool {
                             }
                             if crate::wayland::wayland_input_enabled() {
                                 let (output_x, output_y) = wayland_point.unwrap_or((lxi, lyi));
-                                return crate::wayland::restoring_niri_focus(pid, xid, || {
-                                    crate::wayland::click(xid, output_x, output_y, 1, 3)
-                                })
-                                .map(|()| PointerRoute::Wayland);
+                                return crate::wayland::click(xid, output_x, output_y, 1, 3)
+                                    .map(|()| PointerRoute::Wayland);
                             }
                             if delivery.is_foreground() {
                                 return crate::input::with_x11_foreground(xid, 80, || {
@@ -10983,10 +10978,8 @@ impl Tool for RightClickTool {
             }
             if crate::wayland::wayland_input_enabled() {
                 let (output_x, output_y) = wayland_output_point.unwrap_or((xi, yi));
-                return crate::wayland::restoring_niri_focus(pid, xid, || {
-                    crate::wayland::click(xid, output_x, output_y, 1, 3)
-                })
-                .map(|()| PointerRoute::Wayland);
+                return crate::wayland::click(xid, output_x, output_y, 1, 3)
+                    .map(|()| PointerRoute::Wayland);
             }
             if delivery.is_foreground() {
                 return crate::input::with_x11_foreground(xid, 80, || {

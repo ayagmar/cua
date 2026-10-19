@@ -388,8 +388,9 @@ that names the remedy.
   window is such a change for the next call.
 - `coordinate_frame:"desktop"` with a window target refuses.
 - Foreground actions activate the target, act, and give focus back to the
-  window that had it. Text and keys use niri's own keymap, and focus is checked
-  before every key.
+  window that had it. `right_click` and `hotkey` leave the target focused, as
+  on Sway: giving focus back would close the menu they opened. Text and keys
+  use niri's own keymap, and focus is checked before every key.
 - `list_windows` gives tiled windows 0x0 bounds, and a tiled window reads
   `is_on_screen:true` only while it is the active window of a shown workspace.
   With a floating window active, visible tiled windows read `false`, so do not

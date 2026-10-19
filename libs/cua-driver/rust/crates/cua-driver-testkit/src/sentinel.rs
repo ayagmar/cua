@@ -9,6 +9,12 @@ use crate::e2e::OracleKind;
 use crate::observer::{DesktopObserver, NativeObserver, TargetWindow};
 use crate::{harness_app, spawn_in_job, BehaviorRecording, ChildReaper, Driver};
 
+/// How late the sentinel's 100 ms main-process timer may tick before the
+/// harness treats the sentinel as stalled. Its heartbeat and, on Linux, its
+/// fullscreen state file both come from that timer, which runs late on a
+/// loaded GPU-less runner.
+pub(crate) const SENTINEL_TICK_LIVENESS: Duration = Duration::from_secs(2);
+
 #[cfg(any(target_os = "linux", test))]
 #[path = "sentinel_hyprland.rs"]
 mod hyprland;
@@ -251,7 +257,7 @@ impl ForegroundSentinel {
         driver: &mut impl Driver,
         background_target: TargetWindow,
     ) -> Result<(), String> {
-        wait_for_event(&self.journal_path, "heartbeat", Duration::from_secs(2))?;
+        wait_for_event(&self.journal_path, "heartbeat", SENTINEL_TICK_LIVENESS)?;
         reset_journal(&self.journal_path)?;
 
         let canary_key = if std::env::var("CUA_E2E_WAYLAND_SESSION")
@@ -324,7 +330,7 @@ impl ForegroundSentinel {
         }
         std::thread::sleep(Duration::from_millis(150));
         reset_journal(&self.journal_path)?;
-        wait_for_event(&self.journal_path, "heartbeat", Duration::from_secs(2))?;
+        wait_for_event(&self.journal_path, "heartbeat", SENTINEL_TICK_LIVENESS)?;
         reset_journal(&self.journal_path)?;
         self.assert_background_posture(background_target)
     }
@@ -370,7 +376,7 @@ impl ForegroundSentinel {
         reset_journal(&self.journal_path)?;
         // This heartbeat checks liveness only. Windows setup input has already
         // crossed its explicit renderer/main journal barrier before the reset.
-        wait_for_event(&self.journal_path, "heartbeat", Duration::from_secs(2))?;
+        wait_for_event(&self.journal_path, "heartbeat", SENTINEL_TICK_LIVENESS)?;
         reset_journal(&self.journal_path)?;
         self.assert_background_posture(target)
     }

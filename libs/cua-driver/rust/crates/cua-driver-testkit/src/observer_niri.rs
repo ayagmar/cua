@@ -34,9 +34,13 @@ const QUERY_TIMEOUT: Duration = Duration::from_secs(1);
 const REPLY_LIMIT: u64 = 1024 * 1024;
 /// Logical pixels of slack when comparing a fullscreen tile with its output.
 const FULLSCREEN_TOLERANCE: f64 = 1.0;
-/// How long a snapshot waits for the sentinel's next fullscreen report; the
-/// sentinel writes one every 100 ms.
-const SENTINEL_REPORT_TIMEOUT: Duration = Duration::from_millis(300);
+/// How long a snapshot waits for the sentinel's next fullscreen report. The
+/// sentinel writes one on each tick of its 100 ms timer, the same timer as
+/// its heartbeat, and a snapshot needs just one tick after the window list
+/// read. That timer can stall for hundreds of milliseconds on a loaded
+/// runner, so the wait is the harness's liveness bound for it; a punctual
+/// tick still returns within about 100 ms.
+const SENTINEL_REPORT_TIMEOUT: Duration = crate::sentinel::SENTINEL_TICK_LIVENESS;
 
 /// Connects without blocking past `timeout`: a wedged compositor stops
 /// accepting, and a full backlog would block a plain connect forever.
@@ -465,8 +469,8 @@ fn sentinel_occludes(desktop: &Desktop, tile: &Window) -> Result<TargetZ, Observ
              floating windows",
         )),
         None => Err(ObserverError::new(format!(
-            "niri sentinel sent no fullscreen report within {SENTINEL_REPORT_TIMEOUT:?} \
-             of the window list read"
+            "niri sentinel wrote no fullscreen report since the window list was read, \
+             after waiting {SENTINEL_REPORT_TIMEOUT:?}: its timer is stalled"
         ))),
     }
 }
@@ -1006,6 +1010,28 @@ mod tests {
             std::thread::spawn(move || {
                 std::thread::sleep(Duration::from_millis(20));
                 std::fs::write(state, r#"{"at_ms":10100,"fullscreen":true}"#).unwrap();
+            })
+        };
+        assert_eq!(
+            fullscreen_since(&state, since, SENTINEL_REPORT_TIMEOUT),
+            Some(true)
+        );
+        writer.join().unwrap();
+    }
+
+    #[test]
+    fn a_sentinel_tick_that_runs_late_still_reports() {
+        // On a loaded runner the sentinel's timer skipped three ticks, which
+        // its heartbeat liveness bound allows.
+        let directory = tempfile::tempdir().unwrap();
+        let state = directory.path().join("sentinel-state.json");
+        let since = Duration::from_millis(10_000);
+        std::fs::write(&state, r#"{"at_ms":9999,"fullscreen":true}"#).unwrap();
+        let writer = {
+            let state = state.clone();
+            std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(400));
+                std::fs::write(state, r#"{"at_ms":10400,"fullscreen":true}"#).unwrap();
             })
         };
         assert_eq!(

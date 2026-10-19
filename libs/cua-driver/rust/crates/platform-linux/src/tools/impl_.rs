@@ -2645,6 +2645,26 @@ fn foreground_budget(chars: usize) -> std::time::Duration {
     std::time::Duration::from_millis(12_000 + (chars as u64) * 40)
 }
 
+/// [`foreground_budget`] for `chars` characters with `delay_ms` between them.
+/// The delay comes from the caller unbounded.
+fn paced_typing_budget(chars: usize, delay_ms: u64) -> std::time::Duration {
+    foreground_budget(chars)
+        + std::time::Duration::from_millis(delay_ms.saturating_mul(chars as u64))
+}
+
+#[cfg(test)]
+#[test]
+fn any_typing_delay_gives_a_budget() {
+    assert_eq!(
+        paced_typing_budget(2, 30),
+        foreground_budget(2) + std::time::Duration::from_millis(60)
+    );
+    // Sizing the call must not panic, however long the caller's delay.
+    let longest = paced_typing_budget(3, u64::MAX);
+    assert!(longest >= std::time::Duration::from_millis(u64::MAX));
+    crate::input::action::Action::new(longest);
+}
+
 /// `spawn_blocking` with a hard deadline. A wedged X server (or a client
 /// holding a server grab) must surface as a structured `foreground_timeout`
 /// error instead of a tool call that never returns. The blocking task is not
@@ -14232,8 +14252,7 @@ impl Tool for TypeTextCharsTool {
         let text_len = text.chars().count();
         let result = spawn_blocking_bounded(
             "type_text_chars",
-            foreground_budget(text_len)
-                + std::time::Duration::from_millis(delay_ms * text_len as u64),
+            paced_typing_budget(text_len, delay_ms),
             move || {
                 if crate::wayland::wayland_input_enabled() {
                     // Per-char `wtype` loop with the requested delay — mirrors the

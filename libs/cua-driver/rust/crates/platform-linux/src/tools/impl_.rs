@@ -9935,6 +9935,11 @@ impl Tool for ScrollTool {
             let x = x.round() as i32;
             let y = y.round() as i32;
             let amount = input.amount.unwrap_or(3).clamp(1, 50) as usize;
+            let ticks = wheel_ticks(
+                amount,
+                input.by.unwrap_or(cua_driver_contract::ScrollBy::Line),
+                crate::wayland::niri::is_session(),
+            );
             let display = direction.clone();
             let wayland = crate::wayland::wayland_input_enabled();
             let path = if wayland { "wayland_desktop" } else { "xtest" };
@@ -9955,7 +9960,7 @@ impl Tool for ScrollTool {
             }
             let result = tokio::task::spawn_blocking(move || {
                 if wayland {
-                    crate::wayland::scroll_desktop(&space, x, y, &direction, amount as u32)
+                    crate::wayland::scroll_desktop(&space, x, y, &direction, ticks)
                 } else {
                     crate::input::send_scroll_xtest_desktop(x, y, &direction, amount)
                 }

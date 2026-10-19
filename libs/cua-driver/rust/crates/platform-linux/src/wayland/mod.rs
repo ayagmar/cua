@@ -2291,6 +2291,35 @@ fn gated_events<S>(
     Ok(())
 }
 
+/// Move a pressed button through `path`, rechecking right before each motion.
+/// The layout or the pointer space can change while the button is held (an
+/// output rescaled by the press), and the rest of the path would then land
+/// elsewhere: a refusal releases the button where the pointer is and says how
+/// far the drag got. The press went out, so it never reads as no effect.
+fn held_motions<S>(
+    sess: &mut S,
+    path: &[(u32, u32)],
+    mut recheck: impl FnMut(&S) -> anyhow::Result<()>,
+    mut motion: impl FnMut(&mut S, (u32, u32)) -> anyhow::Result<()>,
+    release: impl FnOnce(&mut S) -> anyhow::Result<()>,
+) -> anyhow::Result<()> {
+    for (i, &point) in path.iter().enumerate() {
+        if let Err(refusal) = recheck(sess) {
+            let total = path.len();
+            match release(sess) {
+                Ok(()) => anyhow::bail!(
+                    "drag stopped after {i} of {total} motions, and the button was released: {refusal}"
+                ),
+                Err(error) => anyhow::bail!(
+                    "drag stopped after {i} of {total} motions, and releasing the button failed ({error:#}): {refusal}"
+                ),
+            }
+        }
+        motion(sess, point)?;
+    }
+    Ok(())
+}
+
 /// The legacy wlroots route sends a click at `(0, 0)` to the output centre.
 /// On Hyprland and niri callers address the global layout, where `(0, 0)` is
 /// a real point (a window or bar at the top-left corner).
@@ -2753,19 +2782,29 @@ fn drag_vptr(
     niri_gate_holds(&mut gate, &sess)?;
     sess.motion(fx, fy)?;
     std::thread::sleep(std::time::Duration::from_millis(15));
-    // The last check: refusing after the press would leave the button held.
     niri_gate_holds(&mut gate, &sess)?;
     sess.press(btn)?;
     let n = steps.max(1);
-    for s in 1..=n {
-        let t = s as f64 / n as f64;
-        let ix = (from_x as f64 + (to_x - from_x) as f64 * t).round() as i32;
-        let iy = (from_y as f64 + (to_y - from_y) as f64 * t).round() as i32;
-        let (cx, cy) = clamp_xy(ix, iy);
-        sess.motion(cx, cy)?;
-        std::thread::sleep(std::time::Duration::from_millis(8));
-    }
-    sess.motion(tx, ty)?;
+    let mut path: Vec<(u32, u32)> = (1..=n)
+        .map(|s| {
+            let t = s as f64 / n as f64;
+            let ix = (from_x as f64 + (to_x - from_x) as f64 * t).round() as i32;
+            let iy = (from_y as f64 + (to_y - from_y) as f64 * t).round() as i32;
+            clamp_xy(ix, iy)
+        })
+        .collect();
+    path.push((tx, ty));
+    held_motions(
+        &mut sess,
+        &path,
+        |sess| niri_gate_holds(&mut gate, sess),
+        |sess, (x, y)| {
+            sess.motion(x, y)?;
+            std::thread::sleep(std::time::Duration::from_millis(8));
+            Ok(())
+        },
+        |sess| sess.release(btn),
+    )?;
     // Sync the synthetic-cursor registry with the drag endpoint so a
     // subsequent `get_cursor_position` reports where we left the pointer.
     record_synth_cursor(origin_x + tx as i32, origin_y + ty as i32);
@@ -4668,6 +4707,46 @@ mod tests {
             stopped.to_string(),
             "click stopped after 1 of 3 presses: foreground_unavailable: niri window 7 closed"
         );
+    }
+
+    #[test]
+    fn a_drag_whose_layout_changes_mid_path_releases_and_reports_how_far_it_got() {
+        // The press rescales the output: the remaining motions would land
+        // elsewhere, so the drag releases the button instead of finishing.
+        #[derive(Default)]
+        struct Held {
+            moved: Vec<(u32, u32)>,
+            released: bool,
+        }
+        let mut held = Held::default();
+        let stopped = super::held_motions(
+            &mut held,
+            &[(10, 10), (20, 10), (30, 10)],
+            |held| {
+                anyhow::ensure!(
+                    held.moved.len() < 2,
+                    "foreground_unavailable: the niri pointer space changed"
+                );
+                Ok(())
+            },
+            |held, point| {
+                held.moved.push(point);
+                Ok(())
+            },
+            |held| {
+                held.released = true;
+                Ok(())
+            },
+        )
+        .unwrap_err();
+        assert_eq!(held.moved, [(10, 10), (20, 10)]);
+        assert!(held.released);
+        assert_eq!(
+            stopped.to_string(),
+            "drag stopped after 2 of 3 motions, and the button was released: \
+             foreground_unavailable: the niri pointer space changed"
+        );
+        assert_eq!(crate::input::foreground::error_code(&stopped), None);
     }
 
     #[test]

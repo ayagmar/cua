@@ -358,9 +358,17 @@ elif [[ "${SESSION_KIND}" == niri ]]; then
   # Without a GPU, niri redraws the whole output in llvmpipe for every frame
   # the behaviour recording copies, and llvmpipe's thread per CPU starves the
   # apps under test: Electron AT-SPI walks ran about 4x slower while recording
-  # on the 4-vCPU hosted runner. One render thread keeps the recording and
-  # leaves the other CPUs to the apps. It has no effect on a hardware GPU.
-  WAYLAND_DISPLAY="${CAGE_RUNTIME_DIR}/wayland-0" LP_NUM_THREADS=1 \
+  # on the 4-vCPU hosted runner. In the shared lane, one render thread keeps
+  # the recording and leaves the other CPUs to the apps. Other lanes keep
+  # llvmpipe's default: a single thread on that runner makes each niri frame
+  # take longer than the agent cursor's 50 ms animation step, so the cursor
+  # animates in slow motion past the overlay idle test's settle time. It has
+  # no effect on a hardware GPU.
+  niri_render_env=()
+  if [[ "${CUA_E2E_INTERNAL_LANE:-all}" == shared ]]; then
+    niri_render_env=(LP_NUM_THREADS=1)
+  fi
+  WAYLAND_DISPLAY="${CAGE_RUNTIME_DIR}/wayland-0" env "${niri_render_env[@]}" \
     niri --config "${NIRI_CONFIG}" >> "${COMPOSITOR_LOG}" 2>&1 &
 else
   sway --unsupported-gpu --config "${SWAY_CONFIG}" > "${COMPOSITOR_LOG}" 2>&1 &

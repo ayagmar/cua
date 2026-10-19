@@ -445,6 +445,19 @@ const NIRI_POINTER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs
 /// past its deadline.
 const NIRI_CLEANUP_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(500);
 
+/// niri did not answer a bounded round trip in time; its connection may
+/// still work.
+#[derive(Debug)]
+struct RoundTripTimedOut;
+
+impl std::fmt::Display for RoundTripTimedOut {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("niri did not answer a Wayland round trip in time")
+    }
+}
+
+impl std::error::Error for RoundTripTimedOut {}
+
 /// A dispatch state that records when its `wl_display.sync` is answered.
 trait Syncs {
     fn synced(&mut self) -> &mut bool;
@@ -477,7 +490,7 @@ where
         }
         let remaining = deadline.saturating_duration_since(std::time::Instant::now());
         if remaining.is_zero() {
-            anyhow::bail!("niri did not answer a Wayland round trip in time");
+            return Err(RoundTripTimedOut.into());
         }
         queue.flush().context("niri Wayland flush failed")?;
         let Some(guard) = queue.prepare_read() else {

@@ -379,47 +379,130 @@ fn handle_release(
     cursor_id: &str,
     button: u8,
 ) -> anyhow::Result<()> {
-    let btn = evdev_pointer_button(button);
-    let drop_entry = {
-        let entry = active
-            .get_mut(cursor_id)
-            .ok_or_else(|| anyhow::anyhow!("no held mouse button for cursor '{cursor_id}'"))?;
-        entry.vptr.button(0, btn, ButtonState::Released);
-        entry.vptr.frame();
-        roundtrip_on_persistent(cursor_id)?;
-        entry.held.remove(&btn);
-        entry.held.is_empty()
-    };
-    if drop_entry {
-        if let Some(p) = active.remove(cursor_id) {
-            p.vptr.destroy();
-            roundtrip_on_persistent(cursor_id).ok();
+    release_held(
+        active,
+        cursor_id,
+        evdev_pointer_button(button),
+        roundtrip_on_persistent,
+        forget_conn,
+    )
+}
+
+/// Release `btn` on a held cursor, dropping the cursor once it holds nothing.
+/// If niri only did not answer in time, the cursor stays for another try.
+/// If the connection failed otherwise, the compositor has already dropped
+/// the virtual pointer and its buttons, so the cursor is dropped too.
+fn release_held<D: HeldDevice>(
+    active: &mut HashMap<String, ActivePointer<D>>,
+    cursor_id: &str,
+    btn: u32,
+    mut roundtrip: impl FnMut(&str) -> anyhow::Result<()>,
+    forget: impl FnOnce(&str),
+) -> anyhow::Result<()> {
+    active
+        .get(cursor_id)
+        .ok_or_else(|| anyhow::anyhow!("no held mouse button for cursor '{cursor_id}'"))?
+        .vptr
+        .button(btn, ButtonState::Released);
+    match roundtrip(cursor_id) {
+        Err(error) if answers_later(&error) => return Err(error),
+        Err(_) => {
+            drop_cursor(active, cursor_id, forget);
+            return Ok(());
         }
-        forget_conn(cursor_id);
+        Ok(()) => {}
+    }
+    let entry = active.get_mut(cursor_id).expect("found above");
+    entry.held.remove(&btn);
+    if entry.held.is_empty() {
+        let entry = active.remove(cursor_id).expect("found above");
+        entry.vptr.destroy();
+        roundtrip(cursor_id).ok();
+        forget(cursor_id);
     }
     Ok(())
 }
 
-/// Release every button `cursor_id` holds and drop the cursor. If niri does
-/// not confirm the release, the cursor stays for another try.
 fn handle_release_unrecorded(
     active: &mut HashMap<String, ActivePointer>,
     cursor_id: &str,
+) -> anyhow::Result<bool> {
+    release_all_held(active, cursor_id, roundtrip_on_persistent, forget_conn)
+}
+
+/// Release every button `cursor_id` holds and drop the cursor. If niri only
+/// did not answer in time, the cursor stays for another try; a connection
+/// that failed otherwise took the virtual pointer and its buttons with it.
+fn release_all_held<D: HeldDevice>(
+    active: &mut HashMap<String, ActivePointer<D>>,
+    cursor_id: &str,
+    mut roundtrip: impl FnMut(&str) -> anyhow::Result<()>,
+    forget: impl FnOnce(&str),
 ) -> anyhow::Result<bool> {
     let Some(entry) = active.get(cursor_id) else {
         return Ok(false);
     };
     for button in &entry.held {
-        entry.vptr.button(0, *button, ButtonState::Released);
-        entry.vptr.frame();
+        entry.vptr.button(*button, ButtonState::Released);
     }
-    roundtrip_on_persistent(cursor_id)?;
-    if let Some(p) = active.remove(cursor_id) {
-        p.vptr.destroy();
-        roundtrip_on_persistent(cursor_id).ok();
+    match roundtrip(cursor_id) {
+        Err(error) if answers_later(&error) => Err(error),
+        Err(_) => {
+            drop_cursor(active, cursor_id, forget);
+            Ok(true)
+        }
+        Ok(()) => {
+            let entry = active.remove(cursor_id).expect("found above");
+            entry.vptr.destroy();
+            roundtrip(cursor_id).ok();
+            forget(cursor_id);
+            Ok(true)
+        }
     }
-    forget_conn(cursor_id);
-    Ok(true)
+}
+
+/// Drop a cursor whose connection is gone, as `forget` does, and its
+/// connection with it.
+fn drop_cursor<D: HeldDevice>(
+    active: &mut HashMap<String, ActivePointer<D>>,
+    cursor_id: &str,
+    forget: impl FnOnce(&str),
+) {
+    if let Some(entry) = active.remove(cursor_id) {
+        entry.vptr.destroy();
+    }
+    forget(cursor_id);
+}
+
+/// A held cursor's failed round trip. `timed_out` when niri only did not
+/// answer in time, so the connection may still work.
+#[derive(Debug)]
+struct RoundTripFailed {
+    detail: String,
+    timed_out: bool,
+}
+
+impl std::fmt::Display for RoundTripFailed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.detail)
+    }
+}
+
+impl std::error::Error for RoundTripFailed {}
+
+fn round_trip_failed(error: anyhow::Error) -> anyhow::Error {
+    RoundTripFailed {
+        timed_out: error.is::<super::RoundTripTimedOut>(),
+        detail: format!("compositor roundtrip failed: {error:#}"),
+    }
+    .into()
+}
+
+/// Whether a failed round trip left a connection that may still answer.
+fn answers_later(error: &anyhow::Error) -> bool {
+    error
+        .downcast_ref::<RoundTripFailed>()
+        .is_some_and(|failed| failed.timed_out)
 }
 
 // Process-static slots for Connection + EventQueue keyed by cursor_id. The
@@ -460,8 +543,7 @@ fn roundtrip_on_persistent(cursor_id: &str) -> anyhow::Result<()> {
             .ok_or_else(|| anyhow::anyhow!("no persistent connection for cursor '{cursor_id}'"))?;
         let mut tmp = super::State::default();
         let deadline = niri.then(|| std::time::Instant::now() + super::NIRI_ROUNDTRIP_TIMEOUT);
-        super::sync_by(conn, queue, &mut tmp, deadline)
-            .map_err(|e| anyhow::anyhow!("compositor roundtrip failed: {e:#}"))
+        super::sync_by(conn, queue, &mut tmp, deadline).map_err(round_trip_failed)
     })
 }
 
@@ -856,6 +938,69 @@ mod tests {
         assert!(device.0.borrow().is_empty());
         // The button stays held for the next call's motion or release.
         assert!(active.contains_key("drag"));
+    }
+
+    /// Release `drag`'s button with `release_held`, or with
+    /// `release_all_held` when `unrecorded`, through `roundtrip`.
+    fn release_drag(
+        active: &mut HashMap<String, ActivePointer<&Recorder>>,
+        unrecorded: bool,
+        roundtrip: impl FnMut(&str) -> anyhow::Result<()>,
+        forgotten: &mut bool,
+    ) -> anyhow::Result<()> {
+        let forget = |_: &str| *forgotten = true;
+        if unrecorded {
+            release_all_held(active, "drag", roundtrip, forget).map(|held| assert!(held))
+        } else {
+            release_held(active, "drag", 0x110, roundtrip, forget)
+        }
+    }
+
+    #[test]
+    fn a_release_niri_did_not_answer_in_time_keeps_the_cursor_for_another_try() {
+        for unrecorded in [false, true] {
+            let device = Recorder::default();
+            let mut active = held(&device);
+            let mut forgotten = false;
+            let refused = release_drag(
+                &mut active,
+                unrecorded,
+                |_| Err(round_trip_failed(crate::wayland::RoundTripTimedOut.into())),
+                &mut forgotten,
+            )
+            .unwrap_err();
+            assert_eq!(
+                refused.to_string(),
+                "compositor roundtrip failed: niri did not answer a Wayland round trip in time"
+            );
+            assert!(active.contains_key("drag"), "unrecorded: {unrecorded}");
+            assert!(!forgotten);
+        }
+    }
+
+    #[test]
+    fn a_release_on_a_dead_connection_drops_the_cursor() {
+        // The compositor dropped the client, and with it the virtual pointer
+        // and its buttons: keeping the cursor would refuse every new press.
+        for unrecorded in [false, true] {
+            let device = Recorder::default();
+            let mut active = held(&device);
+            let mut forgotten = false;
+            release_drag(
+                &mut active,
+                unrecorded,
+                |_| {
+                    Err(round_trip_failed(anyhow::anyhow!(
+                        "niri Wayland flush failed: Broken pipe"
+                    )))
+                },
+                &mut forgotten,
+            )
+            .unwrap();
+            assert!(active.is_empty(), "unrecorded: {unrecorded}");
+            assert!(forgotten);
+            assert_eq!(*device.0.borrow(), [Event::Release(0x110), Event::Destroy]);
+        }
     }
 
     #[test]

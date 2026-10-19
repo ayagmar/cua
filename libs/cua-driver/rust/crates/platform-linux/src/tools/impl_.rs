@@ -12186,9 +12186,9 @@ impl Tool for MouseDragTool {
                 ))
                 .with_structured(mouse_hold_json(&cursor_id, Some(&hold)))
             }
-            Err(e) if e.is::<crate::wayland::persistent_vptr::HeldPointerReleased>() => {
-                // The persistent pointer released the button: the cursor
-                // holds nothing any more.
+            Err(e) if e.is::<crate::wayland::persistent_vptr::HeldPointerEnded>() => {
+                // The persistent pointer released the button and discarded
+                // the cursor: it holds nothing any more.
                 self.state.mouse_hold.lock().unwrap().remove(&cursor_id);
                 crate::overlay::send_command_for(
                     cursor_id.clone(),

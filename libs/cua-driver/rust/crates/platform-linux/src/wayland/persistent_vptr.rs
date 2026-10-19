@@ -91,18 +91,24 @@ impl HeldDevice for ZwlrVirtualPointerV1 {
 }
 
 /// A held cursor's motion refused because the pointer space it scales by
-/// changed. Its buttons were released where the pointer was, so the app may
-/// have seen a drop: the cursor holds nothing any more.
+/// changed, or could not be read. The owner sent the release of its buttons
+/// where the pointer was, so the app may have seen a drop, and discarded the
+/// cursor: it holds nothing any more, whether or not niri confirmed the
+/// release.
 #[derive(Debug)]
-pub struct HeldPointerReleased(String);
+pub struct HeldPointerEnded {
+    detail: String,
+    /// niri answered the round trip after the release.
+    pub release_confirmed: bool,
+}
 
-impl std::fmt::Display for HeldPointerReleased {
+impl std::fmt::Display for HeldPointerEnded {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(&self.0)
+        f.write_str(&self.detail)
     }
 }
 
-impl std::error::Error for HeldPointerReleased {}
+impl std::error::Error for HeldPointerEnded {}
 
 /// State held inside the owner thread for one cursor_id.
 struct ActivePointer<D = ZwlrVirtualPointerV1> {
@@ -269,14 +275,20 @@ fn move_held<D: HeldDevice>(
             .trim_start_matches("foreground_unavailable: ")
             .to_owned();
         return Err(match released {
-            Ok(()) => HeldPointerReleased(format!(
-                "{refusal}; no motion was sent, and the held button was released where the pointer was, which the app may take as a drop"
-            ))
-            .into(),
-            Err(error) => anyhow::anyhow!(
-                "{refusal}; no motion was sent, and releasing the held button failed: {error:#}"
-            ),
-        });
+            Ok(()) => HeldPointerEnded {
+                detail: format!(
+                    "{refusal}; no motion was sent, and the held button was released where the pointer was, which the app may take as a drop"
+                ),
+                release_confirmed: true,
+            },
+            Err(error) => HeldPointerEnded {
+                detail: format!(
+                    "{refusal}; no motion was sent, and the held button's release was sent but not confirmed ({error:#}); the cursor no longer holds it"
+                ),
+                release_confirmed: false,
+            },
+        }
+        .into());
     }
     let (px, py) = super::pointer_abs(
         entry.origin_x,
@@ -494,7 +506,9 @@ mod tests {
             |_| Ok(()),
         )
         .unwrap_err();
-        assert!(stopped.downcast_ref::<HeldPointerReleased>().is_some());
+        assert!(stopped
+            .downcast_ref::<HeldPointerEnded>()
+            .is_some_and(|ended| ended.release_confirmed));
         assert_eq!(
             stopped.to_string(),
             "the niri pointer space changed from (0, 0, 1280, 720) to (0, 0, 854, 480); take a new screenshot; no motion was sent, and the held button was released where the pointer was, which the app may take as a drop"
@@ -503,6 +517,33 @@ mod tests {
             device.0.borrow()[1..],
             [Event::Release(0x110), Event::Destroy]
         );
+        assert!(active.is_empty());
+    }
+
+    #[test]
+    fn a_held_motion_whose_cleanup_niri_never_answers_still_ends_the_hold() {
+        // niri stopped answering: the pointer space cannot be read and the
+        // release is not confirmed. The owner discards the cursor anyway, so
+        // the tool must learn that the hold ended, not see a plain failure.
+        let device = Recorder::default();
+        let mut active = held(&device);
+        let stopped = move_held(
+            &mut active,
+            "drag",
+            (200, 200),
+            || anyhow::bail!("niri did not answer in time"),
+            |_| anyhow::bail!("niri did not answer a Wayland round trip in time"),
+        )
+        .unwrap_err();
+        let ended = stopped
+            .downcast_ref::<HeldPointerEnded>()
+            .expect("the hold ended");
+        assert!(!ended.release_confirmed);
+        assert_eq!(
+            stopped.to_string(),
+            "niri did not answer in time; no motion was sent, and the held button's release was sent but not confirmed (niri did not answer a Wayland round trip in time); the cursor no longer holds it"
+        );
+        assert_eq!(*device.0.borrow(), [Event::Release(0x110), Event::Destroy]);
         assert!(active.is_empty());
     }
 }

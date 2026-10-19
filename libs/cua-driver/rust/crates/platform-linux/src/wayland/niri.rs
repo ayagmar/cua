@@ -1799,6 +1799,46 @@ fn with_focused_window_in<C: FnMut(Instant) -> Result<UnixStream>, T>(
         .map_err(input_unavailable)
         .and_then(|()| body());
     let restore = restore_focus(ipc, prior.as_ref(), &workspaces, &target, confirm);
+    finish(result, restore)
+}
+
+/// Run `body`, which focuses niri window `id` of `pid` itself once its input
+/// is admitted, then undo what that focus changed, as [`with_focused_window`]
+/// does. Unlike it, nothing is focused before `body`: a body refused before it
+/// focused the window leaves focus, the view and the floating stacking order
+/// as they were.
+pub fn with_focus_restored<T>(pid: u32, id: u64, body: impl FnOnce() -> Result<T>) -> Result<T> {
+    with_focus_restored_in(&mut ipc(), pid, id, FOCUS_CONFIRM_TIMEOUT, body)
+}
+
+fn with_focus_restored_in<C: FnMut(Instant) -> Result<UnixStream>, T>(
+    ipc: &mut Ipc<C>,
+    pid: u32,
+    id: u64,
+    confirm: Duration,
+    body: impl FnOnce() -> Result<T>,
+) -> Result<T> {
+    let prior = ipc.focused_window().map_err(input_unavailable)?;
+    let workspaces: Vec<IpcWorkspace> =
+        ipc.query(Request::Workspaces).map_err(input_unavailable)?;
+    let Some(target) = focus_target(ipc, id, Some(pid)).map_err(input_unavailable)? else {
+        return body();
+    };
+    let result = body();
+    let restore = match ipc.focused_window() {
+        Ok(now)
+            if now.as_ref().map(|window| window.id) == prior.as_ref().map(|window| window.id) =>
+        {
+            Ok(())
+        }
+        Ok(_) => restore_focus(ipc, prior.as_ref(), &workspaces, &target, confirm),
+        Err(error) => Err(error),
+    };
+    finish(result, restore)
+}
+
+/// The outcome of a focus transaction: `body`'s, with a failed restore.
+fn finish<T>(result: Result<T>, restore: Result<()>) -> Result<T> {
     match (result, restore) {
         (Ok(value), Ok(())) => Ok(value),
         (Err(error), Ok(())) => Err(error),
@@ -4158,6 +4198,55 @@ mod tests {
             error.to_string(),
             "foreground_unavailable: the niri overview is open, so input would go to the overview instead of the window"
         );
+    }
+
+    #[test]
+    fn a_pointer_action_refused_before_it_focused_leaves_niri_untouched() {
+        let fake = focus_fixture();
+        let error = with_focus_restored_in(
+            &mut fake_ipc(&fake),
+            107,
+            7,
+            Duration::from_millis(50),
+            || Err::<(), _>(foreground_unavailable("the point is outside niri window 7")),
+        )
+        .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "foreground_unavailable: the point is outside niri window 7"
+        );
+        let fake = fake.lock().unwrap();
+        assert!(
+            !fake
+                .requests
+                .iter()
+                .any(|request| request.contains("Action")),
+            "a refused action sent {:?}",
+            fake.requests
+        );
+        assert_eq!(fake.focused(), Some(5));
+    }
+
+    #[test]
+    fn a_pointer_action_that_focused_its_target_gives_focus_back() {
+        let fake = focus_fixture();
+        let seen = with_focus_restored_in(
+            &mut fake_ipc(&fake),
+            107,
+            7,
+            Duration::from_millis(100),
+            || {
+                // The pointer gate focuses the target once it admits the input.
+                let mut fake = fake.lock().unwrap();
+                fake.reply(r#"{"Action":{"FocusWindow":{"id":7}}}"#);
+                Ok(fake.focused())
+            },
+        )
+        .unwrap();
+        assert_eq!(seen, Some(7));
+        let fake = fake.lock().unwrap();
+        assert_eq!(fake.focused(), Some(5));
+        assert!(fake.active(1));
     }
 
     #[test]

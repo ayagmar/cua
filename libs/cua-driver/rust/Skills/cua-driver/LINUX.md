@@ -385,7 +385,9 @@ that names the remedy.
   screenshot. It refuses before there is one, when `capture_id` names an older
   one, after 60 s, past the output edge, and once niri reports a layout or
   focus change; take a new screenshot then. A click that focuses another
-  window is such a change for the next call.
+  window is such a change for the next call, and within a double or triple
+  click on a tiled window that did not have focus: the train stops after the
+  first press. Click once, take a new `get_desktop_state`, then double-click.
 - `coordinate_frame:"desktop"` with a window target refuses.
 - Foreground actions activate the target, act, and give focus back to the
   window that had it. `right_click` and `hotkey` leave the target focused, as

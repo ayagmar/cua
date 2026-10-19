@@ -2298,14 +2298,14 @@ fn gated_events<S>(
 /// far the drag got. The press went out, so it never reads as no effect.
 fn held_motions<S>(
     sess: &mut S,
-    path: &[(u32, u32)],
+    path: impl ExactSizeIterator<Item = (u32, u32)>,
     mut recheck: impl FnMut(&S) -> anyhow::Result<()>,
     mut motion: impl FnMut(&mut S, (u32, u32)) -> anyhow::Result<()>,
     release: impl FnOnce(&mut S) -> anyhow::Result<()>,
 ) -> anyhow::Result<()> {
-    for (i, &point) in path.iter().enumerate() {
+    let total = path.len();
+    for (i, point) in path.enumerate() {
         if let Err(refusal) = recheck(sess) {
-            let total = path.len();
             match release(sess) {
                 Ok(()) => anyhow::bail!(
                     "drag stopped after {i} of {total} motions, and the button was released: {refusal}"
@@ -2758,6 +2758,32 @@ pub fn drag_desktop(
     )
 }
 
+/// The most intermediate motions a drag sends: the `steps` maximum the drag
+/// tools advertise.
+const MAX_DRAG_STEPS: u32 = 200;
+
+/// A drag's motions after its press: `steps` points from `from` toward `to`,
+/// each aimed through `aim`, then `end`. `steps` is clamped to
+/// `1..=MAX_DRAG_STEPS`, and each point is computed only when it is sent.
+fn drag_path(
+    from: (i32, i32),
+    to: (i32, i32),
+    steps: u32,
+    end: (u32, u32),
+    mut aim: impl FnMut(i32, i32) -> (u32, u32),
+) -> impl ExactSizeIterator<Item = (u32, u32)> {
+    let n = steps.clamp(1, MAX_DRAG_STEPS) as usize;
+    (1..n + 2).map(move |s| {
+        if s > n {
+            return end;
+        }
+        let t = s as f64 / n as f64;
+        let x = (f64::from(from.0) + f64::from(to.0 - from.0) * t).round() as i32;
+        let y = (f64::from(from.1) + f64::from(to.1 - from.1) * t).round() as i32;
+        aim(x, y)
+    })
+}
+
 /// wlroots virtual-pointer implementation of [`drag`].
 #[allow(clippy::too_many_arguments)]
 fn drag_vptr(
@@ -2784,19 +2810,10 @@ fn drag_vptr(
     std::thread::sleep(std::time::Duration::from_millis(15));
     niri_gate_holds(&mut gate, &sess)?;
     sess.press(btn)?;
-    let n = steps.max(1);
-    let mut path: Vec<(u32, u32)> = (1..=n)
-        .map(|s| {
-            let t = s as f64 / n as f64;
-            let ix = (from_x as f64 + (to_x - from_x) as f64 * t).round() as i32;
-            let iy = (from_y as f64 + (to_y - from_y) as f64 * t).round() as i32;
-            clamp_xy(ix, iy)
-        })
-        .collect();
-    path.push((tx, ty));
+    let path = drag_path((from_x, from_y), (to_x, to_y), steps, (tx, ty), clamp_xy);
     held_motions(
         &mut sess,
-        &path,
+        path,
         |sess| niri_gate_holds(&mut gate, sess),
         |sess, (x, y)| {
             sess.motion(x, y)?;
@@ -4710,6 +4727,20 @@ mod tests {
     }
 
     #[test]
+    fn a_drag_sends_at_most_the_advertised_steps_and_ends_on_its_endpoint() {
+        // `steps` comes from the caller, after the button is already down.
+        let path = super::drag_path((0, 0), (100, 50), u32::MAX, (100, 50), |x, y| {
+            (x as u32, y as u32)
+        });
+        assert_eq!(path.len(), 201);
+        let points: Vec<_> = path.collect();
+        assert_eq!(points[99], (50, 25));
+        assert_eq!(points.last(), Some(&(100, 50)));
+        let path = super::drag_path((0, 0), (10, 0), 0, (10, 0), |x, y| (x as u32, y as u32));
+        assert_eq!(path.collect::<Vec<_>>(), [(10, 0), (10, 0)]);
+    }
+
+    #[test]
     fn a_drag_whose_layout_changes_mid_path_releases_and_reports_how_far_it_got() {
         // The press rescales the output: the remaining motions would land
         // elsewhere, so the drag releases the button instead of finishing.
@@ -4721,7 +4752,7 @@ mod tests {
         let mut held = Held::default();
         let stopped = super::held_motions(
             &mut held,
-            &[(10, 10), (20, 10), (30, 10)],
+            [(10, 10), (20, 10), (30, 10)].into_iter(),
             |held| {
                 anyhow::ensure!(
                     held.moved.len() < 2,

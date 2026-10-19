@@ -11293,7 +11293,7 @@ impl Tool for DragTool {
         };
 
         let duration_ms = args.u64_or("duration_ms", 500);
-        let steps = args.u64_or("steps", 20) as usize;
+        let steps = args.u64_or("steps", 20).clamp(1, 200) as usize;
         let button_str = args.str_or("button", "left");
         let button = parse_mouse_button(button_str.as_str());
         match context {

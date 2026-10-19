@@ -280,6 +280,35 @@ struct Fixture {
     window_y: f64,
     name: &'static str,
     journal: FixtureJournal,
+    /// The last lines a Tauri host and its WebKit processes wrote to stderr.
+    stderr_tail: Option<StderrTail>,
+}
+
+type StderrTail = std::sync::Arc<std::sync::Mutex<std::collections::VecDeque<String>>>;
+
+/// Copy a host's stderr to the test's own and keep its last lines.
+fn tee_stderr(stderr: std::process::ChildStderr) -> StderrTail {
+    use std::io::{BufRead as _, Write as _};
+    let tail = StderrTail::default();
+    let kept = tail.clone();
+    thread::spawn(move || {
+        for line in std::io::BufReader::new(stderr)
+            .lines()
+            .map_while(Result::ok)
+        {
+            // Write to fd 2 itself, as the inherited stream did, not
+            // through the test harness's output capture.
+            let _ = writeln!(std::io::stderr(), "{line}");
+            let mut kept = kept
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if kept.len() == 40 {
+                kept.pop_front();
+            }
+            kept.push_back(line);
+        }
+    });
+    tail
 }
 
 fn evidence_for_driver(driver: &McpDriver) -> Evidence {
@@ -323,7 +352,11 @@ fn launch_host_with_evidence(spec: &HostSpec, scenario: &str, evidence: &mut Evi
         .args(&spec.args)
         .env("CUA_E2E_FIXTURE_JOURNAL_URL", journal.url())
         .stdout(Stdio::inherit())
-        .stderr(Stdio::inherit());
+        .stderr(if spec.name == "tauri" {
+            Stdio::piped()
+        } else {
+            Stdio::inherit()
+        });
     match spec.name {
         "electron" => {
             command.env(
@@ -350,8 +383,9 @@ fn launch_host_with_evidence(spec: &HostSpec, scenario: &str, evidence: &mut Evi
                 .collect::<std::collections::HashSet<_>>()
         })
         .unwrap_or_default();
-    let child = spawn_in_job(&mut command)
+    let mut child = spawn_in_job(&mut command)
         .unwrap_or_else(|error| panic!("failed to launch {} fixture: {error}", spec.name));
+    let stderr_tail = child.stderr.take().map(tee_stderr);
     let pid = child.id();
     driver.reaper().push(child);
 
@@ -378,6 +412,7 @@ fn launch_host_with_evidence(spec: &HostSpec, scenario: &str, evidence: &mut Evi
                         window_y: bounds["y"].as_f64().unwrap_or(0.0),
                         name: spec.name,
                         journal,
+                        stderr_tail,
                     };
                     // Electron and Tauri can need more than the generic fixture
                     // budget to start their renderer and expose the remote
@@ -442,16 +477,34 @@ fn snapshot(fixture: &mut Fixture) -> ToolResponse {
 
 /// A web fixture page laid out collapsed (seen with WebKitGTK on a runner
 /// without a DRM render node) stacks its controls, so pointer rows would
-/// fail as misdelivered. Report the host's renderer instead.
+/// fail as misdelivered. Report the host's renderer instead, with what the
+/// page and the host process reported about it.
 fn assert_laid_out(fixture: &Fixture) {
-    let client_height = fixture.journal.snapshot()["scroll-tall"]["clientHeight"].as_u64();
-    assert_ne!(
-        client_height,
-        Some(0),
+    let scroll = &fixture.journal.snapshot()["scroll-tall"];
+    if scroll["clientHeight"].as_u64() != Some(0) {
+        return;
+    }
+    let renderer_env: Vec<String> = std::env::vars()
+        .filter(|(name, _)| name.starts_with("WEBKIT_") || name.starts_with("GDK_"))
+        .map(|(name, value)| format!("{name}={value}"))
+        .collect();
+    let stderr_tail = fixture.stderr_tail.as_ref().map_or_else(
+        || "not captured".to_owned(),
+        |tail| {
+            let tail = tail
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            tail.iter().cloned().collect::<Vec<_>>().join("\n")
+        },
+    );
+    panic!(
         "environment: the {} fixture page laid out collapsed (#scroll-tall clientHeight 0), \
          so its controls are not where its accessibility tree places them; this host's web \
-         renderer is broken, and no row on this fixture can be judged",
-        fixture.name
+         renderer is broken, and no row on this fixture can be judged\n\
+         page layout: {}\nhost env: {}\nhost stderr tail:\n{stderr_tail}",
+        fixture.name,
+        scroll["layout"],
+        renderer_env.join(" "),
     );
 }
 

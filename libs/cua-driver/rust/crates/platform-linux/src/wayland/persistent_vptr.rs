@@ -28,7 +28,7 @@
 //!   command on a fresh one, emitting a typed error for the in-flight call.
 
 use std::collections::{HashMap, HashSet};
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 use std::thread;
 
 use crossbeam_channel::{bounded, Receiver, Sender};
@@ -36,6 +36,7 @@ use wayland_client::{protocol::wl_pointer::ButtonState, Connection};
 use wayland_protocols_wlr::virtual_pointer::v1::client::zwlr_virtual_pointer_v1::ZwlrVirtualPointerV1;
 
 use super::{evdev_pointer_button, open_vptr_session};
+use crate::input::action::Action;
 
 /// One in-flight command from the public API to the owner thread.
 enum Cmd {
@@ -45,12 +46,16 @@ enum Cmd {
         x: i32,
         y: i32,
         button: u8,
+        /// The tool call the press serves: bound on the owner thread, so a
+        /// call that has ended presses nothing.
+        action: Option<Arc<Action>>,
         reply: Sender<anyhow::Result<()>>,
     },
     MoveTo {
         cursor_id: String,
         x: i32,
         y: i32,
+        action: Option<Arc<Action>>,
         reply: Sender<anyhow::Result<()>>,
     },
     Release {
@@ -64,6 +69,53 @@ enum Cmd {
         cursor_id: String,
         reply: Sender<anyhow::Result<()>>,
     },
+}
+
+/// What the owner thread does with each command. [`Pointers`] drives the
+/// compositor's virtual pointers.
+trait Owner {
+    fn press(
+        &mut self,
+        cursor_id: &str,
+        window_id: u64,
+        x: i32,
+        y: i32,
+        button: u8,
+    ) -> anyhow::Result<()>;
+    fn move_to(&mut self, cursor_id: &str, x: i32, y: i32) -> anyhow::Result<()>;
+    fn release(&mut self, cursor_id: &str, button: u8) -> anyhow::Result<()>;
+    fn forget(&mut self, cursor_id: &str);
+}
+
+/// The held cursors, by cursor_id.
+#[derive(Default)]
+struct Pointers(HashMap<String, ActivePointer>);
+
+impl Owner for Pointers {
+    fn press(
+        &mut self,
+        cursor_id: &str,
+        window_id: u64,
+        x: i32,
+        y: i32,
+        button: u8,
+    ) -> anyhow::Result<()> {
+        handle_press(&mut self.0, cursor_id, window_id, x, y, button)
+    }
+
+    fn move_to(&mut self, cursor_id: &str, x: i32, y: i32) -> anyhow::Result<()> {
+        handle_move(&mut self.0, cursor_id, x, y)
+    }
+
+    fn release(&mut self, cursor_id: &str, button: u8) -> anyhow::Result<()> {
+        handle_release(&mut self.0, cursor_id, button)
+    }
+
+    fn forget(&mut self, cursor_id: &str) {
+        if let Some(p) = self.0.remove(cursor_id) {
+            p.vptr.destroy();
+        }
+    }
 }
 
 /// The device a held cursor drives: the virtual pointer, or a recording
@@ -133,14 +185,13 @@ fn tx() -> &'static Sender<Cmd> {
         let (tx, rx) = bounded::<Cmd>(32);
         thread::Builder::new()
             .name("cua-persistent-vptr".into())
-            .spawn(move || owner_thread(rx))
+            .spawn(move || owner_thread(rx, Pointers::default()))
             .expect("spawn cua-persistent-vptr thread");
         tx
     })
 }
 
-fn owner_thread(rx: Receiver<Cmd>) {
-    let mut active: HashMap<String, ActivePointer> = HashMap::new();
+fn owner_thread(rx: Receiver<Cmd>, mut owner: impl Owner) {
     while let Ok(cmd) = rx.recv() {
         match cmd {
             Cmd::Press {
@@ -149,32 +200,32 @@ fn owner_thread(rx: Receiver<Cmd>) {
                 x,
                 y,
                 button,
+                action,
                 reply,
             } => {
-                let r = handle_press(&mut active, &cursor_id, window_id, x, y, button);
-                let _ = reply.send(r);
+                let _bound = action.map(crate::input::action::bind);
+                let _ = reply.send(owner.press(&cursor_id, window_id, x, y, button));
             }
             Cmd::MoveTo {
                 cursor_id,
                 x,
                 y,
+                action,
                 reply,
             } => {
-                let r = handle_move(&mut active, &cursor_id, x, y);
-                let _ = reply.send(r);
+                let _bound = action.map(crate::input::action::bind);
+                let _ = reply.send(owner.move_to(&cursor_id, x, y));
             }
+            // Releases are cleanup: they go out also once the call is over.
             Cmd::Release {
                 cursor_id,
                 button,
                 reply,
             } => {
-                let r = handle_release(&mut active, &cursor_id, button);
-                let _ = reply.send(r);
+                let _ = reply.send(owner.release(&cursor_id, button));
             }
             Cmd::Forget { cursor_id, reply } => {
-                if let Some(p) = active.remove(&cursor_id) {
-                    p.vptr.destroy();
-                }
+                owner.forget(&cursor_id);
                 let _ = reply.send(Ok(()));
             }
         }
@@ -298,7 +349,7 @@ fn move_held<D: HeldDevice>(
         x,
         y,
     );
-    entry.vptr.motion(px, py, (entry.out_w, entry.out_h));
+    crate::input::action::admit(|| entry.vptr.motion(px, py, (entry.out_w, entry.out_h)))?;
     roundtrip(cursor_id)
 }
 
@@ -373,53 +424,101 @@ fn roundtrip_on_persistent(cursor_id: &str) -> anyhow::Result<()> {
 
 // ── public API ────────────────────────────────────────────────────────────
 
+/// Send one command to the owner thread on `tx` and wait for its reply.
+fn request(
+    tx: &Sender<Cmd>,
+    cmd: impl FnOnce(Sender<anyhow::Result<()>>) -> Cmd,
+) -> anyhow::Result<()> {
+    let (tx_r, rx_r) = bounded(1);
+    tx.send(cmd(tx_r))
+        .map_err(|e| anyhow::anyhow!("cua-persistent-vptr thread is dead: {e}"))?;
+    rx_r.recv()
+        .map_err(|e| anyhow::anyhow!("reply channel closed: {e}"))?
+}
+
 /// Press and HOLD `button` (evdev code) at output coordinates `(x, y)` on the
 /// toplevel identified by `window_id`. Subsequent `move_to` / `release` calls
 /// targeting the same `cursor_id` reuse the same virtual-pointer device, so
 /// the compositor treats the sequence as one logical drag rather than as
 /// independent clicks. Errors if `cursor_id` already has a held button.
-pub fn press(cursor_id: &str, window_id: u64, x: i32, y: i32, button: u8) -> anyhow::Result<()> {
-    let (tx_r, rx_r) = bounded(1);
-    tx().send(Cmd::Press {
+///
+/// The press serves the tool call bound to this thread: a call that has
+/// ended presses nothing. Once the button is down, `record` notes the hold
+/// for the caller, under that call; if the call ended meanwhile, the button
+/// is released instead, so no press stays down that nobody recorded.
+pub fn press(
+    cursor_id: &str,
+    window_id: u64,
+    x: i32,
+    y: i32,
+    button: u8,
+    record: impl FnOnce(),
+) -> anyhow::Result<()> {
+    press_on(tx(), cursor_id, window_id, x, y, button, record)
+}
+
+fn press_on(
+    tx: &Sender<Cmd>,
+    cursor_id: &str,
+    window_id: u64,
+    x: i32,
+    y: i32,
+    button: u8,
+    record: impl FnOnce(),
+) -> anyhow::Result<()> {
+    request(tx, |reply| Cmd::Press {
         cursor_id: cursor_id.to_string(),
         window_id,
         x,
         y,
         button,
-        reply: tx_r,
-    })
-    .map_err(|e| anyhow::anyhow!("cua-persistent-vptr thread is dead: {e}"))?;
-    rx_r.recv()
-        .map_err(|e| anyhow::anyhow!("reply channel closed: {e}"))?
+        action: crate::input::action::current(),
+        reply,
+    })?;
+    // A call that ended while the button went down cannot record the hold:
+    // its caller stopped waiting. Release the button instead.
+    let Err(ended) = crate::input::action::admit(record) else {
+        return Ok(());
+    };
+    match release_on(tx, cursor_id, button) {
+        Ok(()) => Err(anyhow::anyhow!(
+            "{ended}; the button went down as the call ended, and it was released"
+        )),
+        Err(error) => Err(anyhow::anyhow!(
+            "{ended}; the button went down as the call ended, and its release failed: {error:#}"
+        )),
+    }
 }
 
-/// Emit motion_absolute on the held cursor's virtual-pointer. Errors if there
-/// is no held button for `cursor_id`.
+/// Emit motion_absolute on the held cursor's virtual-pointer, for the tool
+/// call bound to this thread. Errors if there is no held button for
+/// `cursor_id`.
 pub fn move_to(cursor_id: &str, x: i32, y: i32) -> anyhow::Result<()> {
-    let (tx_r, rx_r) = bounded(1);
-    tx().send(Cmd::MoveTo {
+    move_on(tx(), cursor_id, x, y)
+}
+
+fn move_on(tx: &Sender<Cmd>, cursor_id: &str, x: i32, y: i32) -> anyhow::Result<()> {
+    request(tx, |reply| Cmd::MoveTo {
         cursor_id: cursor_id.to_string(),
         x,
         y,
-        reply: tx_r,
+        action: crate::input::action::current(),
+        reply,
     })
-    .map_err(|e| anyhow::anyhow!("cua-persistent-vptr thread is dead: {e}"))?;
-    rx_r.recv()
-        .map_err(|e| anyhow::anyhow!("reply channel closed: {e}"))?
 }
 
 /// Release `button` on the held cursor. If no other buttons remain held the
 /// virtual-pointer is destroyed and its Wayland connection torn down.
 pub fn release(cursor_id: &str, button: u8) -> anyhow::Result<()> {
-    let (tx_r, rx_r) = bounded(1);
-    tx().send(Cmd::Release {
+    release_on(tx(), cursor_id, button)
+}
+
+fn release_on(tx: &Sender<Cmd>, cursor_id: &str, button: u8) -> anyhow::Result<()> {
+    request(tx, |reply| Cmd::Release {
         cursor_id: cursor_id.to_string(),
         button,
-        reply: tx_r,
+        reply,
     })
-    .map_err(|e| anyhow::anyhow!("cua-persistent-vptr thread is dead: {e}"))?;
-    rx_r.recv()
-        .map_err(|e| anyhow::anyhow!("reply channel closed: {e}"))?
 }
 
 /// Drop the entry for `cursor_id` without emitting any Wayland events.
@@ -427,14 +526,10 @@ pub fn release(cursor_id: &str, button: u8) -> anyhow::Result<()> {
 /// compositor disagrees, this clears the local state without trying to
 /// send a release that would error.
 pub fn forget(cursor_id: &str) -> anyhow::Result<()> {
-    let (tx_r, rx_r) = bounded(1);
-    tx().send(Cmd::Forget {
+    request(tx(), |reply| Cmd::Forget {
         cursor_id: cursor_id.to_string(),
-        reply: tx_r,
+        reply,
     })
-    .map_err(|e| anyhow::anyhow!("cua-persistent-vptr thread is dead: {e}"))?;
-    rx_r.recv()
-        .map_err(|e| anyhow::anyhow!("reply channel closed: {e}"))?
 }
 
 #[cfg(test)]
@@ -479,6 +574,113 @@ mod tests {
                 origin_y: 0,
             },
         )])
+    }
+
+    /// An owner that records what reaches the compositor, sending input as
+    /// the virtual pointer does: through the action bound to its thread.
+    struct Wire {
+        sent: Arc<std::sync::Mutex<Vec<&'static str>>>,
+        /// The caller stops waiting while the press is under way.
+        caller_leaves_during_press: bool,
+    }
+
+    impl Owner for Wire {
+        fn press(&mut self, _: &str, _: u64, _: i32, _: i32, _: u8) -> anyhow::Result<()> {
+            crate::input::action::admit(|| self.sent.lock().unwrap().push("press"))?;
+            if self.caller_leaves_during_press {
+                crate::input::action::current().unwrap().abandon();
+            }
+            Ok(())
+        }
+
+        fn move_to(&mut self, _: &str, _: i32, _: i32) -> anyhow::Result<()> {
+            crate::input::action::admit(|| self.sent.lock().unwrap().push("motion"))
+        }
+
+        fn release(&mut self, _: &str, _: u8) -> anyhow::Result<()> {
+            self.sent.lock().unwrap().push("release");
+            Ok(())
+        }
+
+        fn forget(&mut self, _: &str) {}
+    }
+
+    /// The owner thread's channel, with `wire` as its owner.
+    fn owner(
+        caller_leaves_during_press: bool,
+    ) -> (Sender<Cmd>, Arc<std::sync::Mutex<Vec<&'static str>>>) {
+        let sent = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (tx, rx) = bounded(32);
+        let wire = Wire {
+            sent: sent.clone(),
+            caller_leaves_during_press,
+        };
+        thread::spawn(move || owner_thread(rx, wire));
+        (tx, sent)
+    }
+
+    fn timed_out(error: &anyhow::Error) -> bool {
+        crate::input::foreground::error_code(error) == Some(crate::input::foreground::CODE_TIMEOUT)
+    }
+
+    #[test]
+    fn a_held_pointer_sends_nothing_for_a_call_that_has_ended() {
+        // mouse_button_down and mouse_drag hand their input to the owner
+        // thread. A call that timed out or whose caller went away must not
+        // press or move there afterwards.
+        let (tx, sent) = owner(false);
+        let action = Action::new(std::time::Duration::from_secs(60));
+        action.abandon();
+        let _bound = crate::input::action::bind(action);
+        let mut recorded = false;
+        let pressed = press_on(&tx, "drag", 1, 10, 10, 1, || recorded = true).unwrap_err();
+        assert!(timed_out(&pressed), "{pressed:#}");
+        let moved = move_on(&tx, "drag", 20, 20).unwrap_err();
+        assert!(timed_out(&moved), "{moved:#}");
+        assert!(sent.lock().unwrap().is_empty());
+        assert!(!recorded);
+    }
+
+    #[test]
+    fn a_press_whose_caller_left_meanwhile_is_released_not_left_held() {
+        // The caller stopped waiting while the button went down, so it will
+        // never record the hold: the press must not stay down.
+        let (tx, sent) = owner(true);
+        let _bound = crate::input::action::bind(Action::new(std::time::Duration::from_secs(60)));
+        let mut recorded = false;
+        let pressed = press_on(&tx, "drag", 1, 10, 10, 1, || recorded = true).unwrap_err();
+        assert!(timed_out(&pressed), "{pressed:#}");
+        assert_eq!(*sent.lock().unwrap(), ["press", "release"]);
+        assert!(!recorded);
+
+        // A caller still waiting records the hold, and the button stays down.
+        let (tx, sent) = owner(false);
+        let _bound = crate::input::action::bind(Action::new(std::time::Duration::from_secs(60)));
+        let mut recorded = false;
+        press_on(&tx, "drag", 1, 10, 10, 1, || recorded = true).unwrap();
+        assert_eq!(*sent.lock().unwrap(), ["press"]);
+        assert!(recorded);
+    }
+
+    #[test]
+    fn a_held_motion_for_a_call_that_has_ended_is_not_sent() {
+        let device = Recorder::default();
+        let mut active = held(&device);
+        let action = Action::new(std::time::Duration::from_secs(60));
+        action.abandon();
+        let _bound = crate::input::action::bind(action);
+        let refused = move_held(
+            &mut active,
+            "drag",
+            (200, 200),
+            || Ok(Some((0, 0, 1280, 720))),
+            |_| Ok(()),
+        )
+        .unwrap_err();
+        assert!(timed_out(&refused), "{refused:#}");
+        assert!(device.0.borrow().is_empty());
+        // The button stays held for the next call's motion or release.
+        assert!(active.contains_key("drag"));
     }
 
     #[test]

@@ -12197,8 +12197,25 @@ impl Tool for MouseButtonDownTool {
                 Ok(point) => point,
                 Err(error) => return input_error_result(error),
             };
+            let state = self.state.clone();
+            let hold = MouseHoldState {
+                pid,
+                xid,
+                button,
+                x,
+                y,
+            };
             spawn_blocking_bounded("mouse_button_down", foreground_budget(0), move || {
-                crate::wayland::persistent_vptr::press(&cid, xid, output_x, output_y, button)
+                crate::wayland::persistent_vptr::press(
+                    &cid,
+                    xid,
+                    output_x,
+                    output_y,
+                    button,
+                    || {
+                        state.mouse_hold.lock().unwrap().insert(cid.clone(), hold);
+                    },
+                )
             })
             .await
         } else {

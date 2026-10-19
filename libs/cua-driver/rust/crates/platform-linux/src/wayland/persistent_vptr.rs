@@ -230,7 +230,7 @@ fn owner_thread(rx: Receiver<Cmd>, mut owner: impl Owner, held: Arc<HeldCursors>
             } => {
                 let _bound = action.map(crate::input::action::bind);
                 let pressed = owner.press(&cursor_id, window_id, x, y, button);
-                held.publish(&cursor_id, &owner);
+                held.publish(&cursor_id, &owner, true);
                 let _ = reply.send(pressed);
             }
             Cmd::MoveTo {
@@ -242,7 +242,7 @@ fn owner_thread(rx: Receiver<Cmd>, mut owner: impl Owner, held: Arc<HeldCursors>
             } => {
                 let _bound = action.map(crate::input::action::bind);
                 let moved = owner.move_to(&cursor_id, x, y);
-                held.publish(&cursor_id, &owner);
+                held.publish(&cursor_id, &owner, false);
                 let _ = reply.send(moved);
             }
             // Releases are cleanup: they go out also once the call is over.
@@ -252,43 +252,71 @@ fn owner_thread(rx: Receiver<Cmd>, mut owner: impl Owner, held: Arc<HeldCursors>
                 reply,
             } => {
                 let released = owner.release(&cursor_id, button);
-                held.publish(&cursor_id, &owner);
+                held.publish(&cursor_id, &owner, false);
                 let _ = reply.send(released);
             }
             Cmd::ReleaseUnrecorded { cursor_id, reply } => {
                 let released = owner.release_unrecorded(&cursor_id);
-                held.publish(&cursor_id, &owner);
+                held.publish(&cursor_id, &owner, false);
                 let _ = reply.send(released);
             }
             Cmd::Forget { cursor_id, reply } => {
                 owner.forget(&cursor_id);
-                held.publish(&cursor_id, &owner);
+                held.publish(&cursor_id, &owner, false);
                 let _ = reply.send(Ok(()));
             }
         }
     }
 }
 
-/// The cursors the owner thread holds a button for, readable without
-/// waiting on that thread.
+/// The cursors that may hold a button, readable without waiting on the
+/// owner thread: those it holds one for, and those with a press queued or
+/// under way, which may send input at any moment.
 #[derive(Default)]
-struct HeldCursors(std::sync::Mutex<HashSet<String>>);
+struct HeldCursors(std::sync::Mutex<Cursors>);
+
+#[derive(Default)]
+struct Cursors {
+    held: HashSet<String>,
+    /// Presses queued and not yet handled, by cursor.
+    pressing: HashMap<String, usize>,
+}
 
 impl HeldCursors {
-    fn publish(&self, cursor_id: &str, owner: &dyn Owner) {
-        let mut held = self.0.lock().unwrap_or_else(|e| e.into_inner());
+    fn lock(&self) -> std::sync::MutexGuard<'_, Cursors> {
+        self.0.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// A press for `cursor_id` is about to be queued.
+    fn press_queued(&self, cursor_id: &str) {
+        *self
+            .lock()
+            .pressing
+            .entry(cursor_id.to_owned())
+            .or_default() += 1;
+    }
+
+    /// The owner handled a command for `cursor_id`, a press when `pressed`.
+    fn publish(&self, cursor_id: &str, owner: &dyn Owner, pressed: bool) {
+        let mut cursors = self.lock();
+        if pressed {
+            if let Some(count) = cursors.pressing.get_mut(cursor_id) {
+                *count -= 1;
+                if *count == 0 {
+                    cursors.pressing.remove(cursor_id);
+                }
+            }
+        }
         if owner.holds(cursor_id) {
-            held.insert(cursor_id.to_owned());
+            cursors.held.insert(cursor_id.to_owned());
         } else {
-            held.remove(cursor_id);
+            cursors.held.remove(cursor_id);
         }
     }
 
     fn contains(&self, cursor_id: &str) -> bool {
-        self.0
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .contains(cursor_id)
+        let cursors = self.lock();
+        cursors.held.contains(cursor_id) || cursors.pressing.contains_key(cursor_id)
     }
 }
 
@@ -628,11 +656,22 @@ pub fn press(
     button: u8,
     record: impl FnOnce(),
 ) -> anyhow::Result<()> {
-    press_on(tx(), cursor_id, window_id, x, y, button, record)
+    press_on(
+        tx(),
+        held_cursors(),
+        cursor_id,
+        window_id,
+        x,
+        y,
+        button,
+        record,
+    )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn press_on(
     tx: &Sender<Cmd>,
+    held: &HeldCursors,
     cursor_id: &str,
     window_id: u64,
     x: i32,
@@ -640,6 +679,8 @@ fn press_on(
     button: u8,
     record: impl FnOnce(),
 ) -> anyhow::Result<()> {
+    // Session cleanup must see this press before it can send input.
+    held.press_queued(cursor_id);
     request(tx, |reply| Cmd::Press {
         cursor_id: cursor_id.to_string(),
         window_id,
@@ -756,8 +797,9 @@ fn release_unrecorded_on(tx: &Sender<Cmd>, cursor_id: &str) -> anyhow::Result<bo
 const SESSION_END_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// [`release_unrecorded`] for session cleanup. A cursor the owner holds
-/// nothing for, as for most sessions, is answered without waiting on the
-/// owner thread; otherwise the wait is bounded by [`SESSION_END_WAIT`].
+/// nothing for and has no press queued for, as for most sessions, is
+/// answered without waiting on the owner thread; otherwise the wait is
+/// bounded by [`SESSION_END_WAIT`].
 pub fn release_unrecorded_at_session_end(cursor_id: &str) -> anyhow::Result<bool> {
     release_unrecorded_within(held_cursors(), tx, cursor_id, SESSION_END_WAIT)
 }
@@ -981,7 +1023,10 @@ mod tests {
         action.abandon();
         let _bound = crate::input::action::bind(action);
         let mut recorded = false;
-        let pressed = press_on(&tx, "drag", 1, 10, 10, 1, || recorded = true).unwrap_err();
+        let pressed = press_on(&tx, &HeldCursors::default(), "drag", 1, 10, 10, 1, || {
+            recorded = true
+        })
+        .unwrap_err();
         assert!(timed_out(&pressed), "{pressed:#}");
         let moved = move_on(&tx, "drag", 20, 20).unwrap_err();
         assert!(timed_out(&moved), "{moved:#}");
@@ -996,7 +1041,10 @@ mod tests {
         let (tx, sent) = owner(true, false);
         let _bound = crate::input::action::bind(Action::new(std::time::Duration::from_secs(60)));
         let mut recorded = false;
-        let pressed = press_on(&tx, "drag", 1, 10, 10, 1, || recorded = true).unwrap_err();
+        let pressed = press_on(&tx, &HeldCursors::default(), "drag", 1, 10, 10, 1, || {
+            recorded = true
+        })
+        .unwrap_err();
         assert!(timed_out(&pressed), "{pressed:#}");
         assert_eq!(*sent.lock().unwrap(), ["press", "release"]);
         assert!(!recorded);
@@ -1005,7 +1053,10 @@ mod tests {
         let (tx, sent) = owner(false, false);
         let _bound = crate::input::action::bind(Action::new(std::time::Duration::from_secs(60)));
         let mut recorded = false;
-        press_on(&tx, "drag", 1, 10, 10, 1, || recorded = true).unwrap();
+        press_on(&tx, &HeldCursors::default(), "drag", 1, 10, 10, 1, || {
+            recorded = true
+        })
+        .unwrap();
         assert_eq!(*sent.lock().unwrap(), ["press"]);
         assert!(recorded);
     }
@@ -1015,7 +1066,9 @@ mod tests {
         let (tx, sent) = owner(false, false);
         let _bound = crate::input::action::bind(Action::new(std::time::Duration::from_secs(60)));
         let pressed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            press_on(&tx, "drag", 1, 10, 10, 1, || panic!("recording failed"))
+            press_on(&tx, &HeldCursors::default(), "drag", 1, 10, 10, 1, || {
+                panic!("recording failed")
+            })
         }));
         assert!(pressed.is_err());
         assert_eq!(*sent.lock().unwrap(), ["press", "release"]);
@@ -1027,7 +1080,9 @@ mod tests {
         let (tx, sent) = owner_with(false, release_fails.clone());
         let _bound = crate::input::action::bind(Action::new(std::time::Duration::from_secs(60)));
         let pressed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            press_on(&tx, "drag", 1, 10, 10, 1, || panic!("recording failed"))
+            press_on(&tx, &HeldCursors::default(), "drag", 1, 10, 10, 1, || {
+                panic!("recording failed")
+            })
         }));
         assert!(pressed.is_err());
         assert_eq!(*sent.lock().unwrap(), ["press", "release"]);
@@ -1046,7 +1101,10 @@ mod tests {
         let (tx, sent) = owner(true, true);
         let _bound = crate::input::action::bind(Action::new(std::time::Duration::from_secs(60)));
         let mut recorded = false;
-        let pressed = press_on(&tx, "drag", 1, 10, 10, 1, || recorded = true).unwrap_err();
+        let pressed = press_on(&tx, &HeldCursors::default(), "drag", 1, 10, 10, 1, || {
+            recorded = true
+        })
+        .unwrap_err();
         assert!(timed_out(&pressed), "{pressed:#}");
         assert!(
             pressed.to_string().contains("the hold is kept"),
@@ -1060,7 +1118,7 @@ mod tests {
     fn session_end_does_not_wait_on_the_owner_for_a_session_without_a_pointer() {
         // Another session's command is stuck in a Sway round trip.
         let held = HeldCursors::default();
-        held.0.lock().unwrap().insert("other-session".to_owned());
+        held.lock().held.insert("other-session".to_owned());
         let released = release_unrecorded_within(
             &held,
             || -> &Sender<Cmd> { unreachable!("asked the stalled owner") },
@@ -1073,7 +1131,7 @@ mod tests {
     #[test]
     fn session_end_gives_up_on_a_stalled_owner_within_its_bound() {
         let held = Arc::new(HeldCursors::default());
-        held.0.lock().unwrap().insert("session".to_owned());
+        held.lock().held.insert("session".to_owned());
         // The owner thread is stuck in another command: nothing reads the
         // channel. With room in the queue the reply never comes; with the
         // queue full the command cannot even be queued.
@@ -1112,11 +1170,41 @@ mod tests {
     }
 
     #[test]
+    fn session_end_waits_for_a_press_still_under_way() {
+        // The client cancelled mouse_button_down while its press waited on
+        // the owner, then ended the session. The press can still go down.
+        let held = Arc::new(HeldCursors::default());
+        let (tx, rx) = bounded::<Cmd>(1);
+        let pressing = thread::spawn({
+            let (tx, held) = (tx.clone(), held.clone());
+            move || {
+                let _ = press_on(&tx, &held, "session", 1, 10, 10, 1, || ());
+            }
+        });
+        while tx.is_empty() {
+            thread::yield_now();
+        }
+        let wait = std::time::Duration::from_millis(200);
+        let released = release_unrecorded_within(&held, || &tx, "session", wait);
+        assert!(
+            released
+                .as_ref()
+                .is_err_and(|error| error.to_string().ends_with("retry")),
+            "{released:?}"
+        );
+        // Answer nothing: dropping the queued press ends its wait.
+        drop(rx.recv().unwrap());
+        pressing.join().unwrap();
+    }
+
+    #[test]
     fn session_end_releases_the_unrecorded_press_of_its_own_session() {
         let release_fails = Arc::new(std::sync::atomic::AtomicBool::new(true));
         let (tx, sent, held) = owner_publishing(false, release_fails.clone());
         let pressed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            press_on(&tx, "session", 1, 10, 10, 1, || panic!("recording failed"))
+            press_on(&tx, &held, "session", 1, 10, 10, 1, || {
+                panic!("recording failed")
+            })
         }));
         assert!(pressed.is_err());
         release_fails.store(false, std::sync::atomic::Ordering::SeqCst);

@@ -444,8 +444,10 @@ fn request(
 ///
 /// The press serves the tool call bound to this thread: a call that has
 /// ended presses nothing. Once the button is down, `record` notes the hold
-/// for the caller, under that call; if the call ended meanwhile, the button
-/// is released instead, so no press stays down that nobody recorded.
+/// for the caller, under that call; if the call ended meanwhile, or `record`
+/// panics, the button is released instead, so no press stays down that
+/// nobody recorded. If that release fails, the hold is recorded anyway, so
+/// `mouse_button_up` can release it.
 pub fn press(
     cursor_id: &str,
     window_id: u64,
@@ -475,18 +477,55 @@ fn press_on(
         action: crate::input::action::current(),
         reply,
     })?;
+    // The button is down. Until the hold is recorded, release it on every
+    // way out, a panicking `record` included.
+    let pressed = UnrecordedPress {
+        tx,
+        cursor_id,
+        button,
+    };
+    let mut record = Some(record);
     // A call that ended while the button went down cannot record the hold:
     // its caller stopped waiting. Release the button instead.
-    let Err(ended) = crate::input::action::admit(record) else {
+    let admitted = crate::input::action::admit(|| record.take().expect("recorded once")());
+    pressed.disarm();
+    let Err(ended) = admitted else {
         return Ok(());
     };
     match release_on(tx, cursor_id, button) {
         Ok(()) => Err(anyhow::anyhow!(
             "{ended}; the button went down as the call ended, and it was released"
         )),
-        Err(error) => Err(anyhow::anyhow!(
-            "{ended}; the button went down as the call ended, and its release failed: {error:#}"
-        )),
+        Err(error) => {
+            // The button may still be down, and the owner keeps it: record
+            // the hold so that mouse_button_up can release it.
+            if let Some(record) = record.take() {
+                record();
+            }
+            Err(anyhow::anyhow!(
+                "{ended}; the button went down as the call ended, and its release failed: {error:#}; the hold is kept, so mouse_button_up can release it"
+            ))
+        }
+    }
+}
+
+/// A confirmed press whose hold nobody recorded yet: released when dropped.
+struct UnrecordedPress<'a> {
+    tx: &'a Sender<Cmd>,
+    cursor_id: &'a str,
+    button: u8,
+}
+
+impl UnrecordedPress<'_> {
+    /// The hold was recorded, or the caller handles the release itself.
+    fn disarm(self) {
+        std::mem::forget(self);
+    }
+}
+
+impl Drop for UnrecordedPress<'_> {
+    fn drop(&mut self) {
+        let _ = release_on(self.tx, self.cursor_id, self.button);
     }
 }
 
@@ -582,6 +621,8 @@ mod tests {
         sent: Arc<std::sync::Mutex<Vec<&'static str>>>,
         /// The caller stops waiting while the press is under way.
         caller_leaves_during_press: bool,
+        /// niri does not confirm a release.
+        release_fails: bool,
     }
 
     impl Owner for Wire {
@@ -599,6 +640,9 @@ mod tests {
 
         fn release(&mut self, _: &str, _: u8) -> anyhow::Result<()> {
             self.sent.lock().unwrap().push("release");
+            if self.release_fails {
+                anyhow::bail!("niri did not answer a Wayland round trip in time");
+            }
             Ok(())
         }
 
@@ -608,12 +652,14 @@ mod tests {
     /// The owner thread's channel, with `wire` as its owner.
     fn owner(
         caller_leaves_during_press: bool,
+        release_fails: bool,
     ) -> (Sender<Cmd>, Arc<std::sync::Mutex<Vec<&'static str>>>) {
         let sent = Arc::new(std::sync::Mutex::new(Vec::new()));
         let (tx, rx) = bounded(32);
         let wire = Wire {
             sent: sent.clone(),
             caller_leaves_during_press,
+            release_fails,
         };
         thread::spawn(move || owner_thread(rx, wire));
         (tx, sent)
@@ -628,7 +674,7 @@ mod tests {
         // mouse_button_down and mouse_drag hand their input to the owner
         // thread. A call that timed out or whose caller went away must not
         // press or move there afterwards.
-        let (tx, sent) = owner(false);
+        let (tx, sent) = owner(false, false);
         let action = Action::new(std::time::Duration::from_secs(60));
         action.abandon();
         let _bound = crate::input::action::bind(action);
@@ -645,7 +691,7 @@ mod tests {
     fn a_press_whose_caller_left_meanwhile_is_released_not_left_held() {
         // The caller stopped waiting while the button went down, so it will
         // never record the hold: the press must not stay down.
-        let (tx, sent) = owner(true);
+        let (tx, sent) = owner(true, false);
         let _bound = crate::input::action::bind(Action::new(std::time::Duration::from_secs(60)));
         let mut recorded = false;
         let pressed = press_on(&tx, "drag", 1, 10, 10, 1, || recorded = true).unwrap_err();
@@ -654,11 +700,39 @@ mod tests {
         assert!(!recorded);
 
         // A caller still waiting records the hold, and the button stays down.
-        let (tx, sent) = owner(false);
+        let (tx, sent) = owner(false, false);
         let _bound = crate::input::action::bind(Action::new(std::time::Duration::from_secs(60)));
         let mut recorded = false;
         press_on(&tx, "drag", 1, 10, 10, 1, || recorded = true).unwrap();
         assert_eq!(*sent.lock().unwrap(), ["press"]);
+        assert!(recorded);
+    }
+
+    #[test]
+    fn a_press_whose_recording_panics_is_released() {
+        let (tx, sent) = owner(false, false);
+        let _bound = crate::input::action::bind(Action::new(std::time::Duration::from_secs(60)));
+        let pressed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            press_on(&tx, "drag", 1, 10, 10, 1, || panic!("recording failed"))
+        }));
+        assert!(pressed.is_err());
+        assert_eq!(*sent.lock().unwrap(), ["press", "release"]);
+    }
+
+    #[test]
+    fn a_press_whose_release_fails_after_its_call_ended_keeps_its_hold() {
+        // The button may still be down: mouse_button_up needs the hold to
+        // release it.
+        let (tx, sent) = owner(true, true);
+        let _bound = crate::input::action::bind(Action::new(std::time::Duration::from_secs(60)));
+        let mut recorded = false;
+        let pressed = press_on(&tx, "drag", 1, 10, 10, 1, || recorded = true).unwrap_err();
+        assert!(timed_out(&pressed), "{pressed:#}");
+        assert!(
+            pressed.to_string().contains("the hold is kept"),
+            "{pressed:#}"
+        );
+        assert_eq!(*sent.lock().unwrap(), ["press", "release"]);
         assert!(recorded);
     }
 

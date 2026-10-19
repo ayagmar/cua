@@ -2778,9 +2778,10 @@ fn drag_path(
             return end;
         }
         let t = s as f64 / n as f64;
-        let x = (f64::from(from.0) + f64::from(to.0 - from.0) * t).round() as i32;
-        let y = (f64::from(from.1) + f64::from(to.1 - from.1) * t).round() as i32;
-        aim(x, y)
+        // In i64, the distance between any two i32 points cannot overflow.
+        let x = (f64::from(from.0) + (i64::from(to.0) - i64::from(from.0)) as f64 * t).round();
+        let y = (f64::from(from.1) + (i64::from(to.1) - i64::from(from.1)) as f64 * t).round();
+        aim(x as i32, y as i32)
     })
 }
 
@@ -4741,6 +4742,20 @@ mod tests {
         assert_eq!(points.last(), Some(&(100, 50)));
         let path = super::drag_path((0, 0), (10, 0), 0, (10, 0), |x, y| (x as u32, y as u32));
         assert_eq!(path.collect::<Vec<_>>(), [(10, 0), (10, 0)]);
+    }
+
+    #[test]
+    fn a_drag_between_opposite_coordinate_extremes_aims_every_point() {
+        // The path is interpolated after the press, so its arithmetic must
+        // not overflow for any pair of points the caller can pass.
+        let (min, max) = (i32::MIN, i32::MAX);
+        let mut aimed = Vec::new();
+        let path = super::drag_path((min, max), (max, min), 2, (0, 0), |x, y| {
+            aimed.push((x, y));
+            (0, 0)
+        });
+        assert_eq!(path.count(), 3);
+        assert_eq!(aimed, [(-1, -1), (max, min)]);
     }
 
     #[test]

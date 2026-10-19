@@ -390,7 +390,9 @@ that names the remedy.
   first press. Click once, take a new `get_desktop_state`, then double-click.
 - A desktop-scope `drag` refuses before its press when the press would move
   focus: the start is off every floating window while no tiled window has
-  focus. Click the start point, take a new `get_desktop_state`, then drag.
+  focus, unless nothing has focus and the workspace has no tiled window (the
+  press lands on empty space). Click the start point, take a new
+  `get_desktop_state`, then drag.
   niri does not say where tiled windows are, so a drag that starts on one
   tiled window while another has focus is not refused: its press focuses that
   window, the drag stops after the press, and the app gets the press and

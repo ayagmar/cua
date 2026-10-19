@@ -2627,19 +2627,28 @@ impl DesktopFrame {
     /// press would then stop, and the app would get the press and release
     /// as a click. A press on the one floating window there only focuses
     /// it. Off every floating window, the press is on a tiled window or on
-    /// no window, which is safe only while a tiled window here has focus;
-    /// niri does not say where tiled windows are, so a start on another
-    /// tiled window then is not caught.
+    /// no window, which is safe while a tiled window here has focus, or
+    /// while nothing has focus and the workspace holds no tiled window (the
+    /// press lands on empty space). niri does not say where tiled windows
+    /// are, so a start on another tiled window than the focused one is not
+    /// caught.
     fn drag_start(&self, x: i32, y: i32) -> Result<()> {
         let focused = self.shown.focused;
+        let tiled = |layout: &Option<IpcLayout>| {
+            layout
+                .as_ref()
+                .is_some_and(|layout| layout.pos_in_scrolling_layout.is_some())
+        };
         let keeps_focus = match self.floating_under(x, y).as_slice() {
             [_] => true,
-            [] => self.shown.windows.iter().any(|(id, layout)| {
-                Some(*id) == focused
-                    && layout
-                        .as_ref()
-                        .is_some_and(|layout| layout.pos_in_scrolling_layout.is_some())
-            }),
+            [] => match focused {
+                None => !self.shown.windows.iter().any(|(_, layout)| tiled(layout)),
+                Some(focused) => self
+                    .shown
+                    .windows
+                    .iter()
+                    .any(|(id, layout)| *id == focused && tiled(layout)),
+            },
             several => focused.is_some_and(|id| several.contains(&id)),
         };
         if keeps_focus {
@@ -5062,6 +5071,25 @@ mod tests {
             .unwrap()
             .starts_with("Click the drag's start point first"));
         frame.drag_start(2100, 100).unwrap();
+        // Nothing has focus: a start off the floating window is on a tiled
+        // window the press would focus.
+        let unfocused = DesktopFrame {
+            shown: tiled_scene(None).shown("winit").unwrap(),
+            ..frame.clone()
+        };
+        assert_eq!(
+            unfocused.drag_start(2500, 400).unwrap_err().to_string(),
+            refusal
+        );
+        // Nothing has focus and the workspace holds no tiled window: the
+        // press lands on empty space and focuses nothing.
+        let mut empty = tiled_scene(None);
+        empty.windows.retain(|window| window.id == 7);
+        let empty = DesktopFrame {
+            shown: empty.shown("winit").unwrap(),
+            ..frame
+        };
+        empty.drag_start(2500, 400).unwrap();
     }
 
     #[test]

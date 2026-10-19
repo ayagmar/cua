@@ -429,6 +429,12 @@ If a tool call surprises you on Linux:
    (`gsettings set org.gnome.desktop.interface toolkit-accessibility true`);
    (c) GTK4 / Qt6 / Chromium populate lazily: re-snapshot after an
    interaction or an AX-enable settle.
+4. **`input_busy` saying a previous call's input is still finishing**: an
+   earlier call timed out or was cancelled, and its input worker still holds
+   the desktop (wtype and XTest input runs to completion). The next desktop
+   action waits for that worker for up to 12 s, then refuses before sending
+   anything. Retry once it has stopped. An `input_busy` that names a pid is
+   different: text input to that process is already running.
 
 ## Forbidden vectors
 

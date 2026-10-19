@@ -81,9 +81,17 @@ const STALE_LANE_WAIT: Duration = Duration::from_secs(12);
 /// The process-wide physical input lane: one desktop action at a time.
 struct DesktopLane {
     lock: Arc<tokio::sync::Mutex<()>>,
-    /// When the holder's call ended while its worker still held the lane.
-    stale_since: Arc<Mutex<Option<tokio::time::Instant>>>,
+    holder: Arc<Mutex<LaneHolder>>,
     stale_wait: Duration,
+}
+
+/// Which hold of the lane is current, and when its call ended while a
+/// worker still held the lane. A mark belongs to its holder's generation,
+/// so it never applies to the holder after it.
+#[derive(Default)]
+struct LaneHolder {
+    generation: u64,
+    stale_since: Option<tokio::time::Instant>,
 }
 
 fn desktop_lane() -> &'static DesktopLane {
@@ -91,11 +99,17 @@ fn desktop_lane() -> &'static DesktopLane {
     LANE.get_or_init(|| DesktopLane::new(STALE_LANE_WAIT))
 }
 
+fn lock_holder(holder: &Mutex<LaneHolder>) -> std::sync::MutexGuard<'_, LaneHolder> {
+    holder
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 impl DesktopLane {
     fn new(stale_wait: Duration) -> Self {
         Self {
             lock: Arc::new(tokio::sync::Mutex::new(())),
-            stale_since: Arc::new(Mutex::new(None)),
+            holder: Arc::new(Mutex::new(LaneHolder::default())),
             stale_wait,
         }
     }
@@ -116,17 +130,17 @@ impl DesktopLane {
                 let wait = self.lock.clone().lock_owned();
                 tokio::pin!(wait);
                 loop {
-                    let stale_since = *self
-                        .stale_since
-                        .lock()
-                        .unwrap_or_else(|poisoned| poisoned.into_inner());
-                    let give_up = stale_since.map(|since| since.max(started) + self.stale_wait);
-                    let check = tokio::time::sleep(Duration::from_millis(100));
                     tokio::select! {
                         guard = &mut wait => break guard,
-                        _ = check => {}
+                        _ = tokio::time::sleep(Duration::from_millis(100)) => {}
                     }
-                    if give_up.is_some_and(|at| tokio::time::Instant::now() >= at) {
+                    // Read the holder now, after the wake: the stale worker
+                    // seen before it may have stopped, and its successor be
+                    // a call still running.
+                    let stale_since = lock_holder(&self.holder).stale_since;
+                    if stale_since.is_some_and(|since| {
+                        tokio::time::Instant::now() >= since.max(started) + self.stale_wait
+                    }) {
                         return Err(protected_refusal(
                             "input_busy",
                             "a previous call's input is still finishing: its call ended, but its worker still holds the desktop; retry once it has stopped",
@@ -135,25 +149,33 @@ impl DesktopLane {
                 }
             }
         };
+        let generation = {
+            let mut holder = lock_holder(&self.holder);
+            holder.generation += 1;
+            holder.stale_since = None;
+            holder.generation
+        };
         Ok(DesktopCall(DesktopLease(Arc::new(HeldLane {
-            stale_since: self.stale_since.clone(),
+            holder: self.holder.clone(),
+            generation,
             _guard: guard,
         }))))
     }
 }
 
 struct HeldLane {
-    stale_since: Arc<Mutex<Option<tokio::time::Instant>>>,
+    holder: Arc<Mutex<LaneHolder>>,
+    generation: u64,
     _guard: tokio::sync::OwnedMutexGuard<()>,
 }
 
 impl Drop for HeldLane {
     fn drop(&mut self) {
         // Runs before `_guard` unlocks the lane for the next holder.
-        *self
-            .stale_since
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+        let mut holder = lock_holder(&self.holder);
+        if holder.generation == self.generation {
+            holder.stale_since = None;
+        }
     }
 }
 
@@ -193,12 +215,11 @@ impl DesktopCall {
 impl Drop for DesktopCall {
     fn drop(&mut self) {
         let held = &self.0 .0;
-        let mut stale_since = held
-            .stale_since
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if Arc::strong_count(held) > 1 {
-            *stale_since = Some(tokio::time::Instant::now());
+        // Checked under the holder lock that the last clone's drop takes,
+        // so a worker stopping now cannot leave its mark behind.
+        let mut holder = lock_holder(&held.holder);
+        if holder.generation == held.generation && Arc::strong_count(held) > 1 {
+            holder.stale_since = Some(tokio::time::Instant::now());
         }
     }
 }
@@ -6031,6 +6052,39 @@ resources:
         assert_eq!(
             refusal.structured_content.as_ref().unwrap()["refusal"]["code"],
             "input_busy"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_call_behind_the_healthy_successor_of_a_stale_worker_waits_its_turn() {
+        let lane = Arc::new(DesktopLane::new(Duration::from_secs(12)));
+        let call = lane.acquire().await.unwrap();
+        let worker = call.scope(async { DesktopLease::current().unwrap() }).await;
+        drop(call);
+        // Queued first: runs for 400 ms once the stale worker stops.
+        let first = tokio::spawn({
+            let lane = lane.clone();
+            async move {
+                let call = lane.acquire().await.ok()?;
+                tokio::time::sleep(Duration::from_millis(400)).await;
+                drop(call);
+                Some(())
+            }
+        });
+        tokio::task::yield_now().await;
+        let second = tokio::spawn({
+            let lane = lane.clone();
+            async move { lane.acquire().await.map(drop) }
+        });
+        // The stale worker stops just before the bound.
+        tokio::time::sleep(Duration::from_millis(11_983)).await;
+        drop(worker);
+        assert!(first.await.unwrap().is_some());
+        let second = second.await.unwrap();
+        assert!(
+            second.is_ok(),
+            "refused behind a call still running: {:?}",
+            second.err().map(|refusal| refusal.structured_content)
         );
     }
 

@@ -2791,15 +2791,16 @@ async fn an_input_worker_whose_caller_was_dropped_sends_nothing_more() {
 #[cfg(test)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_timed_out_call_holds_the_desktop_until_its_late_cleanup_is_done() {
-    use cua_driver_core::tool::DesktopLease;
+    use cua_driver_core::tool::DesktopCall;
     // niri: call 1 focused its window, then waited in niri past its budget.
     // Its worker gives focus back afterwards. Desktop typing that started in
     // between would have focus moved away under it.
     let events = Arc::new(std::sync::Mutex::new(Vec::new()));
     let call_1 = {
         let events = events.clone();
-        DesktopLease::acquire()
+        DesktopCall::acquire()
             .await
+            .unwrap()
             .scope(spawn_blocking_bounded(
                 "call 1",
                 std::time::Duration::from_millis(50),
@@ -2815,8 +2816,9 @@ async fn a_timed_out_call_holds_the_desktop_until_its_late_cleanup_is_done() {
             .unwrap()
     };
     assert!(call_1.is_err());
-    DesktopLease::acquire()
+    DesktopCall::acquire()
         .await
+        .unwrap()
         .scope(async { events.lock().unwrap().push("call 2 typed") })
         .await;
     assert_eq!(
@@ -2828,26 +2830,31 @@ async fn a_timed_out_call_holds_the_desktop_until_its_late_cleanup_is_done() {
 #[cfg(test)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn input_that_cannot_be_cancelled_never_overlaps_the_next_desktop_action() {
-    use cua_driver_core::tool::DesktopLease;
+    use cua_driver_core::tool::DesktopCall;
     // wtype and XTest do not read the call's action: a worker whose call
     // timed out, or whose caller went away, still sends all of its input.
     // That input must not reach whatever the next desktop action targets.
     for budget in [50, 60_000] {
         let events = Arc::new(std::sync::Mutex::new(Vec::new()));
         let worker_events = events.clone();
-        let call_1 = DesktopLease::acquire().await.scope(spawn_blocking_bounded(
-            "call 1",
-            std::time::Duration::from_millis(budget),
-            move || {
-                std::thread::sleep(std::time::Duration::from_millis(300));
-                worker_events.lock().unwrap().push("call 1 typed");
-                Ok(())
-            },
-        ));
+        let call = DesktopCall::acquire().await.unwrap();
+        let call_1 = async move {
+            call.scope(spawn_blocking_bounded(
+                "call 1",
+                std::time::Duration::from_millis(budget),
+                move || {
+                    std::thread::sleep(std::time::Duration::from_millis(300));
+                    worker_events.lock().unwrap().push("call 1 typed");
+                    Ok(())
+                },
+            ))
+            .await
+        };
         // A 50 ms budget times out; with 60 s the caller is dropped first.
         let _ = tokio::time::timeout(std::time::Duration::from_millis(100), call_1).await;
-        DesktopLease::acquire()
+        DesktopCall::acquire()
             .await
+            .unwrap()
             .scope(async { events.lock().unwrap().push("call 2 typed") })
             .await;
         assert_eq!(

@@ -73,44 +73,133 @@ pub fn with_runtime_scope<T>(scope: String, action: impl FnOnce() -> T) -> T {
     action()
 }
 
-fn desktop_action_coordinator() -> &'static Arc<tokio::sync::Mutex<()>> {
-    static COORDINATOR: OnceLock<Arc<tokio::sync::Mutex<()>>> = OnceLock::new();
-    COORDINATOR.get_or_init(|| Arc::new(tokio::sync::Mutex::new(())))
+/// How long a call waits for the desktop lane once its holder is a worker
+/// whose call already ended. It matches the base budget of one foreground
+/// input call, so a waiting call never outlasts its own budget behind it.
+const STALE_LANE_WAIT: Duration = Duration::from_secs(12);
+
+/// The process-wide physical input lane: one desktop action at a time.
+struct DesktopLane {
+    lock: Arc<tokio::sync::Mutex<()>>,
+    /// When the holder's call ended while its worker still held the lane.
+    stale_since: Arc<Mutex<Option<tokio::time::Instant>>>,
+    stale_wait: Duration,
+}
+
+fn desktop_lane() -> &'static DesktopLane {
+    static LANE: OnceLock<DesktopLane> = OnceLock::new();
+    LANE.get_or_init(|| DesktopLane::new(STALE_LANE_WAIT))
+}
+
+impl DesktopLane {
+    fn new(stale_wait: Duration) -> Self {
+        Self {
+            lock: Arc::new(tokio::sync::Mutex::new(())),
+            stale_since: Arc::new(Mutex::new(None)),
+            stale_wait,
+        }
+    }
+
+    /// Wait for the lane. Waiting behind a call still running is ordinary
+    /// serialization; waiting behind a worker that outlived its call gives
+    /// up after `stale_wait` with an `input_busy` refusal.
+    async fn acquire(&self) -> Result<DesktopCall, ToolResult> {
+        // Avoid yielding the dispatch task when the process-wide input
+        // lane is uncontended. On Windows, that yield creates a window in
+        // which the foreground target can lose keyboard eligibility
+        // between the fixture's focus proof and SendInput. Contended
+        // runtimes still wait and serialize through the same mutex.
+        let guard = match self.lock.clone().try_lock_owned() {
+            Ok(guard) => guard,
+            Err(_) => {
+                let started = tokio::time::Instant::now();
+                let wait = self.lock.clone().lock_owned();
+                tokio::pin!(wait);
+                loop {
+                    let stale_since = *self
+                        .stale_since
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    let give_up = stale_since.map(|since| since.max(started) + self.stale_wait);
+                    let check = tokio::time::sleep(Duration::from_millis(100));
+                    tokio::select! {
+                        guard = &mut wait => break guard,
+                        _ = check => {}
+                    }
+                    if give_up.is_some_and(|at| tokio::time::Instant::now() >= at) {
+                        return Err(protected_refusal(
+                            "input_busy",
+                            "a previous call's input is still finishing: its call ended, but its worker still holds the desktop; retry once it has stopped",
+                        ));
+                    }
+                }
+            }
+        };
+        Ok(DesktopCall(DesktopLease(Arc::new(HeldLane {
+            stale_since: self.stale_since.clone(),
+            _guard: guard,
+        }))))
+    }
+}
+
+struct HeldLane {
+    stale_since: Arc<Mutex<Option<tokio::time::Instant>>>,
+    _guard: tokio::sync::OwnedMutexGuard<()>,
+}
+
+impl Drop for HeldLane {
+    fn drop(&mut self) {
+        // Runs before `_guard` unlocks the lane for the next holder.
+        *self
+            .stale_since
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+    }
 }
 
 /// One physical desktop action's hold on the process-wide input lane, freed
 /// once every clone is dropped. A platform worker that outlives its call (it
 /// timed out, or its caller went away) keeps a clone, so the next desktop
 /// action waits until that worker has stopped instead of overlapping its
-/// late input or cleanup.
+/// late input or cleanup, for at most [`STALE_LANE_WAIT`].
 #[derive(Clone)]
-pub struct DesktopLease(#[allow(dead_code)] Arc<tokio::sync::OwnedMutexGuard<()>>);
+pub struct DesktopLease(Arc<HeldLane>);
 
 impl DesktopLease {
-    /// Wait for the input lane.
-    pub async fn acquire() -> Self {
-        let coordinator = desktop_action_coordinator();
-        // Avoid yielding the dispatch task when the process-wide input
-        // lane is uncontended. On Windows, that yield creates a window in
-        // which the foreground target can lose keyboard eligibility
-        // between the fixture's focus proof and SendInput. Contended
-        // runtimes still wait and serialize through the same mutex.
-        let held = match coordinator.clone().try_lock_owned() {
-            Ok(held) => held,
-            Err(_) => coordinator.clone().lock_owned().await,
-        };
-        Self(Arc::new(held))
-    }
-
-    /// Run `action` as the desktop action holding this lease, so that
-    /// [`DesktopLease::current`] returns it.
-    pub async fn scope<F: std::future::Future>(self, action: F) -> F::Output {
-        DESKTOP_LEASE.scope(self, action).await
-    }
-
     /// The lease of the desktop action this task runs, if it holds one.
     pub fn current() -> Option<Self> {
         DESKTOP_LEASE.try_with(Clone::clone).ok()
+    }
+}
+
+/// The dispatching call's own hold on the desktop lane. Dropping it while a
+/// worker still holds a [`DesktopLease`] clone marks that worker stale.
+pub struct DesktopCall(DesktopLease);
+
+impl DesktopCall {
+    /// Wait for the process-wide input lane, or refuse with `input_busy`
+    /// once a worker that outlived its call has held it too long.
+    pub async fn acquire() -> Result<Self, ToolResult> {
+        desktop_lane().acquire().await
+    }
+
+    /// Run `action` as the desktop action holding this lane, so that
+    /// [`DesktopLease::current`] returns it.
+    pub async fn scope<F: std::future::Future>(&self, action: F) -> F::Output {
+        DESKTOP_LEASE.scope(self.0.clone(), action).await
+    }
+}
+
+impl Drop for DesktopCall {
+    fn drop(&mut self) {
+        let held = &self.0 .0;
+        let mut stale_since = held
+            .stale_since
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if Arc::strong_count(held) > 1 {
+            *stale_since = Some(tokio::time::Instant::now());
+        }
     }
 }
 
@@ -2259,14 +2348,17 @@ impl ToolRegistry {
                     | "end_session"
             );
         let private_consent_turn = is_existing_profile_prepare(resolved_name, &args);
-        let desktop_lease = if requires_desktop_coordination(
+        let (desktop_call, lane_refusal) = if requires_desktop_coordination(
             resolved_name,
             &args,
             tool.has_independent_input_lane(&args),
         ) {
-            Some(DesktopLease::acquire().await)
+            match DesktopCall::acquire().await {
+                Ok(call) => (Some(call), None),
+                Err(refusal) => (None, Some(refusal)),
+            }
         } else {
-            None
+            (None, None)
         };
         let pending_turn = should_record
             .then(|| {
@@ -2308,9 +2400,10 @@ impl ToolRegistry {
         let invoke = tool.invoke(args.clone());
         let mut result =
             crate::recording::scope_dispatch_click_capture(pending_turn.as_ref(), async {
-                match desktop_lease.clone() {
-                    Some(lease) => lease.scope(invoke).await,
-                    None => invoke.await,
+                match (&desktop_call, lane_refusal) {
+                    (_, Some(refusal)) => refusal,
+                    (Some(call), None) => call.scope(invoke).await,
+                    (None, None) => invoke.await,
                 }
             })
             .await;
@@ -2374,7 +2467,7 @@ impl ToolRegistry {
         // recording/PiP screenshots would unnecessarily block an unrelated
         // runtime after the input side effect has already completed. A
         // platform worker still running keeps its own clone of the lease.
-        drop(desktop_lease);
+        drop(desktop_call);
         restore_public_runtime_result(&mut result, &runtime_prefix);
         // Preserve the producer's private summary for recording/replay before
         // the public ActionResult projection deliberately replaces legacy
@@ -3584,9 +3677,9 @@ fn restore_public_runtime_value(value: &mut Value, runtime_prefix: &str) -> bool
 #[cfg(test)]
 mod runtime_isolation_tests {
     use super::{
-        canonical_proposed_path, desktop_action_coordinator, namespace_runtime_args,
-        publish_action_result, restore_public_runtime_result, try_admit_text_input,
-        TrustedInvocationEvidence, DISPATCH_RUNTIME_SCOPE,
+        canonical_proposed_path, namespace_runtime_args, publish_action_result,
+        restore_public_runtime_result, try_admit_text_input, DesktopCall, DesktopLane,
+        DesktopLease, TrustedInvocationEvidence, DISPATCH_RUNTIME_SCOPE,
     };
     use crate::{
         authorization::PermissionMode,
@@ -5907,7 +6000,7 @@ resources:
             let active = active.clone();
             let max_active = max_active.clone();
             tasks.push(tokio::spawn(async move {
-                let _admission = desktop_action_coordinator().lock().await;
+                let _admission = DesktopCall::acquire().await.unwrap();
                 let now = active.fetch_add(1, Ordering::SeqCst) + 1;
                 max_active.fetch_max(now, Ordering::SeqCst);
                 tokio::task::yield_now().await;
@@ -5918,6 +6011,40 @@ resources:
             task.await.unwrap();
         }
         assert_eq!(max_active.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_call_behind_a_worker_that_never_returns_is_refused_within_its_budget() {
+        let lane = DesktopLane::new(Duration::from_millis(300));
+        let call = lane.acquire().await.unwrap();
+        // The call timed out; its platform worker never returns, so its lease
+        // clone is never dropped.
+        call.scope(async { std::mem::forget(DesktopLease::current().unwrap()) })
+            .await;
+        drop(call);
+        let next = tokio::time::timeout(Duration::from_secs(10), lane.acquire())
+            .await
+            .expect("the next call waited forever behind a stale worker");
+        let Err(refusal) = next else {
+            panic!("the lane was handed out while the stale worker still holds it");
+        };
+        assert_eq!(
+            refusal.structured_content.as_ref().unwrap()["refusal"]["code"],
+            "input_busy"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_call_still_running_is_waited_for_past_the_stale_bound() {
+        let lane = Arc::new(DesktopLane::new(Duration::from_millis(100)));
+        let call = lane.acquire().await.unwrap();
+        let next = tokio::spawn({
+            let lane = lane.clone();
+            async move { lane.acquire().await.is_ok() }
+        });
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        drop(call);
+        assert!(next.await.unwrap());
     }
 
     #[test]

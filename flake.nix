@@ -192,6 +192,11 @@
           # headless cage, and wlr-randr sizes cage's output. niri renders only
           # through EGL, so name the store's Mesa vendor (llvmpipe without a GPU)
           # instead of whatever the host's glvnd directories provide.
+          # GTK on Wayland ignores gtk-xft-dpi in settings.ini and takes it from
+          # GSettings' text-scaling-factor; without that schema, WebKitGTK
+          # reads a screen DPI of -1 and lays pages out at devicePixelRatio
+          # -1/96. Name the store's schemas and keep their defaults in memory,
+          # so neither the host's schemas nor its dconf play a part.
           devShells.cua-driver-niri-e2e =
             (waylandE2eShell (
               with pkgs;
@@ -205,6 +210,8 @@
               (old: {
                 shellHook = old.shellHook + ''
                   export __EGL_VENDOR_LIBRARY_FILENAMES="${pkgs.mesa}/share/glvnd/egl_vendor.d/50_mesa.json"
+                  export GSETTINGS_SCHEMA_DIR="${pkgs.glib.getSchemaPath pkgs.gsettings-desktop-schemas}"
+                  export GSETTINGS_BACKEND=memory
                 '';
               });
         }

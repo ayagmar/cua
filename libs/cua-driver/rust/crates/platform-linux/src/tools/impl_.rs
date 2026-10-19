@@ -12226,8 +12226,24 @@ impl Tool for MouseButtonDownTool {
             })
             .await
         } else {
-            tokio::task::spawn_blocking(move || crate::input::send_button_down(xid, xi, yi, button))
-                .await
+            // Record the hold as soon as the button is down, so a caller that
+            // goes away before this await resumes leaves a hold that
+            // mouse_button_up can release.
+            let cid = cursor_id.clone();
+            let state = self.state.clone();
+            let hold = MouseHoldState {
+                pid,
+                xid,
+                button,
+                x,
+                y,
+            };
+            tokio::task::spawn_blocking(move || {
+                crate::input::send_button_down(xid, xi, yi, button)?;
+                state.mouse_hold.lock().unwrap().insert(cid, hold);
+                Ok(())
+            })
+            .await
         };
         match result {
             Ok(Ok(())) => {
@@ -12238,11 +12254,6 @@ impl Tool for MouseButtonDownTool {
                     x,
                     y,
                 };
-                self.state
-                    .mouse_hold
-                    .lock()
-                    .unwrap()
-                    .insert(cursor_id.clone(), hold.clone());
                 if let Ok(Ok((sx, sy))) =
                     tokio::task::spawn_blocking(move || window_local_to_screen(xid, x, y)).await
                 {

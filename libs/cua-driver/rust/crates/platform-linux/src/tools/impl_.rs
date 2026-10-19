@@ -12556,6 +12556,35 @@ impl Tool for MouseButtonUpTool {
             .get(&cursor_id)
             .cloned()
         else {
+            // A press whose recording failed and whose release niri did not
+            // confirm stays with the persistent pointer: release it there.
+            if crate::wayland::is_wayland() {
+                let cid = cursor_id.clone();
+                let released =
+                    spawn_blocking_bounded("mouse_button_up", foreground_budget(0), move || {
+                        crate::wayland::persistent_vptr::release_unrecorded(&cid)
+                    })
+                    .await;
+                let unheld = mouse_hold_json(&cursor_id, None);
+                match released {
+                    Ok(Ok(true)) => {
+                        crate::overlay::send_command_for(
+                            cursor_id.clone(),
+                            cursor_overlay::OverlayCommand::SetPressed(false),
+                        );
+                        return ToolResult::text(format!(
+                            "✅ Cursor '{cursor_id}' released a button an earlier call pressed but could not record."
+                        ))
+                        .with_structured(unheld);
+                    }
+                    Ok(Ok(false)) => {}
+                    Ok(Err(e)) => return ToolResult::error(e.to_string()).with_structured(unheld),
+                    Err(e) => {
+                        return ToolResult::error(format!("Task error: {e}"))
+                            .with_structured(unheld)
+                    }
+                }
+            }
             return ToolResult::error(format!(
                 "No mouse button is currently held for cursor '{cursor_id}'."
             ))
@@ -15134,6 +15163,10 @@ pub fn build_registry_with_provider(
                             crate::wayland::persistent_vptr::release(cursor_id, held.button)
                         },
                     )?;
+                    // A press the tool never recorded (its recording failed
+                    // and its release was not confirmed) is released too.
+                    crate::wayland::persistent_vptr::release_unrecorded(session_id)
+                        .map_err(|error| error.to_string())?;
                 } else {
                     clear_mouse_hold_after_release(&state_for_session_end, session_id);
                 }

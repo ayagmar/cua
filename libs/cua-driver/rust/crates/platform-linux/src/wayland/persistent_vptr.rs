@@ -63,6 +63,12 @@ enum Cmd {
         button: u8,
         reply: Sender<anyhow::Result<()>>,
     },
+    /// Release every button a cursor still holds, whether or not the tool
+    /// recorded its hold. Replies whether the cursor held any.
+    ReleaseUnrecorded {
+        cursor_id: String,
+        reply: Sender<anyhow::Result<bool>>,
+    },
     /// Drop the entry for a cursor_id without sending wire events — used to
     /// recover when the compositor disconnected mid-life.
     Forget {
@@ -84,6 +90,7 @@ trait Owner {
     ) -> anyhow::Result<()>;
     fn move_to(&mut self, cursor_id: &str, x: i32, y: i32) -> anyhow::Result<()>;
     fn release(&mut self, cursor_id: &str, button: u8) -> anyhow::Result<()>;
+    fn release_unrecorded(&mut self, cursor_id: &str) -> anyhow::Result<bool>;
     fn forget(&mut self, cursor_id: &str);
 }
 
@@ -109,6 +116,10 @@ impl Owner for Pointers {
 
     fn release(&mut self, cursor_id: &str, button: u8) -> anyhow::Result<()> {
         handle_release(&mut self.0, cursor_id, button)
+    }
+
+    fn release_unrecorded(&mut self, cursor_id: &str) -> anyhow::Result<bool> {
+        handle_release_unrecorded(&mut self.0, cursor_id)
     }
 
     fn forget(&mut self, cursor_id: &str) {
@@ -224,6 +235,9 @@ fn owner_thread(rx: Receiver<Cmd>, mut owner: impl Owner) {
             } => {
                 let _ = reply.send(owner.release(&cursor_id, button));
             }
+            Cmd::ReleaseUnrecorded { cursor_id, reply } => {
+                let _ = reply.send(owner.release_unrecorded(&cursor_id));
+            }
             Cmd::Forget { cursor_id, reply } => {
                 owner.forget(&cursor_id);
                 let _ = reply.send(Ok(()));
@@ -240,6 +254,13 @@ fn handle_press(
     y: i32,
     button: u8,
 ) -> anyhow::Result<()> {
+    // A press that went down but was never recorded (its release failed)
+    // stays here until released; replacing it would leave it down for good.
+    if active.contains_key(cursor_id) {
+        anyhow::bail!(
+            "cursor '{cursor_id}' still holds a button from an earlier call whose release niri did not confirm; call mouse_button_up first"
+        );
+    }
     // Open a fresh session for this press — this binds the seat, the foreign-
     // toplevel manager, activates the target window, and creates a new vptr.
     // Keep the (out_w, out_h) but drop the queue + state at end of scope; the
@@ -379,6 +400,28 @@ fn handle_release(
     Ok(())
 }
 
+/// Release every button `cursor_id` holds and drop the cursor. If niri does
+/// not confirm the release, the cursor stays for another try.
+fn handle_release_unrecorded(
+    active: &mut HashMap<String, ActivePointer>,
+    cursor_id: &str,
+) -> anyhow::Result<bool> {
+    let Some(entry) = active.get(cursor_id) else {
+        return Ok(false);
+    };
+    for button in &entry.held {
+        entry.vptr.button(0, *button, ButtonState::Released);
+        entry.vptr.frame();
+    }
+    roundtrip_on_persistent(cursor_id)?;
+    if let Some(p) = active.remove(cursor_id) {
+        p.vptr.destroy();
+        roundtrip_on_persistent(cursor_id).ok();
+    }
+    forget_conn(cursor_id);
+    Ok(true)
+}
+
 // Process-static slots for Connection + EventQueue keyed by cursor_id. The
 // EventQueue is !Send but we only touch these on the owner thread, so wrap
 // in a thread-local-by-construction pattern: store inside the same map so
@@ -425,10 +468,10 @@ fn roundtrip_on_persistent(cursor_id: &str) -> anyhow::Result<()> {
 // ── public API ────────────────────────────────────────────────────────────
 
 /// Send one command to the owner thread on `tx` and wait for its reply.
-fn request(
+fn request<T>(
     tx: &Sender<Cmd>,
-    cmd: impl FnOnce(Sender<anyhow::Result<()>>) -> Cmd,
-) -> anyhow::Result<()> {
+    cmd: impl FnOnce(Sender<anyhow::Result<T>>) -> Cmd,
+) -> anyhow::Result<T> {
     let (tx_r, rx_r) = bounded(1);
     tx.send(cmd(tx_r))
         .map_err(|e| anyhow::anyhow!("cua-persistent-vptr thread is dead: {e}"))?;
@@ -447,7 +490,8 @@ fn request(
 /// for the caller, under that call; if the call ended meanwhile, or `record`
 /// panics, the button is released instead, so no press stays down that
 /// nobody recorded. If that release fails, the hold is recorded anyway, so
-/// `mouse_button_up` can release it.
+/// `mouse_button_up` can release it; when `record` itself panicked, the
+/// cursor stays with the owner for [`release_unrecorded`].
 pub fn press(
     cursor_id: &str,
     window_id: u64,
@@ -525,6 +569,9 @@ impl UnrecordedPress<'_> {
 
 impl Drop for UnrecordedPress<'_> {
     fn drop(&mut self) {
+        // If niri does not confirm this release, the owner keeps the cursor:
+        // mouse_button_up and session cleanup release it through
+        // [`release_unrecorded`], and a new press on it is refused.
         let _ = release_on(self.tx, self.cursor_id, self.button);
     }
 }
@@ -556,6 +603,20 @@ fn release_on(tx: &Sender<Cmd>, cursor_id: &str, button: u8) -> anyhow::Result<(
     request(tx, |reply| Cmd::Release {
         cursor_id: cursor_id.to_string(),
         button,
+        reply,
+    })
+}
+
+/// Release whatever `cursor_id` still holds although the tool has no record
+/// of it: a press whose recording failed and whose release niri did not
+/// confirm. Returns whether the cursor held anything.
+pub fn release_unrecorded(cursor_id: &str) -> anyhow::Result<bool> {
+    release_unrecorded_on(tx(), cursor_id)
+}
+
+fn release_unrecorded_on(tx: &Sender<Cmd>, cursor_id: &str) -> anyhow::Result<bool> {
+    request(tx, |reply| Cmd::ReleaseUnrecorded {
+        cursor_id: cursor_id.to_string(),
         reply,
     })
 }
@@ -622,12 +683,15 @@ mod tests {
         /// The caller stops waiting while the press is under way.
         caller_leaves_during_press: bool,
         /// niri does not confirm a release.
-        release_fails: bool,
+        release_fails: Arc<std::sync::atomic::AtomicBool>,
+        /// Pressed and not yet released, as the owner keeps it.
+        held: bool,
     }
 
     impl Owner for Wire {
         fn press(&mut self, _: &str, _: u64, _: i32, _: i32, _: u8) -> anyhow::Result<()> {
             crate::input::action::admit(|| self.sent.lock().unwrap().push("press"))?;
+            self.held = true;
             if self.caller_leaves_during_press {
                 crate::input::action::current().unwrap().abandon();
             }
@@ -640,10 +704,18 @@ mod tests {
 
         fn release(&mut self, _: &str, _: u8) -> anyhow::Result<()> {
             self.sent.lock().unwrap().push("release");
-            if self.release_fails {
+            if self.release_fails.load(std::sync::atomic::Ordering::SeqCst) {
                 anyhow::bail!("niri did not answer a Wayland round trip in time");
             }
+            self.held = false;
             Ok(())
+        }
+
+        fn release_unrecorded(&mut self, cursor_id: &str) -> anyhow::Result<bool> {
+            if !self.held {
+                return Ok(false);
+            }
+            self.release(cursor_id, 1).map(|()| true)
         }
 
         fn forget(&mut self, _: &str) {}
@@ -654,12 +726,23 @@ mod tests {
         caller_leaves_during_press: bool,
         release_fails: bool,
     ) -> (Sender<Cmd>, Arc<std::sync::Mutex<Vec<&'static str>>>) {
+        owner_with(
+            caller_leaves_during_press,
+            Arc::new(std::sync::atomic::AtomicBool::new(release_fails)),
+        )
+    }
+
+    fn owner_with(
+        caller_leaves_during_press: bool,
+        release_fails: Arc<std::sync::atomic::AtomicBool>,
+    ) -> (Sender<Cmd>, Arc<std::sync::Mutex<Vec<&'static str>>>) {
         let sent = Arc::new(std::sync::Mutex::new(Vec::new()));
         let (tx, rx) = bounded(32);
         let wire = Wire {
             sent: sent.clone(),
             caller_leaves_during_press,
             release_fails,
+            held: false,
         };
         thread::spawn(move || owner_thread(rx, wire));
         (tx, sent)
@@ -717,6 +800,24 @@ mod tests {
         }));
         assert!(pressed.is_err());
         assert_eq!(*sent.lock().unwrap(), ["press", "release"]);
+    }
+
+    #[test]
+    fn a_press_whose_recording_panics_and_whose_release_fails_stays_releasable() {
+        let release_fails = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let (tx, sent) = owner_with(false, release_fails.clone());
+        let _bound = crate::input::action::bind(Action::new(std::time::Duration::from_secs(60)));
+        let pressed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            press_on(&tx, "drag", 1, 10, 10, 1, || panic!("recording failed"))
+        }));
+        assert!(pressed.is_err());
+        assert_eq!(*sent.lock().unwrap(), ["press", "release"]);
+        // niri answers again: mouse_button_up or session cleanup finds the
+        // press that nobody recorded and releases it.
+        release_fails.store(false, std::sync::atomic::Ordering::SeqCst);
+        assert!(release_unrecorded_on(&tx, "drag").unwrap());
+        assert_eq!(*sent.lock().unwrap(), ["press", "release", "release"]);
+        assert!(!release_unrecorded_on(&tx, "drag").unwrap());
     }
 
     #[test]

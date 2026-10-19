@@ -36,8 +36,8 @@ use wayland_client::protocol::{wl_callback, wl_keyboard, wl_registry, wl_seat};
 use wayland_client::{Connection, Dispatch, EventQueue, Proxy, QueueHandle, WEnum};
 use xkbcommon::xkb;
 
-use super::virtual_keyboard::protocol::zwp_virtual_keyboard_manager_v1::ZwpVirtualKeyboardManagerV1;
-use super::virtual_keyboard::protocol::zwp_virtual_keyboard_v1::ZwpVirtualKeyboardV1;
+use super::super::virtual_keyboard::protocol::zwp_virtual_keyboard_manager_v1::ZwpVirtualKeyboardManagerV1;
+use super::super::virtual_keyboard::protocol::zwp_virtual_keyboard_v1::ZwpVirtualKeyboardV1;
 
 /// The whole call's budget: setup, then this much per key.
 const CALL_BASE: Duration = Duration::from_secs(3);
@@ -413,7 +413,7 @@ fn plan_key(map: &str, group: u32, modifiers: &[String], name: &str) -> Result<K
 /// be `expected` when the caller activated one, stopping if focus leaves it.
 /// A stop after some characters went out reports how many, without the
 /// `foreground_unavailable` code that means nothing happened.
-pub(super) fn type_text(expected: Option<u64>, text: &str) -> Result<()> {
+pub(in crate::wayland) fn type_text(expected: Option<u64>, text: &str) -> Result<()> {
     if text.is_empty() {
         return Ok(());
     }
@@ -429,7 +429,11 @@ pub(super) fn type_text(expected: Option<u64>, text: &str) -> Result<()> {
 /// `shift`, `alt`, `logo`) held, into the niri window that has keyboard
 /// focus, which must be `expected` when the caller activated one. The
 /// modifiers are held through the keyboard's modifier state.
-pub(super) fn press(expected: Option<u64>, modifiers: &[String], name: &str) -> Result<()> {
+pub(in crate::wayland) fn press(
+    expected: Option<u64>,
+    modifiers: &[String],
+    name: &str,
+) -> Result<()> {
     let mut session = Session::begin(expected, 1)?;
     let key = plan_key(session.keyboard.base_text(), session.group, modifiers, name)?;
     let parts = [Part {
@@ -476,10 +480,10 @@ impl Session {
             keys,
             crate::input::action::current().map(|action| action.deadline()),
         );
-        let focused = super::niri::keyboard_focus().map_err(super::niri::input_unavailable)?;
+        let focused = super::keyboard_focus().map_err(super::input_unavailable)?;
         let target = admitted_target(expected, focused)?;
-        super::niri::refuse_if_locked().map_err(super::niri::input_unavailable)?;
-        let group = super::niri::keyboard_layout().map_err(super::niri::input_unavailable)?;
+        super::refuse_if_locked().map_err(super::input_unavailable)?;
+        let group = super::keyboard_layout().map_err(super::input_unavailable)?;
         let keyboard = Keyboard::bind(deadline).map_err(|error| refused(format!("{error:#}")))?;
         Ok(Self {
             keyboard,
@@ -497,10 +501,10 @@ impl Session {
             self.group,
             self.deadline,
             sent,
-            |sent| match super::niri::keyboard_focus() {
+            |sent| match super::keyboard_focus() {
                 Ok(Some(focused)) if focused == target => Ok(()),
                 Ok(focused) => Err(focus_moved(target, focused, sent)),
-                Err(error) => Err(super::niri::input_unavailable(error)),
+                Err(error) => Err(super::input_unavailable(error)),
             },
         )
     }
@@ -508,7 +512,7 @@ impl Session {
     /// Finish in the layout active now: the user may have switched layouts,
     /// or focus moved to a window with its own, during the call.
     fn finish(self) -> Result<()> {
-        let group = closing_group(super::niri::keyboard_layout(), self.group);
+        let group = closing_group(super::keyboard_layout(), self.group);
         self.keyboard.finish(group)
     }
 }
@@ -629,7 +633,7 @@ struct Keymap {
 
 #[derive(Default)]
 struct State {
-    seats: super::primary_seat::Seats<wl_seat::WlSeat>,
+    seats: super::super::primary_seat::Seats<wl_seat::WlSeat>,
     manager: Option<ZwpVirtualKeyboardManagerV1>,
     keymap: Option<Keymap>,
     error: Option<String>,
@@ -651,23 +655,23 @@ struct Keyboard {
 
 impl Keyboard {
     fn bind(deadline: Instant) -> Result<Self> {
-        let socket = super::niri::attested_wayland_socket()?;
+        let socket = super::attested_wayland_socket()?;
         let connection =
             Connection::from_socket(socket).context("connect to niri's Wayland display")?;
         let mut queue = connection.new_event_queue::<State>();
         let handle = queue.handle();
         connection.display().get_registry(&handle, ());
         let mut state = State::default();
-        super::bounded_roundtrip(&connection, &mut queue, &mut state, deadline)?;
+        super::super::bounded_roundtrip(&connection, &mut queue, &mut state, deadline)?;
         // The seats' names.
-        super::bounded_roundtrip(&connection, &mut queue, &mut state, deadline)?;
+        super::super::bounded_roundtrip(&connection, &mut queue, &mut state, deadline)?;
         let seat = state.seats.selected().context("niri exposes no wl_seat")?;
         let manager = state
             .manager
             .clone()
             .context("niri exposes no zwp_virtual_keyboard_manager_v1")?;
         let wl_keyboard = seat.get_keyboard(&handle, ());
-        super::bounded_roundtrip(&connection, &mut queue, &mut state, deadline)?;
+        super::super::bounded_roundtrip(&connection, &mut queue, &mut state, deadline)?;
         wl_keyboard.release();
         if let Some(error) = state.error.take() {
             bail!("{error}");
@@ -699,15 +703,20 @@ impl Keyboard {
     fn finish(mut self, group: u32) -> Result<()> {
         let deadline = Instant::now() + CLEANUP_TIMEOUT;
         for code in std::mem::take(&mut self.pressed) {
-            self.device.key(super::event_time_ms(), code, KEY_RELEASED);
+            self.device
+                .key(super::super::event_time_ms(), code, KEY_RELEASED);
         }
         if self.extended {
             self.device
                 .keymap(1, self.base.file.as_fd(), self.base.size);
         }
         self.device.modifiers(0, 0, 0, group);
-        let restored =
-            super::bounded_roundtrip(&self.connection, &mut self.queue, &mut self.state, deadline);
+        let restored = super::super::bounded_roundtrip(
+            &self.connection,
+            &mut self.queue,
+            &mut self.state,
+            deadline,
+        );
         self.device.destroy();
         let flushed = self.queue.flush().context("flush to niri");
         restored.and(flushed)
@@ -734,14 +743,19 @@ impl Strokes for Keyboard {
         let (device, queue) = (&self.device, &self.queue);
         crate::input::action::admit(|| {
             device.modifiers(key.modifiers, 0, 0, key.group);
-            device.key(super::event_time_ms(), key.code, KEY_PRESSED);
-            device.key(super::event_time_ms(), key.code, KEY_RELEASED);
+            device.key(super::super::event_time_ms(), key.code, KEY_PRESSED);
+            device.key(super::super::event_time_ms(), key.code, KEY_RELEASED);
             device.modifiers(0, 0, 0, group);
             queue.flush()
         })?
         .context("flush to niri")?;
         self.pressed.push(key.code);
-        super::bounded_roundtrip(&self.connection, &mut self.queue, &mut self.state, deadline)?;
+        super::super::bounded_roundtrip(
+            &self.connection,
+            &mut self.queue,
+            &mut self.state,
+            deadline,
+        )?;
         self.pressed.clear();
         Ok(())
     }
@@ -842,7 +856,7 @@ impl Dispatch<wl_keyboard::WlKeyboard, ()> for State {
     }
 }
 
-impl super::Syncs for State {
+impl super::super::Syncs for State {
     fn synced(&mut self) -> &mut bool {
         &mut self.synced
     }
@@ -871,7 +885,7 @@ mod tests {
     use super::*;
 
     /// niri 26.04's keymap for `layout "us,de"`, as its `wl_keyboard` sends it.
-    const US_DE: &str = include_str!("../../tests/fixtures/niri-us-de.xkb");
+    const US_DE: &str = include_str!("../../../tests/fixtures/niri-us-de.xkb");
 
     // Evdev codes `wtype` gives the first, 14th and 28th distinct characters
     // of a call, which Chromium reads as Escape, Backspace and Enter.

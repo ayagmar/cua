@@ -18,8 +18,7 @@ mod hyprland_compatibility;
 pub mod hyprland_input;
 pub mod kwin_helper;
 pub mod niri;
-mod niri_keyboard;
-pub use niri_keyboard::call_budget as niri_keyboard_budget;
+pub use niri::keyboard::call_budget as niri_keyboard_budget;
 pub mod overlay;
 pub mod persistent_vptr;
 pub(crate) mod portal;
@@ -2854,14 +2853,14 @@ fn drag_vptr(
 /// foreign-toplevel exposes no pid and Wayland delivers keys to the *focused*
 /// surface, so this is window_id-free; pair it with `click`/`activate` to put
 /// the intended window in focus first. Under niri, text goes out on niri's
-/// own keymap instead (see [`niri_keyboard`]).
+/// own keymap instead (see [`niri::keyboard`]).
 pub fn type_text(window_id: u64, text: &str) -> anyhow::Result<()> {
     if text.is_empty() {
         return Ok(());
     }
     activate_window_for_input(window_id)?;
     if is_wayland() && niri::is_session() {
-        return niri_keyboard::type_text(Some(window_id), text);
+        return niri::keyboard::type_text(Some(window_id), text);
     }
     // Lead with a no-op Shift_L tap: on a freshly-focused window under a headless
     // seat (notably sway), the compositor needs the first virtual-keyboard event
@@ -2895,7 +2894,7 @@ pub fn type_text_focused(text: &str) -> anyhow::Result<()> {
         return Ok(());
     }
     if is_wayland() && niri::is_session() {
-        return niri_keyboard::type_text(niri_expected_window(), text);
+        return niri::keyboard::type_text(niri_expected_window(), text);
     }
     let result = wtype_output(&["-k", "Shift_L", "--", text]);
     match result {
@@ -2917,8 +2916,8 @@ pub fn type_text_focused(text: &str) -> anyhow::Result<()> {
 pub fn type_text_then_key_focused(text: &str, key: &str) -> anyhow::Result<()> {
     let keysym = key_to_keysym(key);
     if is_wayland() && niri::is_session() {
-        niri_keyboard::type_text(niri_expected_window(), text)?;
-        return niri_keyboard::press(niri_expected_window(), &[], &keysym);
+        niri::keyboard::type_text(niri_expected_window(), text)?;
+        return niri::keyboard::press(niri_expected_window(), &[], &keysym);
     }
     let result = wtype_output(&[
         "-k",
@@ -2949,7 +2948,7 @@ pub fn press_key(window_id: u64, key: &str) -> anyhow::Result<()> {
     activate_window_for_input(window_id)?;
     let keysym = key_to_keysym(key);
     if is_wayland() && niri::is_session() {
-        return niri_keyboard::press(Some(window_id), &[], &keysym);
+        return niri::keyboard::press(Some(window_id), &[], &keysym);
     }
     // Keep the sacrificial modifier and requested key in one virtual-keyboard
     // lifetime. Starting a second wtype process creates a fresh protocol object,
@@ -2976,7 +2975,7 @@ pub fn press_key_focused(key: &str) -> anyhow::Result<()> {
     }
     let keysym = key_to_keysym(key);
     if is_wayland() && niri::is_session() {
-        return niri_keyboard::press(niri_expected_window(), &[], &keysym);
+        return niri::keyboard::press(niri_expected_window(), &[], &keysym);
     }
     let result = wtype_output(&["-k", "Shift_L", "-k", keysym.as_str()]);
     match result {
@@ -3000,7 +2999,7 @@ pub fn hotkey(window_id: u64, keys: &[String]) -> anyhow::Result<()> {
     activate_window_for_input(window_id)?;
     let (mods, final_key) = partition_modifiers(keys)?;
     if is_wayland() && niri::is_session() {
-        return niri_keyboard::press(Some(window_id), &mods, &chord_keysym(&final_key));
+        return niri::keyboard::press(Some(window_id), &mods, &chord_keysym(&final_key));
     }
     if let Ok(()) = virtual_keyboard::hotkey(&mods, &final_key) {
         return Ok(());
@@ -3043,7 +3042,7 @@ pub fn hotkey_focused(keys: &[String]) -> anyhow::Result<()> {
     }
     let (mods, final_key) = partition_modifiers(keys)?;
     if is_wayland() && niri::is_session() {
-        return niri_keyboard::press(niri_expected_window(), &mods, &chord_keysym(&final_key));
+        return niri::keyboard::press(niri_expected_window(), &mods, &chord_keysym(&final_key));
     }
     if let Ok(()) = virtual_keyboard::hotkey(&mods, &final_key) {
         return Ok(());

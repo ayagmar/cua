@@ -2404,9 +2404,21 @@ pub struct PointerGate {
     mark: Mark,
     expected: Expected,
     ipc: AttestedIpc,
+    /// The `get_desktop_state` frame a desktop-scope gate admitted against.
+    desktop: Option<DesktopFrame>,
 }
 
 impl PointerGate {
+    /// Refuse a desktop-scope drag from layout point `(x, y)` whose press
+    /// would stop it (see [`DesktopFrame::drag_start`]). A window gate
+    /// focused its window already. Call before the press.
+    pub fn drag_start(&self, x: i32, y: i32) -> Result<()> {
+        match &self.desktop {
+            Some(frame) => frame.drag_start(x, y, self.expected),
+            None => Ok(()),
+        }
+    }
+
     /// Refuse when the layout changed after admission. Call right before the
     /// first motion and again right before every press or wheel event.
     pub fn confirm(&mut self) -> Result<()> {
@@ -2455,6 +2467,7 @@ pub fn gate_pointer(window_id: u64, points: &[(i32, i32)], activate: bool) -> Re
         mark,
         expected: Expected::default(),
         ipc,
+        desktop: None,
     };
     gate.confirm()?;
     if activate {
@@ -2645,14 +2658,17 @@ impl DesktopFrame {
     /// Refuse a drag whose press at `(x, y)` would move focus in a way
     /// [`Self::admit`] counts as a layout change: the motions after the
     /// press would then stop, and the app would get the press and release
-    /// as a click. A press on the one floating window there only focuses
-    /// it. Off every floating window, the press is on a tiled window or on
+    /// as a click. `expected` is the focus change [`Self::admit`] allowed
+    /// for the drag's points. A press on the one floating window there is
+    /// safe while that window has focus, or while the drag stays on it, so
+    /// `admit` expects the focus the press gives it. Off every floating
+    /// window, the press is on a tiled window or on
     /// no window, which is safe while a tiled window here has focus, or
     /// while nothing has focus and the workspace holds no tiled window (the
     /// press lands on empty space). niri does not say where tiled windows
     /// are, so a start on another tiled window than the focused one is not
     /// caught.
-    fn drag_start(&self, x: i32, y: i32) -> Result<()> {
+    fn drag_start(&self, x: i32, y: i32, expected: Expected) -> Result<()> {
         let focused = self.shown.focused;
         let tiled = |layout: &Option<IpcLayout>| {
             layout
@@ -2660,7 +2676,7 @@ impl DesktopFrame {
                 .is_some_and(|layout| layout.pos_in_scrolling_layout.is_some())
         };
         let keeps_focus = match self.floating_under(x, y).as_slice() {
-            [_] => true,
+            [id] => focused == Some(*id) || expected.window == Some(*id),
             [] => match focused {
                 None => !self.shown.windows.iter().any(|(_, layout)| tiled(layout)),
                 Some(focused) => self
@@ -2784,17 +2800,8 @@ pub fn desktop_gate(points: &[(i32, i32)], capture_id: Option<&str>) -> Result<P
         mark: frame.mark,
         expected,
         ipc,
+        desktop: Some(frame),
     })
-}
-
-/// Refuse a desktop-scope drag from layout point `(x, y)` whose press would
-/// stop it (see [`DesktopFrame::drag_start`]). Call after [`desktop_gate`]
-/// admitted the drag, before the press.
-pub fn desktop_drag_start(x: i32, y: i32) -> Result<()> {
-    match latest_desktop().as_ref() {
-        Some(latest) => latest.frame.drag_start(x, y),
-        None => Ok(()),
-    }
 }
 
 fn desktop_admission(
@@ -4923,6 +4930,7 @@ mod tests {
             mark,
             expected: Expected::default(),
             ipc: offline_ipc(),
+            desktop: None,
         };
         // Still quiet before the first motion; a window moves over the point
         // while the pointer is positioned, so the press must refuse.
@@ -5122,44 +5130,61 @@ mod tests {
     fn a_desktop_drag_refuses_a_press_that_would_move_focus_off_its_start() {
         let history = history();
         let refusal = "foreground_unavailable: the drag starts where niri has not focused, and its press would focus that window and stop the drag after the press, which the app would see as a click; click there first, take a new get_desktop_state screenshot, then drag";
+        // The drag gate's admission, then its start check, as `drag` runs
+        // them. Floating window 7 covers layout x 2020..2320, y 60..260.
+        let drag = |frame: &DesktopFrame, scene: &Scene, from: (i32, i32), to: (i32, i32)| {
+            frame
+                .admit(scene, &[from, to], history)
+                .and_then(|expected| frame.drag_start(from.0, from.1, expected))
+                .map_err(|error| error.to_string())
+        };
+        let (on_7, also_on_7, tiled) = ((2100, 100), (2200, 200), (2500, 400));
         // Tiled window 5 has focus: a start off the floating window is on
         // it, or on another tiled window niri cannot tell apart.
         let frame = desktop_frame(history);
-        frame.drag_start(2500, 400).unwrap();
-        // The press focuses and raises floating window 7 without moving
-        // anything.
-        frame.drag_start(2100, 100).unwrap();
-        // Floating window 7 has focus: a start on a tiled window would move
-        // focus there and may scroll the view.
-        let frame = DesktopFrame {
-            shown: tiled_scene(Some(7)).shown("winit").unwrap(),
-            ..frame
-        };
-        let refused = frame.drag_start(2500, 400).unwrap_err().to_string();
+        let scene = tiled_scene(Some(5));
+        drag(&frame, &scene, tiled, (2600, 400)).unwrap();
+        // Within floating window 7, its press only focuses and raises it.
+        drag(&frame, &scene, on_7, also_on_7).unwrap();
+        // Out of window 7, the focus its press takes counts as a change, so
+        // the drag would stop after the press.
+        let refused = drag(&frame, &scene, on_7, tiled).unwrap_err();
         assert_eq!(refused, refusal);
         assert!(refusal_suggestion(&refused)
             .unwrap()
             .starts_with("Click the drag's start point first"));
-        frame.drag_start(2100, 100).unwrap();
+        // Floating window 7 has focus: a start on a tiled window would move
+        // focus there and may scroll the view; one on window 7 moves none.
+        let scene = tiled_scene(Some(7));
+        let frame = DesktopFrame {
+            shown: scene.shown("winit").unwrap(),
+            ..frame
+        };
+        assert_eq!(
+            drag(&frame, &scene, tiled, (2600, 400)).unwrap_err(),
+            refusal
+        );
+        drag(&frame, &scene, on_7, tiled).unwrap();
         // Nothing has focus: a start off the floating window is on a tiled
         // window the press would focus.
+        let scene = tiled_scene(None);
         let unfocused = DesktopFrame {
-            shown: tiled_scene(None).shown("winit").unwrap(),
+            shown: scene.shown("winit").unwrap(),
             ..frame.clone()
         };
         assert_eq!(
-            unfocused.drag_start(2500, 400).unwrap_err().to_string(),
+            drag(&unfocused, &scene, tiled, (2600, 400)).unwrap_err(),
             refusal
         );
         // Nothing has focus and the workspace holds no tiled window: the
         // press lands on empty space and focuses nothing.
-        let mut empty = tiled_scene(None);
-        empty.windows.retain(|window| window.id == 7);
+        let mut scene = tiled_scene(None);
+        scene.windows.retain(|window| window.id == 7);
         let empty = DesktopFrame {
-            shown: empty.shown("winit").unwrap(),
+            shown: scene.shown("winit").unwrap(),
             ..frame
         };
-        empty.drag_start(2500, 400).unwrap();
+        drag(&empty, &scene, tiled, (2600, 400)).unwrap();
     }
 
     #[test]

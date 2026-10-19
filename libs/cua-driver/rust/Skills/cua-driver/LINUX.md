@@ -389,10 +389,11 @@ that names the remedy.
   click on a tiled window that did not have focus: the train stops after the
   first press. Click once, take a new `get_desktop_state`, then double-click.
 - A desktop-scope `drag` refuses before its press when the press would move
-  focus: the start is off every floating window while no tiled window has
-  focus, unless nothing has focus and the workspace has no tiled window (the
-  press lands on empty space). Click the start point, take a new
-  `get_desktop_state`, then drag.
+  focus and stop it: the start is on a floating window that does not have
+  focus and the drop is off that window, or the start is off every floating
+  window while no tiled window has focus, unless nothing has focus and the
+  workspace has no tiled window (the press lands on empty space). Click the
+  start point, take a new `get_desktop_state`, then drag.
   niri does not say where tiled windows are, so a drag that starts on one
   tiled window while another has focus is not refused: its press focuses that
   window, the drag stops after the press, and the app gets the press and

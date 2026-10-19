@@ -2699,7 +2699,9 @@ fn any_typing_delay_gives_a_budget() {
 /// error instead of a tool call that never returns. The blocking task is not
 /// cancellable; it is left to finish (or leak) on the blocking pool, with its
 /// [`crate::input::action::Action`] abandoned so its input routes send
-/// nothing more.
+/// nothing more. Routes that do not read the action (wtype, XTest) keep
+/// sending, and niri gives focus back late, so the worker keeps the call's
+/// desktop lease: the next desktop action waits until it has stopped.
 async fn spawn_blocking_bounded<T: Send + 'static>(
     label: &'static str,
     budget: std::time::Duration,
@@ -2711,7 +2713,9 @@ async fn spawn_blocking_bounded<T: Send + 'static>(
     let _abandon = action.abandon_on_drop();
     let worker = {
         let action = action.clone();
+        let lease = cua_driver_core::tool::DesktopLease::current();
         move || {
+            let _lease = lease;
             let _bound = crate::input::action::bind(action);
             f()
         }
@@ -2782,6 +2786,76 @@ async fn an_input_worker_whose_caller_was_dropped_sends_nothing_more() {
     let at_drop = sent.load(Ordering::SeqCst);
     tokio::time::sleep(std::time::Duration::from_millis(300)).await;
     assert!(sent.load(Ordering::SeqCst) <= at_drop + 1);
+}
+
+#[cfg(test)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_timed_out_call_holds_the_desktop_until_its_late_cleanup_is_done() {
+    use cua_driver_core::tool::DesktopLease;
+    // niri: call 1 focused its window, then waited in niri past its budget.
+    // Its worker gives focus back afterwards. Desktop typing that started in
+    // between would have focus moved away under it.
+    let events = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let call_1 = {
+        let events = events.clone();
+        DesktopLease::acquire()
+            .await
+            .scope(spawn_blocking_bounded(
+                "call 1",
+                std::time::Duration::from_millis(50),
+                move || {
+                    std::thread::sleep(std::time::Duration::from_millis(300));
+                    // The next key is refused, but focus still goes back.
+                    assert!(crate::input::action::admit(|| ()).is_err());
+                    events.lock().unwrap().push("call 1 gave focus back");
+                    Ok(())
+                },
+            ))
+            .await
+            .unwrap()
+    };
+    assert!(call_1.is_err());
+    DesktopLease::acquire()
+        .await
+        .scope(async { events.lock().unwrap().push("call 2 typed") })
+        .await;
+    assert_eq!(
+        *events.lock().unwrap(),
+        ["call 1 gave focus back", "call 2 typed"]
+    );
+}
+
+#[cfg(test)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn input_that_cannot_be_cancelled_never_overlaps_the_next_desktop_action() {
+    use cua_driver_core::tool::DesktopLease;
+    // wtype and XTest do not read the call's action: a worker whose call
+    // timed out, or whose caller went away, still sends all of its input.
+    // That input must not reach whatever the next desktop action targets.
+    for budget in [50, 60_000] {
+        let events = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let worker_events = events.clone();
+        let call_1 = DesktopLease::acquire().await.scope(spawn_blocking_bounded(
+            "call 1",
+            std::time::Duration::from_millis(budget),
+            move || {
+                std::thread::sleep(std::time::Duration::from_millis(300));
+                worker_events.lock().unwrap().push("call 1 typed");
+                Ok(())
+            },
+        ));
+        // A 50 ms budget times out; with 60 s the caller is dropped first.
+        let _ = tokio::time::timeout(std::time::Duration::from_millis(100), call_1).await;
+        DesktopLease::acquire()
+            .await
+            .scope(async { events.lock().unwrap().push("call 2 typed") })
+            .await;
+        assert_eq!(
+            *events.lock().unwrap(),
+            ["call 1 typed", "call 2 typed"],
+            "budget {budget} ms"
+        );
+    }
 }
 
 #[cfg(test)]

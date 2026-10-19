@@ -36,6 +36,8 @@ tokio::task_local! {
     /// Opaque generation for runtime-owned mutable resources. Nested
     /// dispatches inherit this key, while public arguments can never select it.
     static DISPATCH_RUNTIME_SCOPE: String;
+    /// The physical desktop action this task dispatches.
+    static DESKTOP_LEASE: DesktopLease;
 }
 
 /// Return the immutable authorization context bound to the current dispatch.
@@ -71,9 +73,45 @@ pub fn with_runtime_scope<T>(scope: String, action: impl FnOnce() -> T) -> T {
     action()
 }
 
-fn desktop_action_coordinator() -> &'static tokio::sync::Mutex<()> {
-    static COORDINATOR: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
-    COORDINATOR.get_or_init(|| tokio::sync::Mutex::new(()))
+fn desktop_action_coordinator() -> &'static Arc<tokio::sync::Mutex<()>> {
+    static COORDINATOR: OnceLock<Arc<tokio::sync::Mutex<()>>> = OnceLock::new();
+    COORDINATOR.get_or_init(|| Arc::new(tokio::sync::Mutex::new(())))
+}
+
+/// One physical desktop action's hold on the process-wide input lane, freed
+/// once every clone is dropped. A platform worker that outlives its call (it
+/// timed out, or its caller went away) keeps a clone, so the next desktop
+/// action waits until that worker has stopped instead of overlapping its
+/// late input or cleanup.
+#[derive(Clone)]
+pub struct DesktopLease(#[allow(dead_code)] Arc<tokio::sync::OwnedMutexGuard<()>>);
+
+impl DesktopLease {
+    /// Wait for the input lane.
+    pub async fn acquire() -> Self {
+        let coordinator = desktop_action_coordinator();
+        // Avoid yielding the dispatch task when the process-wide input
+        // lane is uncontended. On Windows, that yield creates a window in
+        // which the foreground target can lose keyboard eligibility
+        // between the fixture's focus proof and SendInput. Contended
+        // runtimes still wait and serialize through the same mutex.
+        let held = match coordinator.clone().try_lock_owned() {
+            Ok(held) => held,
+            Err(_) => coordinator.clone().lock_owned().await,
+        };
+        Self(Arc::new(held))
+    }
+
+    /// Run `action` as the desktop action holding this lease, so that
+    /// [`DesktopLease::current`] returns it.
+    pub async fn scope<F: std::future::Future>(self, action: F) -> F::Output {
+        DESKTOP_LEASE.scope(self, action).await
+    }
+
+    /// The lease of the desktop action this task runs, if it holds one.
+    pub fn current() -> Option<Self> {
+        DESKTOP_LEASE.try_with(Clone::clone).ok()
+    }
 }
 
 fn active_text_input_pids() -> &'static Mutex<HashSet<i64>> {
@@ -2221,21 +2259,12 @@ impl ToolRegistry {
                     | "end_session"
             );
         let private_consent_turn = is_existing_profile_prepare(resolved_name, &args);
-        let _desktop_action = if requires_desktop_coordination(
+        let desktop_lease = if requires_desktop_coordination(
             resolved_name,
             &args,
             tool.has_independent_input_lane(&args),
         ) {
-            let coordinator = desktop_action_coordinator();
-            // Avoid yielding the dispatch task when the process-wide input
-            // lane is uncontended. On Windows, that yield creates a window in
-            // which the foreground target can lose keyboard eligibility
-            // between the fixture's focus proof and SendInput. Contended
-            // runtimes still wait and serialize through the same mutex.
-            Some(match coordinator.try_lock() {
-                Ok(guard) => guard,
-                Err(_) => coordinator.lock().await,
-            })
+            Some(DesktopLease::acquire().await)
         } else {
             None
         };
@@ -2276,11 +2305,15 @@ impl ToolRegistry {
         // Desktop pixels read off a capped get_desktop_state image are mapped
         // back to the uncapped capture before any platform interprets them.
         crate::desktop_capture_scale::map_desktop_args(&mut args);
-        let mut result = crate::recording::scope_dispatch_click_capture(
-            pending_turn.as_ref(),
-            tool.invoke(args.clone()),
-        )
-        .await;
+        let invoke = tool.invoke(args.clone());
+        let mut result =
+            crate::recording::scope_dispatch_click_capture(pending_turn.as_ref(), async {
+                match desktop_lease.clone() {
+                    Some(lease) => lease.scope(invoke).await,
+                    None => invoke.await,
+                }
+            })
+            .await;
         match resolved_name {
             "get_desktop_state" if result.is_error != Some(true) => {
                 crate::desktop_capture_scale::record_desktop_state(
@@ -2339,8 +2372,9 @@ impl ToolRegistry {
         // Coordinate the physical action itself, not post-action evidence
         // capture or result shaping. Keeping the global desktop lock through
         // recording/PiP screenshots would unnecessarily block an unrelated
-        // runtime after the input side effect has already completed.
-        drop(_desktop_action);
+        // runtime after the input side effect has already completed. A
+        // platform worker still running keeps its own clone of the lease.
+        drop(desktop_lease);
         restore_public_runtime_result(&mut result, &runtime_prefix);
         // Preserve the producer's private summary for recording/replay before
         // the public ActionResult projection deliberately replaces legacy

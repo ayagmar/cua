@@ -820,18 +820,24 @@ fn release_unrecorded_within<'a>(
 }
 
 /// [`release`] for session cleanup, bounded by [`SESSION_END_WAIT`]. On
-/// expiry the caller keeps its hold record and retries.
+/// expiry the caller keeps its hold record and retries. A cursor the owner
+/// no longer holds and has no press queued for is already released: a
+/// release that timed out ran late.
 pub fn release_at_session_end(cursor_id: &str, button: u8) -> anyhow::Result<()> {
-    release_within(tx(), cursor_id, button, SESSION_END_WAIT)
+    release_within(held_cursors(), tx, cursor_id, button, SESSION_END_WAIT)
 }
 
-fn release_within(
-    tx: &Sender<Cmd>,
+fn release_within<'a>(
+    held: &HeldCursors,
+    tx: impl FnOnce() -> &'a Sender<Cmd>,
     cursor_id: &str,
     button: u8,
     wait: std::time::Duration,
 ) -> anyhow::Result<()> {
-    request_within(tx, cursor_id, wait, |reply| Cmd::Release {
+    if !held.contains(cursor_id) {
+        return Ok(());
+    }
+    request_within(tx(), cursor_id, wait, |reply| Cmd::Release {
         cursor_id: cursor_id.to_string(),
         button,
         reply,
@@ -944,7 +950,10 @@ mod tests {
             crate::input::action::admit(|| self.sent.lock().unwrap().push("motion"))
         }
 
-        fn release(&mut self, _: &str, _: u8) -> anyhow::Result<()> {
+        fn release(&mut self, cursor_id: &str, _: u8) -> anyhow::Result<()> {
+            if !self.held {
+                anyhow::bail!("no held mouse button for cursor '{cursor_id}'");
+            }
             self.sent.lock().unwrap().push("release");
             if self.release_fails.load(std::sync::atomic::Ordering::SeqCst) {
                 anyhow::bail!("niri did not answer a Wayland round trip in time");
@@ -1151,7 +1160,7 @@ mod tests {
                 let held = held.clone();
                 move || {
                     // The recorded hold's release, then the unrecorded one.
-                    let recorded = release_within(&tx, "session", 1, wait);
+                    let recorded = release_within(&held, || &tx, "session", 1, wait);
                     let _ = done.send(recorded.map_err(|error| error.to_string()));
                     let unrecorded = release_unrecorded_within(&held, || &tx, "session", wait);
                     let _ = done.send(unrecorded.map(drop).map_err(|error| error.to_string()));
@@ -1167,6 +1176,19 @@ mod tests {
             assert!(started.elapsed() < std::time::Duration::from_secs(2));
             drop(rx);
         }
+    }
+
+    #[test]
+    fn session_end_retry_completes_after_a_late_recorded_release() {
+        // Session end's release of a recorded hold timed out; the release
+        // ran late and lifted the button. The retry finds nothing held.
+        let (tx, sent, held) = owner_publishing(false, Default::default());
+        press_on(&tx, &held, "session", 1, 10, 10, 1, || ()).unwrap();
+        release_on(&tx, "session", 1).unwrap();
+        let wait = std::time::Duration::from_secs(5);
+        let retried = release_within(&held, || &tx, "session", 1, wait);
+        assert!(retried.is_ok(), "{retried:?}");
+        assert_eq!(*sent.lock().unwrap(), ["press", "release"]);
     }
 
     #[test]

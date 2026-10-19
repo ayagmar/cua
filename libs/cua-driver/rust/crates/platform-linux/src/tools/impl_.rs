@@ -2912,10 +2912,12 @@ async fn a_cancelled_x11_press_is_recorded_before_the_next_call_on_its_cursor() 
 
 #[cfg(test)]
 #[test]
-fn every_wayland_input_worker_stops_when_its_call_ends() {
+fn every_input_worker_stops_when_its_call_ends() {
     // Structural: a worker started with plain `spawn_blocking` has no bound
     // action, so once its call times out or its client cancels it, it keeps
-    // sending the rest of its clicks, ticks, motions or keys.
+    // sending the rest of its clicks, ticks, motions or keys. It has no time
+    // limit either and holds no desktop lease, so on X11 a stale worker can
+    // send input during the next desktop action.
     const ROUTES: &[&str] = &[
         "click",
         "click_focused",
@@ -2956,15 +2958,16 @@ fn every_wayland_input_worker_stops_when_its_call_ends() {
                 })
                 .unwrap();
             let worker = &source[*start..*start + opening.len() + end];
-            ROUTES
-                .iter()
-                .any(|route| worker.contains(&format!("crate::wayland::{route}(")))
+            worker.contains("crate::input::send_")
+                || ROUTES
+                    .iter()
+                    .any(|route| worker.contains(&format!("crate::wayland::{route}(")))
         })
         .map(|(start, _)| source[..start].lines().count())
         .collect();
     assert!(
         unbound.is_empty(),
-        "Wayland input workers not bound to their call, at impl_.rs lines {unbound:?}; \
+        "input workers not bound to their call, at impl_.rs lines {unbound:?}; \
          start them with spawn_blocking_bounded"
     );
 }
@@ -7359,57 +7362,61 @@ impl Tool for ClickTool {
             // click at the element (no focus steal), then to a target-addressed
             // X11 event for toolkits that accept it.
             let cursor_id_for_fallback = cursor_id.clone();
-            let result = tokio::task::spawn_blocking(move || -> anyhow::Result<PointerRoute> {
-                // Refuse before resolving coordinates: the refusal does not
-                // depend on where the element is, and a window without
-                // compositor geometry must not turn it into a lookup error.
-                let modifier_refs: Vec<&str> = modifiers.iter().map(String::as_str).collect();
-                if crate::wayland::wayland_input_enabled() && !modifier_refs.is_empty() {
-                    anyhow::bail!(
-                        "modified element clicks are unavailable on native Wayland: \
+            let result = spawn_blocking_bounded(
+                "element click",
+                foreground_budget(0),
+                move || -> anyhow::Result<PointerRoute> {
+                    // Refuse before resolving coordinates: the refusal does not
+                    // depend on where the element is, and a window without
+                    // compositor geometry must not turn it into a lookup error.
+                    let modifier_refs: Vec<&str> = modifiers.iter().map(String::as_str).collect();
+                    if crate::wayland::wayland_input_enabled() && !modifier_refs.is_empty() {
+                        anyhow::bail!(
+                            "modified element clicks are unavailable on native Wayland: \
                          the pointer route cannot carry keyboard modifier state"
-                    );
-                }
-                let (xid2, lx, ly) = checked_element_local_coords(pid, idx, xid_hint)?;
-                // An explicit X11 foreground request needs the real XTest path
-                // even for a plain click. Some native widgets (notably GTK
-                // selectable rows) expose bounds but no AT-SPI Action and
-                // ignore a targeted XSendEvent; limiting XTest to modified
-                // clicks made those rows addressable but not selectable.
-                if delivery.is_foreground() && !crate::wayland::wayland_input_enabled() {
-                    let (_, sx, sy) = placement
-                        .ok_or_else(|| anyhow::anyhow!("element screen bounds unavailable"))?;
-                    crate::input::with_x11_foreground(xid2, 80, || {
-                        crate::input::send_click_xtest_desktop_with_modifiers(
-                            sx.round() as i32,
-                            sy.round() as i32,
+                        );
+                    }
+                    let (xid2, lx, ly) = checked_element_local_coords(pid, idx, xid_hint)?;
+                    // An explicit X11 foreground request needs the real XTest path
+                    // even for a plain click. Some native widgets (notably GTK
+                    // selectable rows) expose bounds but no AT-SPI Action and
+                    // ignore a targeted XSendEvent; limiting XTest to modified
+                    // clicks made those rows addressable but not selectable.
+                    if delivery.is_foreground() && !crate::wayland::wayland_input_enabled() {
+                        let (_, sx, sy) = placement
+                            .ok_or_else(|| anyhow::anyhow!("element screen bounds unavailable"))?;
+                        crate::input::with_x11_foreground(xid2, 80, || {
+                            crate::input::send_click_xtest_desktop_with_modifiers(
+                                sx.round() as i32,
+                                sy.round() as i32,
+                                button,
+                                count,
+                                &modifier_refs,
+                            )
+                        })
+                        .map(|()| PointerRoute::Foreground)
+                    } else if modifier_refs.is_empty() && !crate::wayland::wayland_input_enabled() {
+                        x11_pixel_click_no_focus_steal(
+                            &cursor_id_for_fallback,
+                            xid2,
+                            lx as i32,
+                            ly as i32,
                             button,
                             count,
+                        )
+                    } else {
+                        crate::input::send_click_with_modifiers(
+                            xid2,
+                            lx as i32,
+                            ly as i32,
+                            count,
+                            button,
                             &modifier_refs,
                         )
-                    })
-                    .map(|()| PointerRoute::Foreground)
-                } else if modifier_refs.is_empty() && !crate::wayland::wayland_input_enabled() {
-                    x11_pixel_click_no_focus_steal(
-                        &cursor_id_for_fallback,
-                        xid2,
-                        lx as i32,
-                        ly as i32,
-                        button,
-                        count,
-                    )
-                } else {
-                    crate::input::send_click_with_modifiers(
-                        xid2,
-                        lx as i32,
-                        ly as i32,
-                        count,
-                        button,
-                        &modifier_refs,
-                    )
-                    .map(|()| PointerRoute::Synthetic)
-                }
-            })
+                        .map(|()| PointerRoute::Synthetic)
+                    }
+                },
+            )
             .await;
             let mode_label = if delivery.is_foreground() {
                 "foreground"
@@ -8592,18 +8599,22 @@ impl Tool for TypeTextTool {
                 };
             }
             let text_f = text.clone();
-            let result = tokio::task::spawn_blocking(move || {
-                if inject_terminal_input(pid, xid, &text_f)? {
-                    return Ok(());
-                }
-                // XTest (real input to the focused window), NOT XSendEvent: GTK/Qt
-                // drop synthetic key events, so a spreadsheet cell / canvas would
-                // stay empty. The click that gave this widget focus already put it
-                // under the X input focus, so XTest-to-focus lands correctly.
-                crate::input::with_x11_foreground(xid, 80, || {
-                    crate::input::send_type_text_xtest(&text_f)
-                })
-            })
+            let result = spawn_blocking_bounded(
+                "foreground type_text",
+                typing_budget(text_len, crate::wayland::niri::is_session()),
+                move || {
+                    if inject_terminal_input(pid, xid, &text_f)? {
+                        return Ok(());
+                    }
+                    // XTest (real input to the focused window), NOT XSendEvent: GTK/Qt
+                    // drop synthetic key events, so a spreadsheet cell / canvas would
+                    // stay empty. The click that gave this widget focus already put it
+                    // under the X input focus, so XTest-to-focus lands correctly.
+                    crate::input::with_x11_foreground(xid, 80, || {
+                        crate::input::send_type_text_xtest(&text_f)
+                    })
+                },
+            )
             .await;
             return match result {
                 Ok(Ok(())) => ToolResult::text(format!(
@@ -8642,22 +8653,26 @@ impl Tool for TypeTextTool {
         // expose the widget tree, type via AT-SPI, then send FocusOut.
         // This doesn't change the X11 active window, so the test's focus check passes.
         let text_clone2 = text.clone();
-        let qt5_result = tokio::task::spawn_blocking(move || {
-            if !is_qt5_process(pid) {
-                anyhow::bail!("not a Qt5 process; synthetic-FocusIn bridge workaround skipped");
-            }
-            // Send FocusIn to trigger Qt5's bridge
-            crate::input::send_focus_in(xid)?;
-            std::thread::sleep(std::time::Duration::from_millis(100));
+        let qt5_result = spawn_blocking_bounded(
+            "Qt5 type_text",
+            typing_budget(text_len, crate::wayland::niri::is_session()),
+            move || {
+                if !is_qt5_process(pid) {
+                    anyhow::bail!("not a Qt5 process; synthetic-FocusIn bridge workaround skipped");
+                }
+                // Send FocusIn to trigger Qt5's bridge
+                crate::input::send_focus_in(xid)?;
+                std::thread::sleep(std::time::Duration::from_millis(100));
 
-            // Try AT-SPI again now that widgets should be exposed
-            let result = crate::atspi::type_into_editable(pid, &text_clone2);
+                // Try AT-SPI again now that widgets should be exposed
+                let result = crate::atspi::type_into_editable(pid, &text_clone2);
 
-            // Restore state with FocusOut
-            crate::input::send_focus_out(xid)?;
+                // Restore state with FocusOut
+                crate::input::send_focus_out(xid)?;
 
-            result
-        })
+                result
+            },
+        )
         .await;
 
         match qt5_result {
@@ -11887,21 +11902,25 @@ impl Tool for DragTool {
                 Ok(Err(e)) => return ToolResult::error(e.to_string()),
                 Err(e) => return ToolResult::error(format!("Task error: {e}")),
             };
-            let drag_result = tokio::task::spawn_blocking(move || {
-                let modifier_refs: Vec<&str> = modifiers.iter().map(String::as_str).collect();
-                crate::input::with_x11_foreground(xid, 80, || {
-                    crate::input::send_drag_xtest_desktop_with_modifiers(
-                        screen_from_x.round() as i32,
-                        screen_from_y.round() as i32,
-                        screen_to_x.round() as i32,
-                        screen_to_y.round() as i32,
-                        button,
-                        duration_ms,
-                        steps,
-                        &modifier_refs,
-                    )
-                })
-            });
+            let drag_result = spawn_blocking_bounded(
+                "foreground drag",
+                foreground_budget(steps) + std::time::Duration::from_millis(duration_ms),
+                move || {
+                    let modifier_refs: Vec<&str> = modifiers.iter().map(String::as_str).collect();
+                    crate::input::with_x11_foreground(xid, 80, || {
+                        crate::input::send_drag_xtest_desktop_with_modifiers(
+                            screen_from_x.round() as i32,
+                            screen_from_y.round() as i32,
+                            screen_to_x.round() as i32,
+                            screen_to_y.round() as i32,
+                            button,
+                            duration_ms,
+                            steps,
+                            &modifier_refs,
+                        )
+                    })
+                },
+            );
             let visual_drag = track_overlay_drag_for(
                 cursor_id.clone(),
                 (screen_from_x, screen_from_y),
@@ -11954,28 +11973,32 @@ impl Tool for DragTool {
                 cursor_overlay::OverlayCommand::SetPressed(true),
             );
             let cursor_id_for_task = cursor_id.clone();
-            let drag_result = tokio::task::spawn_blocking(move || {
-                let (outcome, guard) =
-                    crate::input::focus_guard::guarded_settled(Some(pid), || {
-                        Ok(crate::input::send_virtual_pointer_drag(
-                            &cursor_id_for_task,
-                            &crate::input::VirtualPointerDrag {
-                                target_window: xid,
-                                button,
-                                path: vec![
-                                    (sfx.round() as i32, sfy.round() as i32),
-                                    (stx.round() as i32, sty.round() as i32),
-                                ],
-                                duration_ms,
-                                steps,
-                            },
-                        ))
-                    })?;
-                outcome.map(|mut effect| {
-                    effect.focus_guard = guard;
-                    effect
-                })
-            })
+            let drag_result = spawn_blocking_bounded(
+                "drag",
+                foreground_budget(steps) + std::time::Duration::from_millis(duration_ms),
+                move || {
+                    let (outcome, guard) =
+                        crate::input::focus_guard::guarded_settled(Some(pid), || {
+                            Ok(crate::input::send_virtual_pointer_drag(
+                                &cursor_id_for_task,
+                                &crate::input::VirtualPointerDrag {
+                                    target_window: xid,
+                                    button,
+                                    path: vec![
+                                        (sfx.round() as i32, sfy.round() as i32),
+                                        (stx.round() as i32, sty.round() as i32),
+                                    ],
+                                    duration_ms,
+                                    steps,
+                                },
+                            ))
+                        })?;
+                    outcome.map(|mut effect| {
+                        effect.focus_guard = guard;
+                        effect
+                    })
+                },
+            )
             .await;
             crate::overlay::send_command_for(
                 cursor_id.clone(),
@@ -12017,7 +12040,7 @@ impl Tool for DragTool {
             cursor_id.clone(),
             cursor_overlay::OverlayCommand::SetPressed(true),
         );
-        let press_result = tokio::task::spawn_blocking(move || {
+        let press_result = spawn_blocking_bounded("drag", foreground_budget(0), move || {
             crate::input::send_button_down(
                 xid,
                 from_x.round() as i32,
@@ -12042,15 +12065,16 @@ impl Tool for DragTool {
                 let t = i as f64 / steps.max(1) as f64;
                 let ix = from_x + (to_x - from_x) * t;
                 let iy = from_y + (to_y - from_y) * t;
-                let motion_result = tokio::task::spawn_blocking(move || {
-                    crate::input::send_motion(
-                        xid,
-                        ix.round() as i32,
-                        iy.round() as i32,
-                        Some(button),
-                    )
-                })
-                .await;
+                let motion_result =
+                    spawn_blocking_bounded("drag", foreground_budget(0), move || {
+                        crate::input::send_motion(
+                            xid,
+                            ix.round() as i32,
+                            iy.round() as i32,
+                            Some(button),
+                        )
+                    })
+                    .await;
                 match motion_result {
                     Ok(Ok(())) => {
                         if let Ok(Ok((sx, sy))) =
@@ -12082,7 +12106,9 @@ impl Tool for DragTool {
             }
         }
 
-        let release_result = tokio::task::spawn_blocking(move || {
+        // XSendEvent does not read the call's action, so the release still
+        // goes out if the call ends first.
+        let release_result = spawn_blocking_bounded("drag", foreground_budget(0), move || {
             crate::input::send_button_up(xid, to_x.round() as i32, to_y.round() as i32, button)
         })
         .await;
@@ -12475,7 +12501,7 @@ impl Tool for MouseDragTool {
                     Err(error) => Ok(Err(error)),
                 }
             } else {
-                tokio::task::spawn_blocking(move || {
+                spawn_blocking_bounded("mouse_drag", foreground_budget(0), move || {
                     crate::input::send_motion(
                         xid,
                         ix.round() as i32,
@@ -12707,8 +12733,12 @@ impl Tool for MouseButtonUpTool {
             })
             .await
         } else {
-            tokio::task::spawn_blocking(move || crate::input::send_button_up(xid, xi, yi, button))
-                .await
+            // XSendEvent does not read the call's action, so the release
+            // still goes out if the call ends first.
+            spawn_blocking_bounded("mouse_button_up", foreground_budget(0), move || {
+                crate::input::send_button_up(xid, xi, yi, button)
+            })
+            .await
         };
         match result {
             Ok(Ok(())) => {
@@ -13014,7 +13044,15 @@ impl Tool for ParallelMouseDragTool {
         }
 
         let drags_for_task = drags.clone();
-        let result = tokio::task::spawn_blocking(move || {
+        // The drags run side by side, so the longest one bounds the call.
+        let budget = drags
+            .iter()
+            .map(|(_, drag)| {
+                foreground_budget(drag.steps) + std::time::Duration::from_millis(drag.duration_ms)
+            })
+            .max()
+            .unwrap_or_default();
+        let result = spawn_blocking_bounded("parallel_mouse_drag", budget, move || {
             crate::input::send_parallel_virtual_pointer_drags(&drags_for_task)
         })
         .await;
@@ -13678,8 +13716,10 @@ impl Tool for MoveCursorTool {
                 })
                 .await
             } else {
-                tokio::task::spawn_blocking(move || crate::input::send_move_xtest_desktop(xi, yi))
-                    .await
+                spawn_blocking_bounded("move_cursor", foreground_budget(0), move || {
+                    crate::input::send_move_xtest_desktop(xi, yi)
+                })
+                .await
             };
             return match result {
                 Ok(Ok(())) => ToolResult::text(format!(

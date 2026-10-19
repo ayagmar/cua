@@ -2226,9 +2226,11 @@ fn niri_gate_holds(gate: &mut Option<niri::PointerGate>, sess: &VptrSession) -> 
     let Some(gate) = gate else {
         return Ok(());
     };
-    gate.confirm()?;
+    // niri answers the query only after it has handled what it received
+    // before, so a window that closed by then is in the history read next.
     let space = (sess.origin_x, sess.origin_y, sess.output_w, sess.output_h);
     let current = gate.pointer_space().map_err(niri::input_unavailable)?;
+    gate.confirm()?;
     pointer_space_holds(space, current)
 }
 
@@ -2258,24 +2260,25 @@ fn pointer_space_holds(
 }
 
 /// Deliver the `count` events of one gesture, the presses of a click train
-/// or the ticks of a scroll, rechecking right before each one, after the
-/// `pause` that separates them. A first press can close its target or open
-/// another window over the point, so the next press would reach whatever is
-/// there now: it stops instead. A refusal after an event landed says how
-/// many did, without the `foreground_unavailable` prefix that would report
-/// no effect.
+/// or the ticks of a scroll, rechecking right before each one. `between`
+/// separates two events (a pause, and any motion that re-aims the pointer)
+/// and runs before the recheck, so nothing waits between the check and the
+/// event. A first press can close its target or open another window over
+/// the point, so the next press would reach whatever is there now: it stops
+/// instead. A refusal after an event landed says how many did, without the
+/// `foreground_unavailable` prefix that would report no effect.
 fn gated_events<S>(
     sess: &mut S,
     count: u32,
-    pause: std::time::Duration,
     (gesture, events): (&str, &str),
+    mut between: impl FnMut(&mut S) -> anyhow::Result<()>,
     mut recheck: impl FnMut(&S) -> anyhow::Result<()>,
     mut deliver: impl FnMut(&mut S, u32) -> anyhow::Result<()>,
 ) -> anyhow::Result<()> {
     let count = count.max(1);
     for i in 0..count {
         if i > 0 {
-            std::thread::sleep(pause);
+            between(sess)?;
         }
         if let Err(refusal) = recheck(sess) {
             if i == 0 {
@@ -2370,14 +2373,15 @@ fn click_vptr(
     gated_events(
         &mut sess,
         count,
-        std::time::Duration::from_millis(80),
         ("click", "presses"),
+        |sess| {
+            std::thread::sleep(std::time::Duration::from_millis(80));
+            sess.motion(px, py)?;
+            std::thread::sleep(std::time::Duration::from_millis(15));
+            Ok(())
+        },
         |sess| niri_gate_holds(&mut gate, sess),
-        |sess, i| {
-            if i > 0 {
-                sess.motion(px, py)?;
-                std::thread::sleep(std::time::Duration::from_millis(15));
-            }
+        |sess, _| {
             sess.press(btn)?;
             std::thread::sleep(std::time::Duration::from_millis(20));
             sess.release(btn)
@@ -2576,8 +2580,11 @@ fn scroll_vptr(
     gated_events(
         &mut sess,
         amount,
-        std::time::Duration::from_millis(25),
         ("scroll", "ticks"),
+        |_| {
+            std::thread::sleep(std::time::Duration::from_millis(25));
+            Ok(())
+        },
         |sess| niri_gate_holds(&mut gate, sess),
         |sess, _| {
             sess.send(|vptr| {
@@ -4590,8 +4597,8 @@ mod tests {
         let stopped = super::gated_events(
             &mut target_open,
             2,
-            std::time::Duration::ZERO,
             ("click", "presses"),
+            |_| Ok(()),
             |open| {
                 anyhow::ensure!(*open, "foreground_unavailable: layout changed");
                 Ok(())
@@ -4615,8 +4622,8 @@ mod tests {
         let refused = super::gated_events(
             &mut (),
             5,
-            std::time::Duration::ZERO,
             ("scroll", "ticks"),
+            |_| Ok(()),
             |_| anyhow::bail!("foreground_unavailable: layout changed"),
             |_, _| {
                 delivered += 1;
@@ -4628,6 +4635,38 @@ mod tests {
         assert_eq!(
             crate::input::foreground::error_code(&refused),
             Some(crate::input::foreground::CODE_UNAVAILABLE)
+        );
+    }
+
+    #[test]
+    fn a_target_that_closes_while_the_pointer_re_aims_gets_no_further_press() {
+        // The first press makes the target close itself a moment later,
+        // while the pause and motion before the second press run: the check
+        // must see that, not the state from before the gap.
+        let mut target_open = true;
+        let mut presses = 0;
+        let stopped = super::gated_events(
+            &mut target_open,
+            3,
+            ("click", "presses"),
+            |open| {
+                *open = false;
+                Ok(())
+            },
+            |open| {
+                anyhow::ensure!(*open, "foreground_unavailable: niri window 7 closed");
+                Ok(())
+            },
+            |_, _| {
+                presses += 1;
+                Ok(())
+            },
+        )
+        .unwrap_err();
+        assert_eq!(presses, 1);
+        assert_eq!(
+            stopped.to_string(),
+            "click stopped after 1 of 3 presses: foreground_unavailable: niri window 7 closed"
         );
     }
 

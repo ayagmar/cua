@@ -629,10 +629,24 @@ impl<C: FnMut(Instant) -> Result<UnixStream>> Ipc<C> {
     /// this thread ran out of time (see [`crate::input::action`]): focus
     /// must not move after the caller stopped waiting.
     fn action(&mut self, action: serde_json::Value) -> Result<()> {
+        self.send_action(action, true)
+    }
+
+    /// An action that gives back focus the call took. It is cleanup, like
+    /// a button release, so it goes out also once the call ran out of time.
+    fn restore_action(&mut self, action: serde_json::Value) -> Result<()> {
+        self.send_action(action, false)
+    }
+
+    fn send_action(&mut self, action: serde_json::Value, gated: bool) -> Result<()> {
         let deadline = Instant::now() + self.per_attempt;
         let request = serde_json::json!({ "Action": action }).to_string();
         let mut lines = self.connection(deadline)?;
-        crate::input::action::admit(|| lines.send(&request, deadline))??;
+        if gated {
+            crate::input::action::admit(|| lines.send(&request, deadline))??;
+        } else {
+            lines.send(&request, deadline)?;
+        }
         let reply = lines
             .reply(deadline)
             .context("niri action outcome is unknown")?;
@@ -1877,11 +1891,16 @@ fn restore_focus<C: FnMut(Instant) -> Result<UnixStream>>(
     confirm: Duration,
 ) -> Result<()> {
     let prior_id = prior.map(|prior| prior.id);
+    let focused = ipc.focused_window()?.map(|focused| focused.id);
+    let workspaces: Vec<IpcWorkspace> = ipc.query(Request::Workspaces)?;
+    // Nothing moved, as when the call ran out of time before it focused the
+    // target: there is nothing to give back.
+    if focused == prior_id && workspaces == before {
+        return Ok(());
+    }
     // Someone focused another window meanwhile: theirs is the newer choice.
-    if let Some(chosen) = ipc
-        .focused_window()?
-        .map(|focused| focused.id)
-        .filter(|focused| *focused != target.id && Some(*focused) != prior_id)
+    if let Some(chosen) =
+        focused.filter(|focused| *focused != target.id && Some(*focused) != prior_id)
     {
         tracing::info!(
             window = chosen,
@@ -1894,8 +1913,7 @@ fn restore_focus<C: FnMut(Instant) -> Result<UnixStream>>(
         .iter()
         .find(|workspace| workspace.is_focused)
         .map(|workspace| workspace.id);
-    if let Some(chosen) = ipc
-        .query::<Vec<IpcWorkspace>>(Request::Workspaces)?
+    if let Some(chosen) = workspaces
         .into_iter()
         .find(|workspace| workspace.is_focused)
         .map(|workspace| workspace.id)
@@ -1915,7 +1933,7 @@ fn restore_focus<C: FnMut(Instant) -> Result<UnixStream>>(
         .and_then(|workspace| workspace.active_window_id)
         .filter(|active| *active != target.id && Some(*active) != prior_id)
     {
-        ipc.action(focus_window_action(active))
+        ipc.restore_action(focus_window_action(active))
             .with_context(|| format!("niri could not restore active window {active}"))?;
     }
     let now: Vec<IpcWorkspace> = ipc.query(Request::Workspaces)?;
@@ -1924,11 +1942,13 @@ fn restore_focus<C: FnMut(Instant) -> Result<UnixStream>>(
         .filter(|was| was.is_active && !was.is_focused)
         .filter(|was| now.iter().any(|w| w.id == was.id && !w.is_active))
     {
-        ipc.action(focus_workspace_action(was.id))
+        ipc.restore_action(focus_workspace_action(was.id))
             .with_context(|| format!("niri could not restore workspace {}", was.id))?;
     }
     match (prior, before.iter().find(|workspace| workspace.is_focused)) {
-        (Some(prior), _) => focus_window(ipc, prior.id, prior.pid, confirm)
+        (Some(prior), _) => ipc
+            .restore_action(focus_window_action(prior.id))
+            .and_then(|()| confirm_focus(ipc, prior.id, prior.pid, confirm))
             .with_context(|| format!("niri could not restore prior window {}", prior.id))?,
         (None, Some(workspace)) => restore_workspace(ipc, workspace.id, confirm)
             .with_context(|| format!("niri could not restore prior workspace {}", workspace.id))?,
@@ -1966,7 +1986,7 @@ fn restore_workspace<C: FnMut(Instant) -> Result<UnixStream>>(
     workspace: u64,
     confirm: Duration,
 ) -> Result<()> {
-    ipc.action(focus_workspace_action(workspace))?;
+    ipc.restore_action(focus_workspace_action(workspace))?;
     let deadline = Instant::now() + confirm;
     loop {
         let workspaces: Vec<IpcWorkspace> = ipc.query(Request::Workspaces)?;
@@ -4346,6 +4366,56 @@ mod tests {
         let fake = fake.lock().unwrap();
         assert_eq!(fake.focused(), Some(5));
         assert!(fake.active(1));
+    }
+
+    #[test]
+    fn a_call_that_ran_out_of_time_after_focusing_its_target_still_gives_focus_back() {
+        let timed_out = || {
+            anyhow!(
+                "{}: the call ran out of time, so no further input was sent",
+                crate::input::foreground::CODE_TIMEOUT
+            )
+        };
+        // A pointer action whose gate focused the target.
+        let fake = focus_fixture();
+        let action = crate::input::action::Action::new(Duration::from_secs(60));
+        let _bound = crate::input::action::bind(action.clone());
+        let error = with_focus_restored_in(
+            &mut fake_ipc(&fake),
+            107,
+            7,
+            Duration::from_millis(100),
+            || {
+                fake.lock()
+                    .unwrap()
+                    .reply(r#"{"Action":{"FocusWindow":{"id":7}}}"#);
+                action.abandon();
+                Err::<(), _>(timed_out())
+            },
+        )
+        .unwrap_err();
+        assert_eq!(
+            crate::input::foreground::error_code(&error),
+            Some(crate::input::foreground::CODE_TIMEOUT)
+        );
+        assert_eq!(fake.lock().unwrap().focused(), Some(5));
+
+        // Keys and text, which focus the target before they start.
+        let fake = focus_fixture();
+        let action = crate::input::action::Action::new(Duration::from_secs(60));
+        let _bound = crate::input::action::bind(action.clone());
+        with_focused_window_in(
+            &mut fake_ipc(&fake),
+            107,
+            7,
+            Duration::from_millis(100),
+            || {
+                action.abandon();
+                Err::<(), _>(timed_out())
+            },
+        )
+        .unwrap_err();
+        assert_eq!(fake.lock().unwrap().focused(), Some(5));
     }
 
     #[test]

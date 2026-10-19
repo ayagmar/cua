@@ -19,6 +19,7 @@ pub mod hyprland_input;
 pub mod kwin_helper;
 pub mod niri;
 mod niri_keyboard;
+pub use niri_keyboard::call_budget as niri_keyboard_budget;
 pub mod overlay;
 pub mod persistent_vptr;
 pub(crate) mod portal;

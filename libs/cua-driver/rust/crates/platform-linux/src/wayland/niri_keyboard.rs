@@ -42,6 +42,12 @@ use super::virtual_keyboard::protocol::zwp_virtual_keyboard_v1::ZwpVirtualKeyboa
 /// The whole call's budget: setup, then this much per key.
 const CALL_BASE: Duration = Duration::from_secs(3);
 const PER_KEY: Duration = Duration::from_millis(100);
+
+/// How long a call that sends `keys` keys gives itself, from when its
+/// keyboard session begins. Past it, the call stops and says how far it got.
+pub fn call_budget(keys: usize) -> Duration {
+    CALL_BASE + PER_KEY * u32::try_from(keys).unwrap_or(u32::MAX)
+}
 /// How long releasing held keys and restoring the keymap may take once the
 /// call is over, even past its deadline.
 const CLEANUP_TIMEOUT: Duration = Duration::from_millis(500);
@@ -451,8 +457,7 @@ struct Session {
 
 impl Session {
     fn begin(expected: Option<u64>, keys: usize) -> Result<Self> {
-        let mut deadline =
-            Instant::now() + CALL_BASE + PER_KEY * u32::try_from(keys).unwrap_or(u32::MAX);
+        let mut deadline = Instant::now() + call_budget(keys);
         if let Some(action) = crate::input::action::current() {
             deadline = deadline.min(action.deadline());
         }

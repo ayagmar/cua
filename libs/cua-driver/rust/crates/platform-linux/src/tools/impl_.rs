@@ -2645,6 +2645,35 @@ fn foreground_budget(chars: usize) -> std::time::Duration {
     std::time::Duration::from_millis(12_000 + (chars as u64) * 40)
 }
 
+/// The budget of a `type_text` call that types `chars` characters. niri's
+/// keyboard gives itself its own deadline, which starts once the window is
+/// focused and stops the call with how far it got; the call allows that
+/// plus the foreground setup, so that deadline ends it first.
+fn typing_budget(chars: usize, niri: bool) -> std::time::Duration {
+    let budget = foreground_budget(chars);
+    if niri {
+        budget.max(foreground_budget(0) + crate::wayland::niri_keyboard_budget(chars))
+    } else {
+        budget
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn niri_typing_outlasts_the_keyboard_deadline() {
+    // niri's keyboard allows itself a deadline per key and reports how far
+    // it got when that passes. A call budget that ran out first would cut
+    // the text off with a bare timeout, and a retry would type its start
+    // again.
+    for chars in [0, 1, 150, 1_000, 100_000] {
+        assert!(
+            typing_budget(chars, true) > crate::wayland::niri_keyboard_budget(chars),
+            "{chars} characters"
+        );
+        assert_eq!(typing_budget(chars, false), foreground_budget(chars));
+    }
+}
+
 /// [`foreground_budget`] for `chars` characters with `delay_ms` between them.
 /// The delay comes from the caller unbounded.
 fn paced_typing_budget(chars: usize, delay_ms: u64) -> std::time::Duration {
@@ -7799,7 +7828,7 @@ impl Tool for TypeTextTool {
             let path = if wayland { "wayland_focused" } else { "xtest" };
             let result = spawn_blocking_bounded(
                 "desktop type_text",
-                foreground_budget(text.chars().count()),
+                typing_budget(text.chars().count(), crate::wayland::niri::is_session()),
                 move || {
                     if wayland {
                         crate::wayland::type_text_focused(&text)
@@ -8157,7 +8186,7 @@ impl Tool for TypeTextTool {
                 let text_w = text.clone();
                 let result = spawn_blocking_bounded(
                     "type_text",
-                    foreground_budget(text_w.chars().count()),
+                    typing_budget(text_w.chars().count(), crate::wayland::niri::is_session()),
                     move || {
                         crate::wayland::with_target_foreground(pid, xid, || {
                             if !crate::atspi::focus_element(pid, idx)? {
@@ -8229,7 +8258,7 @@ impl Tool for TypeTextTool {
             let idx = resolved_elem_idx;
             let result = spawn_blocking_bounded(
                 "type_text",
-                foreground_budget(text_w.chars().count()),
+                typing_budget(text_w.chars().count(), crate::wayland::niri::is_session()),
                 move || {
                     crate::wayland::with_target_foreground(pid, xid, || {
                         if let Some(idx) = idx {
@@ -8278,7 +8307,7 @@ impl Tool for TypeTextTool {
             let cursor_id = resolve_cursor_key(&args);
             let result = spawn_blocking_bounded(
                 "type_text terminal",
-                foreground_budget(text_len),
+                typing_budget(text_len, crate::wayland::niri::is_session()),
                 move || -> anyhow::Result<(&'static str, Option<crate::input::KeyboardDeliveryReport>)> {
                 // pty-master injection is preferred — it skips the X event
                 // queue entirely. Falls through to key events if the terminal
@@ -8324,7 +8353,7 @@ impl Tool for TypeTextTool {
             let idx = resolved_elem_idx;
             let result = spawn_blocking_bounded(
                 "foreground type_text",
-                foreground_budget(text_len),
+                typing_budget(text_len, crate::wayland::niri::is_session()),
                 move || {
                     crate::input::with_x11_foreground_opts(
                         xid,
@@ -8378,7 +8407,7 @@ impl Tool for TypeTextTool {
             let cursor_id = resolve_cursor_key(&args);
             let result = spawn_blocking_bounded(
                 "background type_text",
-                foreground_budget(text_len),
+                typing_budget(text_len, crate::wayland::niri::is_session()),
                 move || background_text_route(&cursor_id, pid, xid, &text_b),
             )
             .await;
@@ -8416,7 +8445,7 @@ impl Tool for TypeTextTool {
                 let cursor_id = resolve_cursor_key(&args);
                 let result = spawn_blocking_bounded(
                     "background type_text",
-                    foreground_budget(text_len),
+                    typing_budget(text_len, crate::wayland::niri::is_session()),
                     move || -> anyhow::Result<Option<KeyRoute>> {
                         if inject_terminal_input(pid, xid, &text_b)? {
                             return Ok(Some(KeyRoute::Terminal));
@@ -8525,7 +8554,7 @@ impl Tool for TypeTextTool {
         let cursor_id = resolve_cursor_key(&args);
         let result = spawn_blocking_bounded(
             "type_text",
-            foreground_budget(text_len),
+            typing_budget(text_len, crate::wayland::niri::is_session()),
             move || -> anyhow::Result<(&'static str, Option<crate::input::KeyboardDeliveryReport>)> {
             // Terminals: write to the pty master (focus-free, below the toolkit).
             if inject_terminal_input(pid, xid, &text)? {

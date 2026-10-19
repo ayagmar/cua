@@ -2911,6 +2911,40 @@ async fn a_cancelled_x11_press_is_recorded_before_the_next_call_on_its_cursor() 
 }
 
 #[cfg(test)]
+#[tokio::test]
+async fn a_late_x11_drag_press_is_followed_by_its_release() {
+    // The X server answers the press only after the call timed out. The
+    // drag then sends its own release, which arrives first.
+    let events = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let pressed = press_x11_drag_start(
+        std::time::Duration::from_millis(50),
+        {
+            let events = events.clone();
+            move || {
+                std::thread::sleep(std::time::Duration::from_millis(200));
+                events.lock().unwrap().push("press");
+                Ok(())
+            }
+        },
+        {
+            let events = events.clone();
+            move || {
+                events.lock().unwrap().push("release");
+                Ok(())
+            }
+        },
+    )
+    .await
+    .unwrap();
+    assert!(pressed.is_err());
+    events.lock().unwrap().push("release");
+    tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+    let events = events.lock().unwrap();
+    assert!(events.contains(&"press"), "{events:?}");
+    assert_eq!(events.last(), Some(&"release"), "{events:?}");
+}
+
+#[cfg(test)]
 #[test]
 fn every_input_worker_stops_when_its_call_ends() {
     // Structural: a worker started with plain `spawn_blocking` has no bound
@@ -12040,14 +12074,25 @@ impl Tool for DragTool {
             cursor_id.clone(),
             cursor_overlay::OverlayCommand::SetPressed(true),
         );
-        let press_result = spawn_blocking_bounded("drag", foreground_budget(0), move || {
-            crate::input::send_button_down(
-                xid,
-                from_x.round() as i32,
-                from_y.round() as i32,
-                button,
-            )
-        })
+        let press_result = press_x11_drag_start(
+            foreground_budget(0),
+            move || {
+                crate::input::send_button_down(
+                    xid,
+                    from_x.round() as i32,
+                    from_y.round() as i32,
+                    button,
+                )
+            },
+            move || {
+                crate::input::send_button_up(
+                    xid,
+                    from_x.round() as i32,
+                    from_y.round() as i32,
+                    button,
+                )
+            },
+        )
         .await;
         let mut result: anyhow::Result<()> = match press_result {
             Ok(Ok(())) => Ok(()),
@@ -12348,6 +12393,25 @@ impl Tool for MouseButtonDownTool {
             }
         }
     }
+}
+
+/// The press of an X11 step-by-step drag. A press that goes down after its
+/// call ended is released here, in the same worker: the drag's own release
+/// runs in another worker on its own X connection and can reach the app
+/// first, which would leave the app's last event a press.
+async fn press_x11_drag_start(
+    budget: std::time::Duration,
+    press: impl FnOnce() -> anyhow::Result<()> + Send + 'static,
+    release: impl FnOnce() -> anyhow::Result<()> + Send + 'static,
+) -> Result<anyhow::Result<()>, tokio::task::JoinError> {
+    spawn_blocking_bounded("drag", budget, move || {
+        press()?;
+        if crate::input::action::admit(|| ()).is_err() {
+            release()?;
+        }
+        Ok(())
+    })
+    .await
 }
 
 /// Press an X11 button and record its hold as soon as it is down, so a caller

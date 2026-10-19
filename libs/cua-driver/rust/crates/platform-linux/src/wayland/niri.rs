@@ -507,6 +507,11 @@ impl Lines {
     /// One request and its reply line.
     fn exchange(&mut self, request: &str, deadline: Instant) -> Result<serde_json::Value> {
         self.send(request, deadline)?;
+        self.reply(deadline)
+    }
+
+    /// The reply line to the request sent last.
+    fn reply(&mut self, deadline: Instant) -> Result<serde_json::Value> {
         let line = self.next(deadline)?.ok_or_else(|| {
             anyhow::Error::from(io::Error::new(
                 io::ErrorKind::TimedOut,
@@ -620,13 +625,16 @@ impl<C: FnMut(Instant) -> Result<UnixStream>> Ipc<C> {
     }
 
     /// One compositor action. Never retried: after a timeout niri may have
-    /// applied it.
+    /// applied it. Like input, it is not sent once the tool call bound to
+    /// this thread ran out of time (see [`crate::input::action`]): focus
+    /// must not move after the caller stopped waiting.
     fn action(&mut self, action: serde_json::Value) -> Result<()> {
         let deadline = Instant::now() + self.per_attempt;
         let request = serde_json::json!({ "Action": action }).to_string();
         let mut lines = self.connection(deadline)?;
+        crate::input::action::admit(|| lines.send(&request, deadline))??;
         let reply = lines
-            .exchange(&request, deadline)
+            .reply(deadline)
             .context("niri action outcome is unknown")?;
         self.lines = Some(lines);
         match reply_ok(&request, reply)? {
@@ -1459,7 +1467,7 @@ pub fn refusal_suggestion(detail: &str) -> Option<&'static str> {
 /// An IPC failure on an input route, with its whole cause chain. A refusal
 /// that already carries the code is kept as it is.
 pub(crate) fn input_unavailable(error: anyhow::Error) -> anyhow::Error {
-    if error.to_string().starts_with("foreground_unavailable") {
+    if crate::input::foreground::error_code(&error).is_some() {
         return error;
     }
     foreground_unavailable(format!("{error:#}"))
@@ -4198,6 +4206,41 @@ mod tests {
             error.to_string(),
             "foreground_unavailable: the niri overview is open, so input would go to the overview instead of the window"
         );
+    }
+
+    #[test]
+    fn a_call_that_ran_out_of_time_moves_no_niri_focus() {
+        let fake = focus_fixture();
+        let action = crate::input::action::Action::new(Duration::from_secs(60));
+        action.abandon();
+        let _bound = crate::input::action::bind(action);
+        let mut ran = false;
+        let error = with_focused_window_in(
+            &mut fake_ipc(&fake),
+            107,
+            7,
+            Duration::from_millis(50),
+            || {
+                ran = true;
+                Ok(())
+            },
+        )
+        .unwrap_err();
+        assert!(!ran);
+        assert_eq!(
+            crate::input::foreground::error_code(&error),
+            Some(crate::input::foreground::CODE_TIMEOUT)
+        );
+        let fake = fake.lock().unwrap();
+        assert!(
+            !fake
+                .requests
+                .iter()
+                .any(|request| request.contains("Action")),
+            "a timed-out call sent {:?}",
+            fake.requests
+        );
+        assert_eq!(fake.focused(), Some(5));
     }
 
     #[test]

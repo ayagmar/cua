@@ -2657,6 +2657,9 @@ async fn spawn_blocking_bounded<T: Send + 'static>(
     f: impl FnOnce() -> anyhow::Result<T> + Send + 'static,
 ) -> Result<anyhow::Result<T>, tokio::task::JoinError> {
     let action = crate::input::action::Action::new(budget);
+    // Returning or being dropped while the worker runs both mean nobody waits
+    // for it any more.
+    let _abandon = action.abandon_on_drop();
     let worker = {
         let action = action.clone();
         move || {
@@ -2667,7 +2670,6 @@ async fn spawn_blocking_bounded<T: Send + 'static>(
     match tokio::time::timeout(budget, tokio::task::spawn_blocking(worker)).await {
         Ok(joined) => joined,
         Err(_elapsed) => Ok(Err({
-            action.abandon();
             anyhow::anyhow!(
                 "{}: {label} did not complete within {budget:?}; the X server or the target \
              application may be wedged. Take a screenshot before retrying",
@@ -2702,6 +2704,35 @@ async fn a_timed_out_input_worker_sends_nothing_more() {
     let at_timeout = sent.load(Ordering::SeqCst);
     tokio::time::sleep(std::time::Duration::from_millis(300)).await;
     assert_eq!(sent.load(Ordering::SeqCst), at_timeout);
+}
+
+#[cfg(test)]
+#[tokio::test]
+async fn an_input_worker_whose_caller_was_dropped_sends_nothing_more() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    // The tool call's future is dropped (its client went away, or an outer
+    // timeout fired) long before the worker's own budget runs out.
+    let sent = Arc::new(AtomicUsize::new(0));
+    let worker_sent = sent.clone();
+    let call = spawn_blocking_bounded(
+        "test input",
+        std::time::Duration::from_secs(60),
+        move || {
+            for _ in 0..50 {
+                crate::input::action::admit(|| worker_sent.fetch_add(1, Ordering::SeqCst))?;
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            Ok(())
+        },
+    );
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(100), call)
+            .await
+            .is_err()
+    );
+    let at_drop = sent.load(Ordering::SeqCst);
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    assert!(sent.load(Ordering::SeqCst) <= at_drop + 1);
 }
 
 /// Map an input-path error to a tool error, attaching the structured

@@ -57,6 +57,22 @@ impl Action {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = true;
     }
+
+    /// Abandon this action when the returned guard drops. Hold it where the
+    /// caller waits, so a caller that is itself dropped (a cancelled future)
+    /// abandons the action as one that timed out does.
+    pub fn abandon_on_drop(self: &Arc<Self>) -> AbandonOnDrop {
+        AbandonOnDrop(self.clone())
+    }
+}
+
+/// Abandons its [`Action`] when dropped; see [`Action::abandon_on_drop`].
+pub struct AbandonOnDrop(Arc<Action>);
+
+impl Drop for AbandonOnDrop {
+    fn drop(&mut self) {
+        self.0.abandon();
+    }
 }
 
 thread_local! {

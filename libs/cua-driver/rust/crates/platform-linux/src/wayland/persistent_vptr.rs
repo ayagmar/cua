@@ -771,6 +771,39 @@ fn release_unrecorded_within<'a>(
     if !held.contains(cursor_id) {
         return Ok(false);
     }
+    request_within(tx(), cursor_id, wait, |reply| Cmd::ReleaseUnrecorded {
+        cursor_id: cursor_id.to_string(),
+        reply,
+    })
+}
+
+/// [`release`] for session cleanup, bounded by [`SESSION_END_WAIT`]. On
+/// expiry the caller keeps its hold record and retries.
+pub fn release_at_session_end(cursor_id: &str, button: u8) -> anyhow::Result<()> {
+    release_within(tx(), cursor_id, button, SESSION_END_WAIT)
+}
+
+fn release_within(
+    tx: &Sender<Cmd>,
+    cursor_id: &str,
+    button: u8,
+    wait: std::time::Duration,
+) -> anyhow::Result<()> {
+    request_within(tx, cursor_id, wait, |reply| Cmd::Release {
+        cursor_id: cursor_id.to_string(),
+        button,
+        reply,
+    })
+}
+
+/// [`request`] that gives up after `wait`, queueing included. The command
+/// may still run once the owner thread is free.
+fn request_within<T>(
+    tx: &Sender<Cmd>,
+    cursor_id: &str,
+    wait: std::time::Duration,
+    cmd: impl FnOnce(Sender<anyhow::Result<T>>) -> Cmd,
+) -> anyhow::Result<T> {
     let deadline = std::time::Instant::now() + wait;
     let busy = || {
         anyhow::anyhow!(
@@ -778,19 +811,13 @@ fn release_unrecorded_within<'a>(
         )
     };
     let (tx_r, rx_r) = bounded(1);
-    tx().send_deadline(
-        Cmd::ReleaseUnrecorded {
-            cursor_id: cursor_id.to_string(),
-            reply: tx_r,
-        },
-        deadline,
-    )
-    .map_err(|error| match error {
-        crossbeam_channel::SendTimeoutError::Timeout(_) => busy(),
-        crossbeam_channel::SendTimeoutError::Disconnected(_) => {
-            anyhow::anyhow!("cua-persistent-vptr thread is dead")
-        }
-    })?;
+    tx.send_deadline(cmd(tx_r), deadline)
+        .map_err(|error| match error {
+            crossbeam_channel::SendTimeoutError::Timeout(_) => busy(),
+            crossbeam_channel::SendTimeoutError::Disconnected(_) => {
+                anyhow::anyhow!("cua-persistent-vptr thread is dead")
+            }
+        })?;
     rx_r.recv_deadline(deadline).map_err(|_| busy())?
 }
 
@@ -1060,20 +1087,25 @@ mod tests {
                 .unwrap();
             }
             let wait = std::time::Duration::from_millis(200);
-            let (done, finished) = bounded(1);
+            let (done, finished) = bounded(2);
             let started = std::time::Instant::now();
             thread::spawn({
                 let held = held.clone();
                 move || {
-                    let released = release_unrecorded_within(&held, || &tx, "session", wait);
-                    let _ = done.send(released.map_err(|error| error.to_string()));
+                    // The recorded hold's release, then the unrecorded one.
+                    let recorded = release_within(&tx, "session", 1, wait);
+                    let _ = done.send(recorded.map_err(|error| error.to_string()));
+                    let unrecorded = release_unrecorded_within(&held, || &tx, "session", wait);
+                    let _ = done.send(unrecorded.map(drop).map_err(|error| error.to_string()));
                 }
             });
-            let released = finished
-                .recv_timeout(std::time::Duration::from_secs(5))
-                .expect("session cleanup waited on a stalled owner");
-            let refused = released.unwrap_err();
-            assert!(refused.ends_with("retry"), "{refused}");
+            for release in ["recorded", "unrecorded"] {
+                let released = finished
+                    .recv_timeout(std::time::Duration::from_secs(5))
+                    .unwrap_or_else(|_| panic!("the {release} release waited on a stalled owner"));
+                let refused = released.unwrap_err();
+                assert!(refused.ends_with("retry"), "{refused}");
+            }
             assert!(started.elapsed() < std::time::Duration::from_secs(2));
             drop(rx);
         }

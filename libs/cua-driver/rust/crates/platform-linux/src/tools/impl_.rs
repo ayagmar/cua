@@ -15217,7 +15217,10 @@ pub fn build_registry_with_provider(
                         &state_for_session_end,
                         session_id,
                         |cursor_id, held| {
-                            crate::wayland::persistent_vptr::release(cursor_id, held.button)
+                            crate::wayland::persistent_vptr::release_at_session_end(
+                                cursor_id,
+                                held.button,
+                            )
                         },
                     )?;
                     // A press the tool never recorded (its recording failed

@@ -2866,6 +2866,51 @@ async fn input_that_cannot_be_cancelled_never_overlaps_the_next_desktop_action()
 }
 
 #[cfg(test)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_cancelled_x11_press_is_recorded_before_the_next_call_on_its_cursor() {
+    use cua_driver_core::tool::DesktopCall;
+    let state = ToolState::new();
+    let hold = |xid| MouseHoldState {
+        pid: 1,
+        xid,
+        button: 1,
+        x: 0.0,
+        y: 0.0,
+    };
+    // Call 1: XTest is slow, and its client cancels the call.
+    let call = DesktopCall::acquire().await.unwrap();
+    let first = {
+        let state = state.clone();
+        async move {
+            call.scope(press_and_record_x11_hold(
+                state,
+                "default".to_owned(),
+                hold(1),
+                || {
+                    std::thread::sleep(std::time::Duration::from_millis(300));
+                    Ok(())
+                },
+            ))
+            .await
+        }
+    };
+    let _ = tokio::time::timeout(std::time::Duration::from_millis(50), first).await;
+    // Call 2 on the same cursor checks for a hold once it has the desktop.
+    let _call = DesktopCall::acquire().await.unwrap();
+    let held = state
+        .mouse_hold
+        .lock()
+        .unwrap()
+        .get("default")
+        .map(|hold| hold.xid);
+    assert_eq!(
+        held,
+        Some(1),
+        "call 2 would find no hold, press window 2, and have call 1 overwrite its hold"
+    );
+}
+
+#[cfg(test)]
 #[test]
 fn every_wayland_input_worker_stops_when_its_call_ends() {
     // Structural: a worker started with plain `spawn_blocking` has no bound
@@ -12226,11 +12271,6 @@ impl Tool for MouseButtonDownTool {
             })
             .await
         } else {
-            // Record the hold as soon as the button is down, so a caller that
-            // goes away before this await resumes leaves a hold that
-            // mouse_button_up can release.
-            let cid = cursor_id.clone();
-            let state = self.state.clone();
             let hold = MouseHoldState {
                 pid,
                 xid,
@@ -12238,10 +12278,8 @@ impl Tool for MouseButtonDownTool {
                 x,
                 y,
             };
-            tokio::task::spawn_blocking(move || {
-                crate::input::send_button_down(xid, xi, yi, button)?;
-                state.mouse_hold.lock().unwrap().insert(cid, hold);
-                Ok(())
+            press_and_record_x11_hold(self.state.clone(), cursor_id.clone(), hold, move || {
+                crate::input::send_button_down(xid, xi, yi, button)
             })
             .await
         };
@@ -12284,6 +12322,25 @@ impl Tool for MouseButtonDownTool {
             }
         }
     }
+}
+
+/// Press an X11 button and record its hold as soon as it is down, so a caller
+/// that goes away before the await resumes still leaves a hold that
+/// mouse_button_up can release. The worker keeps the call's desktop lease
+/// through both, so the next call on the cursor sees this hold instead of
+/// pressing and recording its own, which this one would then overwrite.
+async fn press_and_record_x11_hold(
+    state: Arc<ToolState>,
+    cursor_id: String,
+    hold: MouseHoldState,
+    press: impl FnOnce() -> anyhow::Result<()> + Send + 'static,
+) -> Result<anyhow::Result<()>, tokio::task::JoinError> {
+    spawn_blocking_bounded("mouse_button_down", foreground_budget(0), move || {
+        press()?;
+        state.mouse_hold.lock().unwrap().insert(cursor_id, hold);
+        Ok(())
+    })
+    .await
 }
 
 pub struct MouseDragTool {
